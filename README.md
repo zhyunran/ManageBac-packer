@@ -12,7 +12,7 @@
 - 如有issues, 十分欢迎并建议提交zyr712zh123@gmail.com
 
   
-- 本次开发难点，整理附于 [技术文档](TECHNICAL.md)
+- 本次（v0.3)开发难点，主要为**ManageBac 解析规则**，整理附于 [v0.3开发技术文档](TECHNICAL0.3.md)
 ---
 
 ## 快速开始
