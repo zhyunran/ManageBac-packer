@@ -1,7 +1,18 @@
 # ManageBac-packer
-一个整合了希悦校园与managebac系统的一站式小组件，计划接入更多网页......敬请期待！
-Windows 桌面小组件，整合 ManageBac 与希悦校园管理系统的数据。
 
+- 一个整合了希悦校园与managebac系统的一站式小组件，计划接入更多网页......敬请期待！
+
+
+- Windows 桌面小组件，整合 ManageBac 与希悦校园管理系统的数据。
+
+
+- v0.3版本起，并在以后将对北京市101中学ID（Beijing 101 middle school international department) 环境提供优先技术支持。
+
+
+- 如有issues, 十分欢迎并建议提交zyr712zh123@gmail.com
+
+  
+- 本次开发难点，整理附于 [技术文档](TECHNICAL.md)
 ---
 
 ## 快速开始
@@ -199,3 +210,10 @@ MIT License。
 
 第三方依赖：pywebview（BSD 3-Clause）、BeautifulSoup4（MIT）、
 websocket-client（Apache 2.0）、PyInstaller（GPL 2.0 + 例外条款）。
+
+
+### 特别鸣谢
+
+- @xuanqiwang645     提供的UI美化技术支持
+- @hs89n5km86-coder  提供灵感、建议与支持
+- 如需iOS版本，请移步[CampusDesk](https://github.com/xuanqiwang645/CampusDesk)
