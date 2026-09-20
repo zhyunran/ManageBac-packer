@@ -1,0 +1,813 @@
+"""CampusPulse —— 入口。
+
+启动后：
+  1. 立刻显示上次缓存（秒开）
+  2. 后台自动刷新
+  3. 点击任意卡片 → 在你日常使用的 Edge 中打开对应网页
+
+用法：
+    uv run widget.py
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import threading
+import webbrowser
+from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+import webview  # noqa: E402
+
+from app import config, pipeline  # noqa: E402
+
+# ---------------- 日志 ----------------
+config.ensure_dirs()
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.FileHandler(config.LOG_DIR / "widget.log", encoding="utf-8")],
+)
+log = logging.getLogger("mb")
+
+# pywebview 在 Windows 上读取键盘修饰键状态时有个已知递归 bug，
+# 每当窗口获得焦点就会刷一大段 "maximum recursion depth exceeded" 噪音。
+# 它是无害的（不影响任何功能），这里把它压掉，保持日志可读。
+class _QuietPywebviewNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "maximum recursion depth exceeded" in msg:
+            return False
+        if "Error while processing window.native" in msg:
+            return False
+        return True
+
+
+logging.getLogger("pywebview").addFilter(_QuietPywebviewNoise())
+
+TITLE = "CampusPulse"
+W, H = 470, 780
+
+
+def _check_js_api_safe(api_obj: object) -> None:
+    """ 启动自检：确认 js_api 对象没有「公开的非函数属性」。
+
+    pywebview 注入 JS API 时会遍历 js_api 的**所有公开属性**
+    （`webview/util.py` 的 `get_functions`），遇到非函数对象就**递归进去**。
+    一旦指向 pywebview 自己的对象（Window / DOM / EventContainer / .NET 窗体），
+    递归会爆炸（实测 60 秒），期间 `pywebviewready` / `loaded` 事件全被堵住，
+    窗口就一直「未响应」。
+
+    所以在这里挡一道：发现问题就写明显日志，避免又变成用户看到的「未响应」。
+    """
+    try:
+        import inspect as _inspect
+
+        bad = []
+        for name in dir(api_obj):
+            if name.startswith("_"):
+                continue
+            attr = getattr(api_obj, name, None)
+            if _inspect.ismethod(attr) or _inspect.isfunction(attr):
+                continue
+            bad.append(f"{name}={type(attr).__name__}")
+        if bad:
+            log.error(" js_api 自检失败：发现公开的非函数属性 [%s]。"
+                "pywebview 会递归遍历它们 —— 极可能导致窗口「未响应」。"
+                "请把这些成员改成下划线开头（如 _window）。",
+                ", ".join(bad),
+            )
+        else:
+            log.info("js_api 自检通过（无公开的非函数属性）")
+    except Exception as e:
+        log.warning("js_api 自检异常：%s", e)
+
+
+class Api:
+    """暴露给前端 JS 的接口。
+
+     铁律：只允许「方法」公开；任何数据成员必须以 `_` 开头。
+      原因见 `_check_js_api_safe` 的说明。
+    """
+
+    def __init__(self) -> None:
+        #  名字必须以下划线开头！
+        #   pywebview 注入 JS API 时会遍历本对象的所有「公开」属性，
+        #   遇到非函数对象就递归进去（util.py: get_functions）。
+        #   `self.window` 指向整个 pywebview Window（含 DOM / EventContainer /
+        #   .NET 窗体，且 Window.width/height 是会 wait(15s) 的属性 getter）
+        #   → 递归爆炸，实测要 60 秒，期间 pywebviewready / loaded 事件
+        #   全被堵住，窗口就一直「未响应」。
+        #   改成 `_window` 后 0.00 秒（下划线开头的属性会被跳过）。
+        self._window = None
+        self._warming = False
+        self._served = False          # 前端是否已经成功拿到过数据
+        self._relogging = False       # 是否正在自动重新登录
+
+    # ---- 数据 ----
+    def get_data(self):
+        # 第一次被前端调用 = 界面真的活过来了（用于排查「未响应」）
+        if not self._served:
+            self._served = True
+            log.info("界面已就绪（前端首次请求数据）")
+        return pipeline.snapshot()
+
+    def refresh(self):
+        pipeline.refresh_async()
+        return {"ok": True}
+
+    def set_auto_refresh(self, enabled=True):
+        pipeline.set_auto_refresh(bool(enabled))
+        return {"ok": True, "enabled": bool(enabled)}
+
+    def auto_status(self):
+        return pipeline.auto_status()
+
+    # ══════════ 首次运行引导（ 打包版的关键：填账密即用） ══════════
+    def setup_status(self):
+        """前端问「需要引导吗？」
+
+         只看本地有没有填过账号，不发网络请求 ——
+          这样界面一打开就能立刻决定显示引导页还是主界面。
+        """
+        return {
+            "need_setup": not config.has_credentials(),
+            "data_dir": str(config.ROOT),
+            "frozen": bool(getattr(sys, "frozen", False)),
+        }
+
+    def save_setup(self, login: str, password: str, url: str = "",
+                   schedule_login: str = "", schedule_password: str = ""):
+        """保存账号密码（引导页提交）。
+
+         只写「真正需要的键」，不覆盖已有的其他配置。
+         写完立刻用新凭据试一次登录，让用户当场知道对不对 ——
+          不然他以为填好了，其实要等半小时后才发现是错的。
+        """
+        login = (login or "").strip()
+        password = (password or "").strip()
+        if not login or not password:
+            return {"ok": False, "error": "账号和密码都要填"}
+
+        url = (url or "").strip()
+        if url and not url.startswith("http"):
+            return {"ok": False, "error": "网址要以 http:// 或 https:// 开头"}
+
+        # 读现有的（保留 _schedule 等其他配置）
+        cred = dict(config.CREDENTIALS or {})
+
+        mb = dict(cred.get("_managebac") or {})
+        mb["login"] = login
+        mb["password"] = password
+        if url:
+            mb["url"] = url
+        mb.setdefault("note", "ManageBac 学生账号（学校系统）")
+        cred["_managebac"] = mb
+
+        # 课表账号可选 —— 有些学校没有希悦，不填也能用
+        sl = (schedule_login or "").strip()
+        sp = (schedule_password or "").strip()
+        if sl and sp:
+            sc = dict(cred.get("_schedule") or {})
+            sc["login"] = sl
+            sc["password"] = sp
+            sc.setdefault("note", "课表系统（可选）")
+            cred["_schedule"] = sc
+
+        try:
+            path = config.save_credentials(cred)
+        except Exception as e:
+            log.exception("保存凭据失败")
+            return {"ok": False, "error": f"保存失败：{e}"}
+
+        # 重新加载到内存（正在跑的进程也要能立刻用上新账号）
+        try:
+            import importlib
+            from app import config as _cfg
+            importlib.reload(_cfg)
+            from app import httpclient as _hc
+            _hc.CREDENTIALS = _cfg.CREDENTIALS
+            _hc.CRED_FILE = _cfg.ROOT / "credentials.json"
+        except Exception as e:
+            log.warning("重载凭据失败（重启后生效）：%s", e)
+
+        log.info("凭据已保存到 %s", path)
+        return {"ok": True, "path": str(path)}
+
+    def test_login(self, login: str, password: str, url: str = ""):
+        """用**用户刚填的**凭据试登录一次。
+
+         不写入任何文件 —— 先验证再保存，避免填错了留在磁盘上。
+         绝不重试（失败一次就返回）—— 连续失败会锁号。
+        """
+        login = (login or "").strip()
+        password = (password or "").strip()
+        if not login or not password:
+            return {"ok": False, "error": "账号和密码都要填"}
+
+        try:
+            from app import httpclient
+
+            base = (url or "").strip() or config.BASE_URL
+            if not base.startswith("http"):
+                base = "https://" + base.lstrip("/")
+
+            # 用独立会话试，不影响正在跑的
+            s = httpclient.HttpSession(auto_login_on_demand=False)
+            s.base = base.rstrip("/")
+            ok, msg = s.login(login, password)
+            if ok:
+                log.info("引导页测试登录成功")
+                return {"ok": True, "message": "登录成功"}
+            log.warning("引导页测试登录失败：%s", msg)
+            return {"ok": False, "error": msg or "登录失败"}
+        except Exception as e:
+            log.warning("引导页测试登录异常：%s", e)
+            return {"ok": False, "error": f"连接不上：{e}"}
+
+    def open_data_folder(self):
+        """打开数据目录（用户想找缓存/日志时用得上）。"""
+        try:
+            config.ensure_dirs()
+            os.startfile(str(config.ROOT))       # noqa: S606 (Windows)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ---- 预热：自动登录 + 抓取（让「打开即有内容」）----
+    def warmup_status(self):
+        """返回预热结果，供界面显示「数据是否是自动抓来的」。"""
+        from app import warmup
+        st = warmup.read_status()
+        st["cache_age"] = int(warmup.cache_age())
+        st["cache_fresh"] = warmup.cache_is_fresh()
+        return st
+
+    def warmup_now(self):
+        """界面上的「立刻预热」按钮：后台自动登录 + 抓取。"""
+        from app import warmup
+        if getattr(self, "_warming", False):
+            return {"ok": True, "already": True}
+
+        self._warming = True
+
+        def work() -> None:
+            try:
+                warmup.ensure_fresh(verbose=False, force=True)
+            except Exception as e:
+                log.warning("预热失败：%s", e)
+            finally:
+                self._warming = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True}
+
+    # ---- 晚报（每个工作日晚 9 点自动生成）----
+    def digest_status(self):
+        """给顶部小红点用：今天是否有未读晚报。"""
+        try:
+            from app import digest
+            return digest.status()
+        except Exception as e:
+            log.warning("晚报状态读取失败：%s", e)
+            return {"ok": False, "unread": False, "has_any": False}
+
+    def digest_latest(self):
+        """打开晚报面板：返回最近一份（若已过 21:00 且今天还没生成，就现场生成）。"""
+        try:
+            from app import digest
+            data = pipeline.snapshot()
+            made = digest.ensure_today(data)
+            cur = made or digest.latest()
+            if not cur:
+                return {"ok": False, "error": "还没有晚报（工作日晚 9 点后自动生成）"}
+            cur = dict(cur)
+            cur["ok"] = True
+            cur["history"] = [
+                {"date": x.get("date"), "weekday": x.get("weekday"),
+                 "counts": x.get("counts") or {}}
+                for x in digest.list_all(14)
+            ]
+            return cur
+        except Exception as e:
+            log.warning("晚报读取失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def digest_by_date(self, d: str = ""):
+        """按日期取某一期晚报（顶部可翻历史）。"""
+        try:
+            from app import digest
+            for x in digest.list_all(60):
+                if x.get("date") == d:
+                    out = dict(x)
+                    out["ok"] = True
+                    return out
+            return {"ok": False, "error": "找不到这一期的晚报"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def digest_read(self):
+        """标记已读（清掉顶部小红点）。"""
+        try:
+            from app import digest
+            digest.mark_read()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ---- 窗口 ----
+    def minimize(self):
+        try:
+            self._window.minimize()
+        except Exception:
+            pass
+        return {"ok": True}
+
+    # ---- 跳转：用系统默认浏览器（你已登录的 Edge）----
+    def open_url(self, url: str):
+        """打开链接 ——  先过安全校验，阻止「退出/删除/上传/提交」类操作。
+
+        参考 CampusDesk 的做法：只允许「查看页面」类链接通过。
+        这不是防坏人，是**防解析出错** —— 页面结构一变，
+        可能顺手抓到旁边的「删除」按钮链接，用户点下去就出事了。
+        """
+        if not url:
+            return {"ok": False}
+
+        try:
+            from app import safelink
+
+            safe = safelink.sanitize(url)
+        except Exception as e:
+            log.warning("链接校验异常：%s", e)
+            safe = url                      # 校验器本身出错时不拦（保功能）
+
+        if not safe:
+            log.warning("已阻止打开不安全链接：%s", url[:160])
+            return {"ok": False, "blocked": True,
+                    "error": "这个链接可能是「退出/删除」类操作，为安全起见没有打开"}
+
+        try:
+            webbrowser.open(safe, new=2)
+            log.info("打开：%s", safe)
+            return {"ok": True}
+        except Exception as e:
+            log.warning("打开失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    # ---- 数据与备份（导出 / 导入）----
+    def backup_status(self):
+        """给「数据与备份」面板用：当前有多少可备份的数据。"""
+        try:
+            from app import backup
+            return backup.status()
+        except Exception as e:
+            log.warning("读取备份状态失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def backup_export(self):
+        """导出到桌面。返回 {ok, path, counts, bytes}。"""
+        try:
+            from app import backup
+            return backup.export()
+        except Exception as e:
+            log.warning("导出失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def backup_import(self, path: str = ""):
+        """导入指定备份文件（默认合并，不覆盖现有记录）。"""
+        if not path:
+            return {"ok": False, "error": "没有指定文件"}
+        try:
+            from app import backup
+            return backup.import_from(path, merge=True)
+        except Exception as e:
+            log.warning("导入失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def pick_backup_file(self):
+        """ 用 Windows 原生「打开文件」对话框让用户挑备份文件。
+
+        为什么不用 HTML 的 <input type=file>：
+          pywebview 里拿不到真实路径（浏览器安全限制），
+          而导入需要路径。所以走 tkinter 的原生对话框
+          —— 这也是 Windows 用户的习惯交互。
+        """
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)      # 保证对话框在最前面
+            path = filedialog.askopenfilename(title="选择备份文件",
+                filetypes=[("备份文件", "*.json"), ("所有文件", "*.*")],
+                initialdir=str(self._desktop_dir()),
+            )
+            root.destroy()
+            if not path:
+                return ""                          # 用户取消
+            return str(path)
+        except Exception as e:
+            log.warning("打开文件选择器失败：%s", e)
+            return ""
+
+    @staticmethod
+    def _desktop_dir():
+        from pathlib import Path
+        import os
+        for cand in (Path(os.environ.get("USERPROFILE", "")) / "Desktop",
+            Path(os.environ.get("USERPROFILE", "")) / "OneDrive" / "Desktop",
+        ):
+            if cand.exists():
+                return cand
+        return Path(os.environ.get("USERPROFILE", "."))
+
+    # ---- 登录：修复（用户要求「不要让我自己跑脚本」）----
+    def relogin(self):
+        """点一下就把两个登录态都恢复。
+
+        后台线程跑，不阻塞界面。完成后前端会通过 poll 自动看到新数据。
+        """
+        if getattr(self, "_relogging", False):
+            return {"ok": True, "already": True}
+
+        self._relogging = True
+
+        def work() -> None:
+            try:
+                from app import autologin, pipeline
+
+                log.info("用户点击「重新登录」，开始自动恢复登录态")
+                res = autologin.ensure_all(reason="user_click")
+
+                # 恢复成功 → 立即抓一次，让界面刷新
+                if (res.get("mb") or {}).get("ok"):
+                    try:
+                        pipeline.refresh_sync()
+                    except Exception as e:
+                        log.warning("重新登录后抓取失败：%s", e)
+            except Exception as e:
+                log.warning("重新登录失败：%s", e)
+            finally:
+                self._relogging = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "started": True}
+
+    def login_status(self):
+        """给界面用：两个登录态健康度，以及是否有失败在退避中。"""
+        try:
+            from app import autologin
+            return autologin.status()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def show_login_help(self):
+        """兼容旧调用 —— 直接触发自动登录，而不是让用户敲命令。"""
+        return self.relogin()
+
+    # ---- 「我已完成，不再提示」 ----
+    def mark_done(self, url: str = "", title: str = "", course: str = ""):
+        """手动标记为已完成（线下交纸质版、老师未给分的情况）。
+
+        只存本地，**不会**写入 ManageBac。
+        """
+        try:
+            from app import manual_done
+
+            ok = manual_done.mark(url, title, course)
+            pipeline.apply_manual_marks()
+            pipeline.save_cache_now()
+            log.info("手动完成：%s", title or url)
+            return {"ok": ok, "total": manual_done.count()}
+        except Exception as e:
+            log.warning("标记完成失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def unmark_done(self, url: str = "", title: str = "", course: str = ""):
+        """撤销手动标记，回到「已提交 / 已给分」的原始判定。"""
+        try:
+            from app import manual_done
+
+            ok = manual_done.unmark(url, title, course)
+            pipeline.apply_manual_marks()
+            pipeline.save_cache_now()
+            log.info("撤销手动完成：%s", title or url)
+            return {"ok": ok, "total": manual_done.count()}
+        except Exception as e:
+            log.warning("撤销标记失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def manual_count(self):
+        try:
+            from app import manual_done
+
+            return {"ok": True, "count": manual_done.count()}
+        except Exception as e:
+            return {"ok": False, "count": 0, "error": str(e)}
+
+    # ---- 任务详情（点击卡片展开）----
+    def task_detail(self, url: str = "", force: bool = False):
+        """抓取任务的附件 / 老师要求 / 成绩。
+
+        结果按任务缓存 24 小时 —— 点第二次是几乎立即的。
+        """
+        try:
+            from app import taskdetail
+
+            return taskdetail.fetch(url, force=bool(force))
+        except Exception as e:
+            log.warning("取任务详情失败：%s", e)
+            return {"ok": False, "error": str(e), "attachments": [],
+                    "description": "", "grade": {}}
+
+    # ---- 资料（Files 实时浏览 / 下载）----
+    def files_list(self, cid: str, fid: str = "", force: bool = False):
+        """列出课程 Files 的目录内容（含子文件夹）。
+
+         实时向 ManageBac 请求；force=True 时绕过缓存。
+        """
+        try:
+            from app import files
+
+            return files.list_files(cid, fid or "", use_cache=not force)
+        except Exception as e:
+            log.warning("列 Files 失败：%s", e)
+            return {"ok": False, "error": str(e), "folders": [],
+                    "files": [], "items": [], "total": 0}
+
+    def files_download(self, item: dict):
+        """下载单个文件（后台线程，立刻返回）。"""
+        if not isinstance(item, dict) or not item.get("url"):
+            return {"ok": False, "error": "参数不正确"}
+        threading.Thread(target=self._dl_file_item, args=(item,),
+                         daemon=True).start()
+        return {"ok": True, "started": True}
+
+    def _dl_file_item(self, item: dict) -> None:
+        try:
+            from app import files
+
+            # 保存到桌面/ManageBac 资料/<课程名>/<文件夹路径>/
+            cls_name = (item.get("className") or "").strip()
+            sub = (item.get("subDir") or "").strip()
+            root = files.save_root(cls_name)
+            if sub:
+                for part in sub.split("/"):
+                    part = part.strip()
+                    if part and part not in (".", ".."):
+                        root = root / files.safe_name(part)
+
+            res = files.download_item(item, dest_dir=root,
+                                      referer=item.get("referer", ""))
+            if res.get("ok"):
+                size = res.get("size") or 0
+                self._notify({"ok": True, "count": 1, "total": 1,
+                              "folder": str(root)}, res.get("name", ""),
+                             extra=f"{size/1024:.0f} KB")
+            else:
+                self._notify({"ok": False, "count": 0, "total": 1,
+                              "folder": "", "error": res.get("error")},
+                             res.get("name", ""))
+        except Exception as e:
+            log.exception("下载文件项失败")
+            self._notify({"ok": False, "count": 0, "total": 1,
+                          "folder": "", "error": str(e)}, item.get("name", ""))
+
+    def files_download_all(self, cid: str, fid: str = "",
+                           cls_name: str = "", folder: str = ""):
+        """下载当前目录里的**全部文件**（不含子文件夹，后台执行）。"""
+        try:
+            from app import files
+
+            d = files.list_files(cid, fid or "", use_cache=False)
+            if not d.get("ok"):
+                return {"ok": False, "error": d.get("error") or "读取失败"}
+            items = d.get("files") or []
+            if not items:
+                return {"ok": False, "error": "本目录没有文件"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+        threading.Thread(target=self._dl_items_all,
+            args=(items, cls_name, folder), daemon=True
+        ).start()
+        return {"ok": True, "started": True, "total": len(items)}
+
+    def _dl_items_all(self, items: list, cls_name: str,
+                      folder: str) -> None:
+        try:
+            from app import files
+
+            root = files.save_root(cls_name)
+            if folder:
+                for part in folder.split("/"):
+                    part = part.strip()
+                    if part and part not in (".", ".."):
+                        root = root / files.safe_name(part)
+
+            ok = 0
+            for it in items:
+                try:
+                    r = files.download_item(it, dest_dir=root)
+                    if r.get("ok"):
+                        ok += 1
+                except Exception as e:
+                    log.warning("下载 %s 失败：%s", it.get("name"), e)
+
+            self._notify({"ok": ok > 0, "count": ok, "total": len(items),
+                          "folder": str(root)},
+                         folder or cls_name or "资料")
+        except Exception as e:
+            log.exception("批量下载失败")
+            self._notify({"ok": False, "count": 0, "total": len(items),
+                          "folder": "", "error": str(e)}, "资料")
+
+    # ---- 下载 ----
+    def download_task(self, cid: str, tid: str, title: str = ""):
+        """下载某任务的全部附件（后台线程，避免卡住界面）。"""
+        threading.Thread(target=self._dl_task, args=(cid, tid, title), daemon=True
+        ).start()
+        return {"ok": True, "started": True}
+
+    def _dl_task(self, cid: str, tid: str, title: str) -> None:
+        try:
+            from app import download as dl
+
+            res = dl.download_task(cid, tid, title)
+            self._notify(res, title)
+        except Exception as e:
+            log.exception("下载失败")
+            self._alert(f"下载失败：{e}")
+
+    def download_files(self, cid: str, name: str = ""):
+        """下载某课程 Files 里的全部文件。"""
+        threading.Thread(target=self._dl_files, args=(cid, name), daemon=True
+        ).start()
+        return {"ok": True, "started": True}
+
+    def _dl_files(self, cid: str, name: str) -> None:
+        try:
+            from app import download as dl
+
+            res = dl.download_files(cid, name)
+            self._notify(res, name)
+        except Exception as e:
+            log.exception("下载失败")
+            self._alert(f"下载失败：{e}")
+
+    def list_files(self, cid: str, folder: str = ""):
+        """列出课程 Files 的内容（**纯 HTTP，不启动浏览器**）。
+
+         历史坑：这个方法的旧实现走 `app/download.py` 的 `list_files()`，
+          那个用 CDP 驱动浏览器 → 前端一进「资料」页就会拉起一个
+          无头 Edge，用户看着莫名（实测确实发生过）。
+          现在统一走 `app/files.py`（纯 HTTP + 缓存）。
+        """
+        try:
+            from app import files
+
+            r = files.list_files(cid, folder or "", use_cache=True)
+            if not r.get("ok"):
+                return {"ok": False, "items": [],
+                        "error": r.get("error") or "读取失败"}
+            return {"ok": True, "items": r.get("items") or []}
+        except Exception as e:
+            log.warning("列出 Files 失败：%s", e)
+            return {"ok": False, "error": str(e), "items": []}
+
+    def download_file(self, url: str, filename: str = "", subdir: str = ""):
+        """下载单个文件（Files 里的某一项）。"""
+        threading.Thread(target=self._dl_one, args=(url, filename, subdir), daemon=True
+        ).start()
+        return {"ok": True, "started": True}
+
+    def _dl_one(self, url: str, filename: str, subdir: str) -> None:
+        try:
+            from app import download as dl
+
+            root = dl.download_root()
+            if subdir:
+                root = root / dl.safe_name(subdir)
+            root.mkdir(parents=True, exist_ok=True)
+            name = dl.safe_name(filename or dl.guess_name(url))
+            dest = root / name
+            cookies = dl.browser_cookies()
+            res = dl.download_one(url, dest, cookies)
+            if res.get("ok"):
+                self._notify({"ok": True, "count": 1, "total": 1,
+                              "folder": str(root)}, name)
+            else:
+                self._alert(f"下载失败：{res.get('error')}")
+        except Exception as e:
+            log.exception("下载失败")
+            self._alert(f"下载失败：{e}")
+
+    def open_folder(self, path: str):
+        try:
+            from app import download as dl
+
+            dl.open_folder(path)
+        except Exception:
+            pass
+        return {"ok": True}
+
+    # ---- 内部：结果提示 ----
+    @staticmethod
+    def _notify(res: dict, label: str, extra: str = "") -> None:
+        try:
+            import webview as _wv
+
+            if res.get("ok"):
+                folder = (res.get("folder") or "").replace("\\", "\\\\")
+                _wv.windows[0].evaluate_js(f"window.downloadDone && window.downloadDone("
+                    f"{json.dumps(res.get('count', 0))}, "
+                    f"{json.dumps(res.get('total', 0))}, "
+                    f"{json.dumps(label)}, {json.dumps(folder)}, "
+                    f"{json.dumps(extra)})"
+                )
+            else:
+                _wv.windows[0].evaluate_js(f"window.downloadDone && window.downloadDone("
+                    f"0, 1, {json.dumps(label)}, '', '', "
+                    f"{json.dumps(res.get('error') or '未知原因')})"
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _alert(msg: str) -> None:
+        try:
+            import webview as _wv
+
+            _wv.windows[0].evaluate_js(f"alert({json.dumps(msg)})")
+        except Exception:
+            pass
+
+
+def main() -> int:
+    config.ensure_dirs()
+    log.info("=" * 52)
+    log.info("启动 CampusPulse（解释器 %s）", sys.executable)
+
+    # 先用缓存渲染，界面秒开
+    pipeline.load_from_cache()
+
+    api = Api()
+    #  启动自检：确保 js_api 没有「公开的非函数属性」，
+    #   否则 pywebview 会递归遍历 → 窗口「未响应」。
+    _check_js_api_safe(api)
+    window = webview.create_window(TITLE,
+        url=str(config.WEB_DIR / "index.html"),
+        js_api=api,
+        width=W, height=H, min_size=(370, 500),
+        resizable=True, easy_drag=False, text_select=True,
+        background_color="#f5f1e8",
+    )
+    api._window = window
+
+    def after_start() -> None:
+        # 启动自动刷新循环（每 config.AUTO_REFRESH_SEC 秒抓一次）
+        pipeline.start_auto_refresh()
+
+        def work() -> None:
+            import time as _t
+
+            # 等界面渲染完，用户已经看到缓存内容
+            _t.sleep(0.8)
+
+            #  只抓一次。以前这里是 refresh_async() + ensure_fresh()，
+            #   两个都会抓 → 抢锁 + 双重请求 → 容易触发限速，冷启动像卡死。
+            #   现在统一交给一个「开机准备」函数：
+            #     - 缓存够新 → 直接返回（不碰网络）
+            #     - 需要抓   → 自己抓一次（含自动登录）
+            try:
+                from app import warmup
+
+                warmup.startup_prepare(verbose=False)
+            except Exception as e:
+                log.warning("开机准备失败，退回普通刷新：%s", e)
+                try:
+                    pipeline.refresh_async()
+                except Exception:
+                    pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    webview.start(after_start, debug=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

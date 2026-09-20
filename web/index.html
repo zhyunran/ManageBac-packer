@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>CampusPulse</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     SVG 图标库
+     统一 24×24 线性风格（stroke 跟随 currentColor），
+     风格参照 GitHub Octicons / Feather —— 简洁几何、统一描边。
+     ══════════════════════════════════════════════════════════════════ -->
+<svg width="0" height="0" aria-hidden="true" focusable="false"
+     style="position:absolute;overflow:hidden">
+  <defs>
+    <!-- 课程成绩（打开的书） -->
+    <symbol id="i-grades" viewBox="0 0 24 24">
+      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/>
+    </symbol>
+    <!-- 课表（日历） -->
+    <symbol id="i-cal" viewBox="0 0 24 24">
+      <rect x="3" y="4.5" width="18" height="16" rx="2.5"/>
+      <path d="M8 2.5v4M16 2.5v4M3 9.5h18"/>
+    </symbol>
+    <!-- 文件夹 -->
+    <symbol id="i-folder" viewBox="0 0 24 24">
+      <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.1a2 2 0 0 1 1.55.72l.9 1.06a2 2 0 0 0 1.55.72h6.4A2.5 2.5 0 0 1 21 10v6.5A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5Z"/>
+    </symbol>
+    <!-- 空白文件 -->
+    <symbol id="i-file" viewBox="0 0 24 24">
+      <path d="M14 2.5H7.5A2.5 2.5 0 0 0 5 5v14a2.5 2.5 0 0 0 2.5 2.5h9A2.5 2.5 0 0 0 19 19V7.5Z"/>
+      <path d="M14 2.5V7.5H19"/>
+    </symbol>
+    <!-- 文档（doc） -->
+    <symbol id="i-doc" viewBox="0 0 24 24">
+      <path d="M14 2.5H7.5A2.5 2.5 0 0 0 5 5v14a2.5 2.5 0 0 0 2.5 2.5h9A2.5 2.5 0 0 0 19 19V7.5Z"/>
+      <path d="M14 2.5V7.5H19M8.5 12.5h7M8.5 16h4.5"/>
+    </symbol>
+    <!-- 表格（xls / csv） -->
+    <symbol id="i-table" viewBox="0 0 24 24">
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2"/>
+      <path d="M3.5 9.5h17M9.5 9.5v10M15 9.5v10"/>
+    </symbol>
+    <!-- 幻灯片（ppt） -->
+    <symbol id="i-slides" viewBox="0 0 24 24">
+      <rect x="2.5" y="4" width="19" height="12.5" rx="2"/>
+      <path d="M12 16.5V21M8.5 21h7"/>
+    </symbol>
+    <!-- 图片 -->
+    <symbol id="i-image" viewBox="0 0 24 24">
+      <rect x="3" y="4.5" width="18" height="15" rx="2.5"/>
+      <circle cx="8.7" cy="10.2" r="1.6"/>
+      <path d="M4 17.6l4.5-4.2a1.8 1.8 0 0 1 2.5.05L16 18"/>
+      <path d="M14.4 14.6l1.7-1.5a1.8 1.8 0 0 1 2.5.05L21 15.6"/>
+    </symbol>
+    <!-- 压缩包 -->
+    <symbol id="i-zip" viewBox="0 0 24 24">
+      <rect x="3.5" y="4" width="17" height="16" rx="2.5"/>
+      <path d="M10 4v2.6M12.5 6.6v2.6M10 9.2v2.6M12.5 11.8v2.6"/>
+      <rect x="9.6" y="16.2" width="3.4" height="3.6" rx="1"/>
+    </symbol>
+    <!-- 视频 -->
+    <symbol id="i-video" viewBox="0 0 24 24">
+      <rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/>
+      <path d="M10.4 9.6l4.4 2.4-4.4 2.4Z"/>
+    </symbol>
+    <!-- 音频 -->
+    <symbol id="i-audio" viewBox="0 0 24 24">
+      <path d="M9.5 17.8V6.2l9-1.7v12"/>
+      <circle cx="7" cy="18" r="2.5"/>
+      <circle cx="16" cy="16.5" r="2.5"/>
+    </symbol>
+    <!-- 刷新 -->
+    <symbol id="i-refresh" viewBox="0 0 24 24">
+      <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/>
+      <path d="M20.8 4.2v4.6h-4.6"/>
+    </symbol>
+    <!-- 下三角 -->
+    <symbol id="i-chevdown" viewBox="0 0 24 24">
+      <path d="M5.5 9l6.5 6.4L18.5 9"/>
+    </symbol>
+    <!-- 右三角 -->
+    <symbol id="i-chevright" viewBox="0 0 24 24">
+      <path d="M9 5.5l6.4 6.5L9 18.5"/>
+    </symbol>
+    <!-- 暂停 -->
+    <symbol id="i-pause" viewBox="0 0 24 24">
+      <path d="M9.5 5v14M14.5 5v14"/>
+    </symbol>
+    <!-- 播放 -->
+    <symbol id="i-play" viewBox="0 0 24 24">
+      <path d="M7.5 4.9l11.2 7.1-11.2 7.1Z"/>
+    </symbol>
+    <!-- 钥匙 -->
+    <symbol id="i-key" viewBox="0 0 24 24">
+      <circle cx="8" cy="15.5" r="4"/>
+      <path d="M10.9 12.6L20 3.5M17 6.5l2.2 2.2M14.4 9.1l2.2 2.2"/>
+    </symbol>
+    <!-- 最小化 -->
+    <symbol id="i-minus" viewBox="0 0 24 24">
+      <path d="M5.5 12h13"/>
+    </symbol>
+    <!-- 返回（←） -->
+    <symbol id="i-back" viewBox="0 0 24 24">
+      <path d="M20 12H4.5"/><path d="M10.5 5.5L4 12l6.5 6.5"/>
+    </symbol>
+    <!-- 外部链接 -->
+    <symbol id="i-external" viewBox="0 0 24 24">
+      <path d="M13.5 4.5H19.5V10.5"/>
+      <path d="M19.5 4.5L11 13"/>
+      <path d="M18 14v4.5A1.5 1.5 0 0 1 16.5 20h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/>
+    </symbol>
+    <!-- 下载 -->
+    <symbol id="i-download" viewBox="0 0 24 24">
+      <path d="M12 3.5v11"/><path d="M7.5 10L12 14.5 16.5 10"/>
+      <path d="M4.5 19.5h15"/>
+    </symbol>
+    <!-- 对勾 -->
+    <symbol id="i-check" viewBox="0 0 24 24">
+      <path d="M4.5 12.8l5 5 10-11"/>
+    </symbol>
+    <!-- 关闭 -->
+    <symbol id="i-x" viewBox="0 0 24 24">
+      <path d="M6 6l12 12M18 6L6 18"/>
+    </symbol>
+    <!-- 警告三角 -->
+    <symbol id="i-alert" viewBox="0 0 24 24">
+      <path d="M10.3 3.9L2.4 17.5A2 2 0 0 0 4.1 20.5h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/>
+      <path d="M12 9.5v4M12 17h.01"/>
+    </symbol>
+    <!-- 收件箱（空状态） -->
+    <symbol id="i-inbox" viewBox="0 0 24 24">
+      <path d="M21 12.5h-5l-1.5 2.5h-5L8 12.5H3"/>
+      <path d="M5.4 5.4L3 12.5v5A2.5 2.5 0 0 0 5.5 20h13a2.5 2.5 0 0 0 2.5-2.5v-5l-2.4-7.1A2.5 2.5 0 0 0 16.3 3.7H7.7A2.5 2.5 0 0 0 5.4 5.4Z"/>
+    </symbol>
+    <!-- 图钉 -->
+    <symbol id="i-pin" viewBox="0 0 24 24">
+      <path d="M15.5 3.5l5 5-2.4 1.2-.7 4.6-4.1-4.1-5.6 5.6"/>
+      <path d="M8.2 15.8L3.5 20.5"/>
+    </symbol>
+    <!-- 奖章（GPA/成绩） -->
+    <symbol id="i-award" viewBox="0 0 24 24">
+      <circle cx="12" cy="9" r="5.5"/>
+      <path d="M8.6 13.6L7 21l5-2.6L17 21l-1.6-7.4"/>
+    </symbol>
+    <!-- 回形针（附件） -->
+    <symbol id="i-clip" viewBox="0 0 24 24">
+      <path d="M20 11.4l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.9-8.9a3.3 3.3 0 0 1 4.7 4.7l-8.9 8.9a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/>
+    </symbol>
+    <!-- 时钟 -->
+    <symbol id="i-clock" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.5"/><path d="M12 7v5.3l3.4 2"/>
+    </symbol>
+    <!-- 闪电（预热） -->
+    <symbol id="i-zap" viewBox="0 0 24 24">
+      <path d="M13.5 2.5L4 13.6h7.2l-.9 7.9L20 10.3h-7.2Z"/>
+    </symbol>
+    <!-- 日出（今日开头） -->
+    <symbol id="i-sunrise" viewBox="0 0 24 24">
+      <path d="M12 3.5v5M5.6 10.1l1.8 1.8M18.4 10.1l-1.8 1.8M2.5 18.5h19"/>
+      <path d="M7.5 18.5a4.5 4.5 0 0 1 9 0"/>
+    </symbol>
+    <!-- 列表（其他） -->
+    <symbol id="i-list" viewBox="0 0 24 24">
+      <path d="M8.5 7h12M8.5 12h12M8.5 17h12M4 7h.01M4 12h.01M4 17h.01"/>
+    </symbol>
+    <!-- 烧瓶（测验） -->
+    <symbol id="i-flask" viewBox="0 0 24 24">
+      <path d="M9.5 3.5v6.2L4.6 18a2 2 0 0 0 1.7 3h11.4a2 2 0 0 0 1.7-3l-4.9-8.3V3.5"/>
+      <path d="M8.5 3.5h7M7.2 15h9.6"/>
+    </symbol>
+    <!-- 便签（作业） -->
+    <symbol id="i-note" viewBox="0 0 24 24">
+      <path d="M14 2.5H7.5A2.5 2.5 0 0 0 5 5v14a2.5 2.5 0 0 0 2.5 2.5H15l4-4V5a2.5 2.5 0 0 0-2.5-2.5Z"/>
+      <path d="M14 21.5V18a2 2 0 0 1 2-2h3"/>
+      <path d="M8.5 9h6M8.5 13h4"/>
+    </symbol>
+    <!-- 勾选圈（已完成） -->
+    <symbol id="i-checkcircle" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.6"/><path d="M8.3 12.3l2.6 2.6 4.9-5.2"/>
+    </symbol>
+    <!-- 撤销 -->
+    <symbol id="i-undo" viewBox="0 0 24 24">
+      <path d="M4.5 8.5h9.8a5.35 5.35 0 0 1 0 10.7H8.6"/>
+      <path d="M8 4.5L3.5 8.5 8 12.5"/>
+    </symbol>
+    <!-- 日历+（新增） -->
+    <symbol id="i-calplus" viewBox="0 0 24 24">
+      <rect x="3" y="4.5" width="18" height="16" rx="2.5"/>
+      <path d="M8 2.5v4M16 2.5v4M3 9.5h18"/>
+      <path d="M12 12.5v5M9.5 15h5"/>
+    </symbol>
+    <!-- 星光（GPA/亮点） -->
+    <symbol id="i-sparkle" viewBox="0 0 24 24">
+      <path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9Z"/>
+      <path d="M18.5 16.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z"/>
+    </symbol>
+    <!-- 邮件（晚报） -->
+    <symbol id="i-mail" viewBox="0 0 24 24">
+      <rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/>
+      <path d="M3 6.5l8.1 5.7a1.6 1.6 0 0 0 1.8 0L21 6.5"/>
+    </symbol>
+    <!-- 盾牌（数据与备份） -->
+    <symbol id="i-shield" viewBox="0 0 24 24">
+      <path d="M12 2.8l7 2.8v6.1c0 4.2-2.9 7.9-7 9.5-4.1-1.6-7-5.3-7-9.5V5.6Z"/>
+      <path d="M9 12.2l2.1 2.1 4-4.2"/>
+    </symbol>
+    <!-- 设置（齿轮） -->
+    <symbol id="i-settings" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3.2"/>
+      <path d="M19.1 14.4a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1.03Z"/>
+    </symbol>
+    <!-- 眼睛（显示密码） -->
+    <!-- 加号（自编课表） -->
+    <symbol id="i-plus" viewBox="0 0 24 24">
+      <path d="M12 5v14M5 12h14"/>
+    </symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24">
+      <path d="M2.2 12S5.6 5.5 12 5.5 21.8 12 21.8 12 18.4 18.5 12 18.5 2.2 12 2.2 12Z"/>
+      <circle cx="12" cy="12" r="3.2"/>
+    </symbol>
+    <!-- 眼睛划掉（隐藏密码） -->
+    <symbol id="i-eye-off" viewBox="0 0 24 24">
+      <path d="M9.9 5.9A9.4 9.4 0 0 1 12 5.5c6.4 0 9.8 6.5 9.8 6.5a17 17 0 0 1-3 3.9"/>
+      <path d="M6.3 7.9A16.8 16.8 0 0 0 2.2 12S5.6 18.5 12 18.5c1.6 0 3-.4 4.2-1.1"/>
+      <path d="M9.9 9.9a3.2 3.2 0 0 0 4.4 4.4"/>
+      <path d="M3.2 3.2l17.6 17.6"/>
+    </symbol>
+    <!-- 导出（向上箭头出箱） -->
+    <symbol id="i-export" viewBox="0 0 24 24">
+      <path d="M12 15.5V4"/><path d="M7.5 8.5L12 4l4.5 4.5"/>
+      <path d="M4.5 14v5.5h15V14"/>
+    </symbol>
+    <!-- 导入（向下箭头进箱） -->
+    <symbol id="i-import" viewBox="0 0 24 24">
+      <path d="M12 4v11.5"/><path d="M7.5 11L12 15.5 16.5 11"/>
+      <path d="M4.5 14v5.5h15V14"/>
+    </symbol>
+    <!-- 趋势向上（成绩上升） -->
+    <symbol id="i-trend" viewBox="0 0 24 24">
+      <path d="M21 7l-7.5 7.5-4-4L3 17"/>
+      <path d="M16 7h5v5"/>
+    </symbol>
+    <!-- 时钟加（即将截止） -->
+    <symbol id="i-hourglass" viewBox="0 0 24 24">
+      <path d="M7 3.5h10M7 20.5h10"/>
+      <path d="M8 3.5v3.2a4 4 0 0 0 1.2 2.8L12 12l-2.8 2.5A4 4 0 0 0 8 17.3v3.2"/>
+      <path d="M16 3.5v3.2a4 4 0 0 1-1.2 2.8L12 12l2.8 2.5a4 4 0 0 1 1.2 2.8v3.2"/>
+    </symbol>
+    <!-- 书本合上（空课程） -->
+    <symbol id="i-book" viewBox="0 0 24 24">
+      <path d="M3.5 5.5A2 2 0 0 1 5.5 3.5H11v17H5.5a2 2 0 0 1-2-2Z"/>
+      <path d="M11 3.5h7.5a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H11"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div id="bar">
+  <div class="logo">MB</div>
+  <div class="brand">ManageBac <small id="upd">—</small></div>
+  <div class="flex"></div>
+  <button class="ibtn" id="btnFold" title="全部折叠 / 展开">
+    <svg class="oi"><use href="#i-chevdown"/></svg></button>
+  <button class="ibtn" id="live" title="自动刷新倒计时"></button>
+  <button class="ibtn" id="btnAuto" title="开启 / 暂停自动刷新">
+    <svg class="oi"><use href="#i-pause"/></svg></button>
+  <button class="ibtn dig" id="btnDigest" title="晚报（每个工作日晚 9 点生成）">
+    <svg class="oi"><use href="#i-mail"/></svg>
+    <i class="digdot" id="digdot"></i></button>
+  <button class="ibtn" id="btnLogin" title="重新登录（自动）">
+    <svg class="oi"><use href="#i-key"/></svg></button>
+  <button class="ibtn" id="btnSettings" title="外观设置">
+    <svg class="oi"><use href="#i-settings"/></svg>
+  </button>
+  <button class="ibtn" id="btnData" title="数据与备份（导出 / 导入）">
+    <svg class="oi"><use href="#i-shield"/></svg></button>
+  <button class="ibtn" id="btnRefresh" title="立即刷新">
+    <svg class="oi"><use href="#i-refresh"/></svg></button>
+  <button class="ibtn" id="btnMin" title="最小化">
+    <svg class="oi"><use href="#i-minus"/></svg></button>
+</div>
+
+<div id="tabs">
+  <div class="tab active" data-tab="0"><svg class="oi"><use href="#i-grades"/></svg
+    ><span>课程成绩</span><span class="badge" id="badge-tasks">—</span></div>
+  <div class="tab" data-tab="1"><svg class="oi"><use href="#i-cal"/></svg
+    ><span>今日课表</span><span class="badge" id="badge-sch">—</span></div>
+  <div class="tab" data-tab="2"><svg class="oi"><use href="#i-award"/></svg
+    ><span>GPA</span><span class="badge" id="badge-gpa">—</span></div>
+  <div class="tab" data-tab="3"><svg class="oi"><use href="#i-folder"/></svg
+    ><span>资料</span><span class="badge" id="badge-files">—</span></div>
+</div>
+
+<div id="stats"></div>
+<div id="wb"></div>
+<div id="msg"></div>
+
+<!-- 晚报面板（从顶部按钮展开） -->
+<div id="digest" class="dighost">
+  <div class="digwrap" id="digwrap"></div>
+</div>
+
+<!-- 数据与备份面板 -->
+<div id="datapanel" class="dighost">
+  <div class="digwrap" id="datawrap"></div>
+</div>
+<input id="backupFile" type="file" accept="application/json,.json" hidden>
+
+<div id="viewport">
+  <div id="pages">
+    <div class="page" id="page-grade"></div>
+    <div class="page" id="page-sch"></div>
+    <div class="page" id="page-gpa"></div>
+    <div class="page" id="page-files"></div>
+  </div>
+</div>
+
+<!-- ══════════ 首次运行引导页（填账密即用）══════════ -->
+<div id="setup">
+  <div class="su-card">
+    <div class="su-ic" id="suIc"></div>
+    <h1 id="suTitle">登录</h1>
+    <div class="su-sub" id="suSub">
+      使用学校账号登录，读取作业与成绩。
+    </div>
+
+    <div class="su-msg" id="suMsg"></div>
+
+    <!-- 学校网址 -->
+    <div class="su-field" id="suUrlField">
+      <label>学校网址</label>
+      <input class="su-in" id="suUrl" type="text" spellcheck="false"
+             placeholder="your-school.managebac.cn">
+    </div>
+
+    <!-- 账号 -->
+    <div class="su-field">
+      <label>ManageBac 账号</label>
+      <input class="su-in" id="suUser" type="text" spellcheck="false"
+             autocomplete="username" placeholder="学校邮箱">
+    </div>
+
+    <!-- 密码 -->
+    <div class="su-field">
+      <label>ManageBac 密码</label>
+      <div class="su-pw">
+        <input class="su-in" id="suPw" type="password"
+               autocomplete="current-password" placeholder="密码">
+        <button class="su-eye" id="suEye" type="button" title="显示/隐藏密码"></button>
+      </div>
+    </div>
+
+    <!-- 课表账号（可选，折叠） -->
+    <div class="su-fold" id="suFold">
+      <div class="su-fhead" id="suFhead">
+        <span id="suFic"></span>
+        课表账号<span class="opt">可选</span>
+        <span class="arw">▶</span>
+      </div>
+      <div class="su-fbody"><div class="su-finner"><div class="su-fpad">
+        <div class="su-field" style="margin-bottom:11px">
+          <label>课表账号 <span class="opt">手机号</span></label>
+          <input class="su-in" id="suSUser" type="text" spellcheck="false"
+                 placeholder="手机号">
+        </div>
+        <div class="su-field" style="margin-bottom:0">
+          <label>课表密码</label>
+          <input class="su-in" id="suSPw" type="password"
+                 placeholder="密码">
+        </div>
+        <div class="su-foot" style="text-align:left;margin-top:9px">
+          不填也可以，只影响「今日课表」页。
+        </div>
+      </div></div></div>
+    </div>
+
+    <button class="su-btn" id="suGo"></button>
+
+    <div class="su-foot" id="suFoot">
+      账号信息保存在本机，不会上传到任何服务器。<br>
+      需要修改时，点右上角的 <b>钥匙</b> 图标。
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+<!-- ══════════ 自编课表（添加网站没有的课） ══════════ -->
+<div class="clhost" id="clpanel">
+  <div class="clwrap">
+    <div class="clh">
+      <span class="t">添加自编课</span>
+      <button class="clx" id="clClose" title="关闭"></button>
+    </div>
+    <div class="clbody">
+      <div class="clrow">
+        <label>星期（可多选）</label>
+        <div class="cldays" id="clDays"></div>
+      </div>
+      <div class="clrow">
+        <label>第几节</label>
+        <select id="clPeriod"></select>
+      </div>
+      <div class="clrow">
+        <label>名称</label>
+        <input id="clName" type="text" placeholder="比如上操 / 社团 / 班会"
+               maxlength="24">
+      </div>
+      <div class="clrow">
+        <label>地点（可不填）</label>
+        <input id="clRoom" type="text" placeholder="比如操场 / 礼堂"
+               maxlength="20">
+      </div>
+      <button class="clbtn-go" id="clSave">
+        <span>添加</span>
+      </button>
+      <div class="cllist" id="clList"></div>
+      <div class="clnote">
+        只存在这台电脑上，不会改动学校的课表。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ 外观设置 ══════════ -->
+<div class="clhost" id="setpanel">
+  <div class="clwrap">
+    <div class="clh">
+      <span class="t">外观设置</span>
+      <button class="clx" id="setClose" title="关闭"></button>
+    </div>
+    <div class="clbody">
+      <!-- 预览 -->
+      <div class="setprev" id="setPreview">
+        <div class="pv-t">预览</div>
+        <div class="pv-s">调整下面的选项，这里会立刻变化</div>
+      </div>
+
+      <!-- 圆角 -->
+      <div class="setrow">
+        <div class="sethead">
+          <label>圆角</label>
+          <span class="setval" id="setValR"></span>
+        </div>
+        <div class="seg" id="setR">
+          <span data-r="small">小</span>
+          <span data-r="mid">中</span>
+          <span data-r="large">大</span>
+        </div>
+      </div>
+
+      <!-- 透明度 -->
+      <div class="setrow">
+        <div class="sethead">
+          <label>卡片透明度</label>
+          <span class="setval" id="setValA"></span>
+        </div>
+        <input type="range" id="setA" min="40" max="100" step="2" value="72">
+        <div class="setdesc">越低越透，背景内容会透出来</div>
+      </div>
+
+      <!-- 毛玻璃 -->
+      <div class="setrow">
+        <div class="settoggle">
+          <div>
+            <label>毛玻璃模糊</label>
+            <div class="setdesc">关掉后界面更省显卡，低配机器更流畅</div>
+          </div>
+          <button class="sw" id="setBlur" title="开关"></button>
+        </div>
+      </div>
+
+      <button class="setreset" id="setReset">恢复默认</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
