@@ -71,7 +71,7 @@ def make_shortcut(target: Path, lnk: Path, args: str = "",
         f"$s.Arguments = '{args}'; "
         f"$s.WorkingDirectory = '{wd}'; "
         f"$s.WindowStyle = 7; "
-        f"$s.Description = 'CampusPulse后台预热'; "
+        f"$s.Description = 'ManageBac-packer后台预热'; "
         f"$s.Save(); "
         f"Write-Output 'created'"
     )

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>CampusPulse</title>
+<title>ManageBac-packer</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -209,6 +209,13 @@
       <path d="M9 12.2l2.1 2.1 4-4.2"/>
     </symbol>
     <!-- 设置（齿轮） -->
+    <!-- Teams（四格方块） -->
+    <symbol id="i-teams" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="8" height="8" rx="2.2"/>
+      <rect x="13" y="3" width="8" height="8" rx="2.2"/>
+      <rect x="3" y="13" width="8" height="8" rx="2.2"/>
+      <rect x="13" y="13" width="8" height="8" rx="2.2"/>
+    </symbol>
     <symbol id="i-settings" viewBox="0 0 24 24">
       <circle cx="12" cy="12" r="3.2"/>
       <path d="M19.1 14.4a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.55-1.1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34H9a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.56 1.03Z"/>
@@ -272,6 +279,9 @@
     <i class="digdot" id="digdot"></i></button>
   <button class="ibtn" id="btnLogin" title="重新登录（自动）">
     <svg class="oi"><use href="#i-key"/></svg></button>
+  <button class="ibtn" id="btnTeams" title="Teams / EC">
+    <svg class="oi"><use href="#i-teams"/></svg>
+  </button>
   <button class="ibtn" id="btnSettings" title="外观设置">
     <svg class="oi"><use href="#i-settings"/></svg>
   </button>
@@ -473,6 +483,48 @@
       </div>
 
       <button class="setreset" id="setReset">恢复默认</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ Teams / EC ══════════ -->
+<div class="clhost" id="teampanel">
+  <div class="clwrap">
+    <div class="clh">
+      <span class="t">Teams / EC</span>
+      <button class="clx" id="tmClose" title="关闭">&#10005;</button>
+    </div>
+    <div class="clbody">
+      <div class="tm-bar" id="tmBar">
+        <span class="tm-dot"></span>
+        <span class="tm-txt" id="tmStatus">还没同步过</span>
+      </div>
+
+      <div class="tm-acts">
+        <button class="tm-btn" id="tmOpen" title="打开 Teams 登录">
+          <span>打开 Teams</span>
+        </button>
+        <button class="tm-btn primary" id="tmSync" title="读取当前页面的消息">
+          <span>同步</span>
+        </button>
+        <button class="tm-btn" id="tmMore" title="再往回翻更多历史（翻得越多越慢）">
+          <span>多翻一点</span>
+        </button>
+        <button class="tm-btn" id="tmDL" title="下载 EC 附件并读取 PDF 文字">
+          <span>取附件</span>
+        </button>
+      </div>
+
+      <input class="tm-search" id="tmSearch" type="text"
+             placeholder="搜索 EC 内容（关键词、日期、姓名）">
+
+      <div id="tmList"></div>
+
+      <div class="tm-hint">
+        同步时会自动往回翻，直到 Teams 不再加载更早的内容。
+        「多翻一点」会再往深处翻 —— 但能翻到多早，取决于 Teams
+        自己愿意返回多少，翻不动时会如实告诉你已到最早。
+      </div>
     </div>
   </div>
 </div>

@@ -12,7 +12,7 @@ from pathlib import Path
 #  两种模式的差别很大，搞错了会出现「打包后打不开」：
 #
 #    源码运行
-#      __file__ = D:\...\campus-pulse\app\config.py
+#      __file__ = D:\...\mb-widget\app\config.py
 #      → 项目根目录就是它的上上级，可读可写
 #
 #    打包运行（PyInstaller 单文件）
@@ -48,7 +48,7 @@ def _pick_writable_root() -> Path:
          —— 用户把 exe 放桌面或 U 盘时最好，数据跟着走（便携）
          —— 但放在 Program Files 时这里不可写，所以要试
 
-      2. %LOCALAPPDATA%\\CampusPulse
+      2. %LOCALAPPDATA%\\ManageBac-packer
          —— 任何情况都能写，Windows 上「每个用户独立」的标准位置
 
      用「真的写一个文件试试」来判断，而不是 os.access()
@@ -64,7 +64,7 @@ def _pick_writable_root() -> Path:
 
     local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
     if local:
-        candidates.append(Path(local) / "CampusPulse")
+        candidates.append(Path(local) / "ManageBac-packer")
 
     for d in candidates:
         try:
@@ -78,7 +78,7 @@ def _pick_writable_root() -> Path:
 
     # 理论上到不了这里；真到了就用临时目录兜底，至少能跑起来
     import tempfile
-    return Path(tempfile.gettempdir()) / "CampusPulse"
+    return Path(tempfile.gettempdir()) / "ManageBac-packer"
 
 
 RES_DIR = _resource_root()

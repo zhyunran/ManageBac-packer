@@ -1,13 +1,14 @@
 [project]
-name = "campus-pulse"
+name = "mb-widget"
 version = "0.1.0"
-description = "CampusPulse：待办任务、成绩、GPA 一屏总览，点击跳转原网页"
+description = "ManageBac 桌面小组件：待办任务、成绩、GPA 一屏总览，点击跳转原网页"
 requires-python = ">=3.11"
 dependencies = [
     "pywebview>=5.1",
     "playwright>=1.49",
     "beautifulsoup4>=4.12",
     "websocket-client>=1.9.2",
+    "pypdf>=5.1",
 ]
 
 [tool.uv]

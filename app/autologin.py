@@ -386,7 +386,7 @@ def renew_schedule(headless: bool = True,
     login = (cred.get("login") or "").strip()
     pwd = (cred.get("password") or "").strip()
     if not login or not pwd:
-        return False, "没有课表账号（credentials.json 里缺 _schedule）"
+        return False, "还没有填课表账号"
 
     if allow_popup is None:
         allow_popup = config.AUTO_LOGIN_ALLOW_POPUP

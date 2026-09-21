@@ -46,7 +46,7 @@ m_style = re.search(r"<style>(.*?)</style>", html, re.S)
 assert m_style, "找不到 <style>"
 css = m_style.group(1)
 
-css_header = ("/* CampusPulse —— 样式表\n"
+css_header = ("/* ManageBac-packer —— 样式表\n"
     " * 由 web/split_files.py 从 index.html 的 <style> 块抽出（2026-09-20）。\n"
     " * 拆开是为了避免单文件过大导致编辑器写入丢内容。\n"
     " */\n"
@@ -67,7 +67,7 @@ assert j >= 0, "找不到主脚本结尾"
 
 js = stage1[i + len("<script>\n"): j]
 
-js_header = ("/* CampusPulse —— 主逻辑\n"
+js_header = ("/* ManageBac-packer —— 主逻辑\n"
     " * 由 web/split_files.py 从 index.html 内联脚本抽出（2026-09-20）。\n"
     " */\n"
 )

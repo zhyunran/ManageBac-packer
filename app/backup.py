@@ -130,7 +130,7 @@ def export(path: str | Path | None = None) -> dict:
         config.ensure_dirs()
 
         payload = {
-            "app": "campus-pulse",
+            "app": "mb-widget",
             "version": BACKUP_VERSION,
             "exported_at": datetime.now().isoformat(timespec="seconds"),
             "note": ("本文件只包含学习数据（手动标记 / 晚报 / 成绩历史），"
@@ -182,7 +182,7 @@ def validate(payload) -> dict:
     """
     if not isinstance(payload, dict):
         raise BadBackup("文件内容不是 JSON 对象")
-    if payload.get("app") != "campus-pulse":
+    if payload.get("app") != "mb-widget":
         raise BadBackup("这不是本软件的备份文件")
     if payload.get("version") != BACKUP_VERSION:
         raise BadBackup(f"备份版本不匹配（文件 {payload.get('version')}，"
@@ -387,7 +387,7 @@ def _self_test() -> int:
         "Cookie": ("_managebac_session", "cookies", "session_cookies"),
         "课表 token": ("access_token", "schedule_token", "eyJ"),
         "邮箱": ("@", ""),          # 只检查 @ 符号，不写具体域名
-        "手机号": ("13800000000",),
+        "手机号": ("18519776629",),
     }
     for name, keys in bad.items():
         hits = [k for k in keys if k in txt]
@@ -411,11 +411,11 @@ def _self_test() -> int:
     bads = [
         ({}, "空对象"),
         ({"app": "other", "version": 1, "data": {}}, "别的软件"),
-        ({"app": "campus-pulse", "version": 99, "data": {}}, "版本不符"),
-        ({"app": "campus-pulse", "version": 1}, "缺 data"),
-        ({"app": "campus-pulse", "version": 1, "data": {"manual_done": []}},
+        ({"app": "mb-widget", "version": 99, "data": {}}, "版本不符"),
+        ({"app": "mb-widget", "version": 1}, "缺 data"),
+        ({"app": "mb-widget", "version": 1, "data": {"manual_done": []}},
          "manual_done 类型错"),
-        ({"app": "campus-pulse", "version": 1, "data": {"digests": {}}},
+        ({"app": "mb-widget", "version": 1, "data": {"digests": {}}},
          "digests 类型错"),
     ]
     for payload, note in bads:

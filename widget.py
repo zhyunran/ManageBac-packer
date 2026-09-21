@@ -1,4 +1,4 @@
-"""CampusPulse —— 入口。
+"""ManageBac 桌面小组件 —— 入口。
 
 启动后：
   1. 立刻显示上次缓存（秒开）
@@ -56,7 +56,7 @@ class _QuietPywebviewNoise(logging.Filter):
 
 logging.getLogger("pywebview").addFilter(_QuietPywebviewNoise())
 
-TITLE = "CampusPulse"
+TITLE = "ManageBac-packer"
 W, H = 470, 780
 
 
@@ -114,6 +114,7 @@ class Api:
         self._warming = False
         self._served = False          # 前端是否已经成功拿到过数据
         self._relogging = False       # 是否正在自动重新登录
+        self._teams_syncing = False    # Teams 是否正在同步
 
     # ---- 数据 ----
     def get_data(self):
@@ -272,6 +273,138 @@ class Api:
 
         threading.Thread(target=work, daemon=True).start()
         return {"ok": True}
+
+    # ══════════ Teams / EC（English Corner）══════════
+    #
+    # ★ 说明：这块用的是「浏览器会话模式」——
+    #   启动组件自带的 Edge，你在里面正常登录 Teams，
+    #   程序读页面上**已渲染**的消息。不导出任何令牌。
+    #
+    # ★ 为什么不做成自动同步
+    #   Teams 需要用户先登录一次，这是绕不过去的人工步骤。
+    #   所以设计成「你点一下同步」而不是「后台偷偷跑」。
+    def teams_status(self):
+        """Teams 面板的状态（有没有同步过、有多少条）。"""
+        try:
+            from app import teams
+            return teams.status()
+        except Exception as e:
+            log.warning("Teams 状态读取失败：%s", e)
+            return {"ok": False, "ready": False, "note": str(e),
+                    "ec_count": 0, "post_count": 0, "attach_count": 0,
+                    "updated": ""}
+
+    def teams_open(self):
+        """打开 Teams 窗口让你登录（只做一次）。"""
+        try:
+            from app import teams_reader
+            ok = teams_reader.open_teams(headless=False)
+            return {"ok": bool(ok)}
+        except Exception as e:
+            log.warning("打开 Teams 失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def teams_sync(self, rounds=8):
+        """同步一次（往回翻 → 读页面 → 分类 → 存本地）。
+
+        rounds 是往回翻的轮数：
+          8  = 默认，翻到 Teams 不再加载为止（通常够用）
+          25 = 「多翻一点」，往更深处翻（会慢一些）
+
+        ★ 放在后台线程里跑，界面不会卡住。
+        """
+        if getattr(self, "_teams_syncing", False):
+            return {"ok": True, "already": True}
+        self._teams_syncing = True
+
+        try:
+            n = max(1, min(int(rounds or 8), 40))
+        except Exception:
+            n = 8
+        #  轮数越多，给的总时间也放大，避免「多翻一点」被时间上限截断
+        budget = 90 if n <= 10 else min(240, 60 + n * 6)
+
+        box: dict = {}
+
+        def work() -> None:
+            try:
+                from app import teams_reader
+                box.update(teams_reader.sync(scroll_rounds=n, budget_sec=budget))
+            except Exception as e:
+                log.warning("Teams 同步失败：%s", e)
+                box.update({"ok": False, "reason": str(e)})
+            finally:
+                self._teams_syncing = False
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(timeout=max(150, budget + 60))
+        return box or {"ok": False, "reason": "同步超时"}
+
+    def ec_list(self, keyword="", date=""):
+        """EC 列表（可按关键词 / 日期筛）。"""
+        try:
+            from app import teams
+            return {"ok": True, "items": teams.ec_list(keyword or "", date or "")}
+        except Exception as e:
+            return {"ok": False, "items": [], "error": str(e)}
+
+    def ec_open_dir(self):
+        """打开 EC 附件所在目录。"""
+        try:
+            from app import teams, config
+            config.ensure_dirs()
+            teams.EC_DIR.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(teams.EC_DIR))       # noqa: S606
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def teams_download_ec(self):
+        """下载 EC 消息里的附件，并尝试提取 PDF 文字。"""
+        try:
+            from app import teams
+            data = teams.load()
+            ec = data.get("ec") or []
+            urls = []
+            for it in ec:
+                for a in (it.get("attachments") or []):
+                    u = teams.safe_url(a.get("url") or "")
+                    if u and all(x["url"] != u for x in urls):
+                        urls.append({"url": u, "name": a.get("name") or "attach.pdf"})
+            if not urls:
+                return {"ok": False, "reason": "EC 消息里还没有附件（先同步一次）"}
+
+            from app import httpclient
+            teams.EC_DIR.mkdir(parents=True, exist_ok=True)
+            got, texts = 0, 0
+            for item in urls[:teams.MAX_ATTACH]:
+                try:
+                    dest = teams.EC_DIR / item["name"][:120]
+                    ok = httpclient.download_direct(item["url"], dest)
+                    if not ok:
+                        continue
+                    got += 1
+                    if dest.suffix.lower() == ".pdf":
+                        r = teams.extract_pdf_text(dest)
+                        if r.get("ok"):
+                            texts += 1
+                            # 把提取到的文字挂回对应的 EC 记录
+                            for it in ec:
+                                for a in (it.get("attachments") or []):
+                                    if a.get("url") == item["url"]:
+                                        it["file_text"] = r["text"][:20000]
+                                        it["file_note"] = r.get("note") or ""
+                except Exception as e:
+                    log.debug("下载 EC 附件失败：%s", e)
+
+            data["ec"] = ec
+            teams.save(data)
+            return {"ok": True, "downloaded": got, "text_extracted": texts,
+                    "total": len(urls), "dir": str(teams.EC_DIR)}
+        except Exception as e:
+            log.warning("下载 EC 附件失败：%s", e)
+            return {"ok": False, "reason": str(e)}
 
     # ---- 晚报（每个工作日晚 9 点自动生成）----
     def digest_status(self):
@@ -756,10 +889,120 @@ class Api:
             pass
 
 
+# ══════════════════════════════════════════════════════════════════
+#  启动前环境检查
+#
+#  ★ 为什么需要
+#    程序依赖 WebView2 Runtime。Win11 与较新 Win10 自带，老 Win10 可能没有。
+#    没装时 pywebview 会抛异常，而 exe 是 console=False（不弹黑框），
+#    用户看到的是「双击了，什么都没发生」—— 不知如何是好。
+#
+#    所以要在启动前检查，并用**原生对话框**给出能照着做的指引。
+#    （不能用网页提示 —— 那也需要 WebView2 才能显示。）
+# ══════════════════════════════════════════════════════════════════
+
+WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+
+def _webview2_installed() -> bool:
+    """检测 WebView2 Runtime 是否已安装。
+
+    两种方式都试：
+      ① 查注册表（官方推荐，最可靠）
+      ② 查安装目录（注册表被清理过时的兜底）
+    """
+    # ① 注册表
+    try:
+        import winreg
+        keys = [
+            r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            # 每用户安装（非管理员权限装的那种）
+            r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+        ]
+        for k in keys:
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(hive, k) as h:
+                        v, _ = winreg.QueryValueEx(h, "pv")
+                        if v and v != "0.0.0.0":
+                            return True
+                except OSError:
+                    continue
+    except Exception:
+        pass
+
+    # ② 安装目录
+    import os
+    for base in (
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("LOCALAPPDATA", ""),
+    ):
+        if not base:
+            continue
+        p = Path(base) / "Microsoft" / "EdgeWebView" / "Application"
+        try:
+            if p.is_dir() and any(
+                d.name[0].isdigit() for d in p.iterdir() if d.is_dir()
+            ):
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _show_missing_webview2() -> None:
+    """用原生对话框告知用户缺什么、怎么装。
+
+    ★ 这里刻意用 ctypes 调 Windows 的 MessageBox，
+      而不是 tkinter —— tkinter 在打包版里可能没打进去，
+      而 MessageBox 是系统自带的，一定会弹出来。
+    """
+    msg = (
+        "缺少一个运行组件：Microsoft WebView2 Runtime\n\n"
+        "这个组件是 Windows 自带的浏览器内核，"
+        "大部分电脑已经有了（Win11 全都自带）。\n\n"
+        "安装方法：\n"
+        "  1. 点「确定」后会自动打开下载页面\n"
+        "  2. 下载并运行安装程序（一路点「下一步」即可）\n"
+        "  3. 装完重新双击本程序\n\n"
+        "下载地址（如果没自动打开，可手动复制到浏览器）：\n"
+        + WEBVIEW2_URL
+    )
+    try:
+        import ctypes
+        # MB_OK | MB_ICONINFORMATION
+        ctypes.windll.user32.MessageBoxW(
+            None, msg, "ManageBac-packer - 缺少运行组件", 0x40
+        )
+    except Exception:
+        # 连对话框都弹不出来时，至少写到日志
+        try:
+            log.error("缺少 WebView2 Runtime，且无法弹出提示对话框")
+        except Exception:
+            pass
+
+    # 打开下载页
+    try:
+        import webbrowser
+        webbrowser.open(WEBVIEW2_URL)
+    except Exception:
+        pass
+
+
 def main() -> int:
     config.ensure_dirs()
     log.info("=" * 52)
-    log.info("启动 CampusPulse（解释器 %s）", sys.executable)
+    log.info("启动 ManageBac-packer（解释器 %s）", sys.executable)
+
+    # ★ 启动前先确认 WebView2 在。不在就给提示 + 打开下载页，
+    #   而不是让它抛一个用户看不懂的异常然后静默退出。
+    if not _webview2_installed():
+        log.error("未检测到 WebView2 Runtime，无法启动界面")
+        _show_missing_webview2()
+        return 3
 
     # 先用缓存渲染，界面秒开
     pipeline.load_from_cache()

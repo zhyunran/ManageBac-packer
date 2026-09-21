@@ -224,6 +224,52 @@ DIGEST = {
 }
 
 
+def _check_js_quotes(js: str, base_line: int = 1) -> list[str]:
+    """挑出跨行的 JS 单双引号字符串 —— 这类问题会让整块脚本失效。
+
+    只检查「引号内出现裸换行」，不含正则/模板字符串分析，
+    所以只适合检查纯数据片段（注入的 mock），不适合整份 app.js。
+    教训：f-string 里的 \\n 会被解释成真实换行，落到 JS
+    单引号字符串里就跨行 → 整块 SyntaxError → window.pywebview
+    从未定义 → 面板显示「当前模式不支持」。
+    """
+    problems: list[str] = []
+    i = 0
+    line = base_line
+    n = len(js)
+    while i < n:
+        ch = js[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+        if ch in "\"'`":
+            quote = ch
+            start_line = line
+            i += 1
+            while i < n:
+                c = js[i]
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == "\n":
+                    if quote != "`":
+                        snippet = js[max(0, i - 45): i].replace("\n", " ").strip()
+                        problems.append(
+                            f"第 {start_line} 行：{quote} 字符串里有裸换行"
+                            f"（结尾 …{snippet[-40:]}）"
+                        )
+                        break
+                    line += 1
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return problems
+
+
 def main() -> int:
     src = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
 
@@ -263,7 +309,7 @@ window.pywebview = {{
        测「测试登录」时：账号里含 "bad" 就模拟失败，否则成功。 */
     setup_status: () => Promise.resolve({{
       need_setup: new URLSearchParams(location.search).has('setup'),
-      data_dir: 'C:/Users/me/AppData/Local/CampusPulse',
+      data_dir: 'C:/Users/me/AppData/Local/ManageBac-packer',
       frozen: true
     }}),
     test_login: (login, password, url) => new Promise(res => setTimeout(() => res(String(login).includes('bad')
@@ -271,7 +317,7 @@ window.pywebview = {{
         : {{ok:true, message:'登录成功'}}),
       900)),
     save_setup: () => Promise.resolve({{
-      ok:true, path:'C:/Users/me/AppData/Local/CampusPulse/credentials.json'
+      ok:true, path:'C:/Users/me/AppData/Local/ManageBac-packer/credentials.json'
     }}),
     open_data_folder: () => Promise.resolve({{ok:true}}),
     warmup_status: () => Promise.resolve({{
@@ -307,6 +353,33 @@ window.pywebview = {{
       new_tasks: MOCK_DIGEST.new_tasks.slice(0,1),
       new_grades: [], new_done: MOCK_DIGEST.new_done.slice(0,1),
       due_soon: [], overdue: []
+    }}),
+    /* Teams / EC */
+    teams_status: () => Promise.resolve({{
+      ok:true, ready:true, updated:'2026-09-21 08:12:00',
+      ec_count:2, post_count:1, attach_count:1, note:''
+    }}),
+    teams_open: () => Promise.resolve({{ok:true}}),
+    teams_sync: (rounds) => Promise.resolve({{
+      ok:true, scanned:8, ec:2, posts:1, attachments:1,
+      scrolled:true, at_top:(rounds||8)>=25, scroll_rounds:(rounds||8),
+      scroll_grew:3, saved_ec:2, saved_posts:1
+    }}),
+    ec_list: () => Promise.resolve({{ok:true, items:[
+      {{kind:'ec', title:'EC roster - Sep 21', date:'2026-09-21',
+       channel:'ENGLISH CORNER', author:'Ms. Wang',
+       timeLabel:'08:12', text:'Today EC is in B-203.',
+       file_text:'English Corner Roster\\n\\nGroup A: Zhang San, Li Si\\n\\nPlease arrive at 12:30.',
+       file_note:'1 page', attachments:[{{name:'EC_20260921.pdf'}}]}},
+      {{kind:'ec', title:'EC cancelled', date:'2026-09-20',
+       channel:'ENGLISH CORNER', author:'Ms. Wang',
+       timeLabel:'09:00', text:'EC this Friday is cancelled.', attachments:[]}},
+      {{kind:'homework', title:'Unit 2 Essay', date:'2026-09-21',
+       channel:'Homework', author:'Mr. Zhao', timeLabel:'10:30',
+       text:'Write 500 words.', attachments:[{{name:'rubric.pdf'}}]}}
+    ]}}),
+    teams_download_ec: () => Promise.resolve({{
+      ok:true, downloaded:1, text_extracted:1, total:1, dir:'D:/x/ec'
     }}),
     digest_read: () => Promise.resolve({{ok:true}}),
     backup_status: () => Promise.resolve({{
@@ -359,6 +432,18 @@ window.pywebview = {{
     dst = ROOT / "_preview.html"
     dst.write_text(out, encoding="utf-8")
     print(f"[OK] 已生成 {dst.name}  ({len(out):,} 字节)")
+
+    # ── 自检：注入的 mock 片段里不能有跨行的单双引号字符串 ──────
+    # 这一段是纯数据，检查零误报；出问题会让整块脚本失效，
+    # 表现为面板显示「当前模式不支持」。
+    bad = _check_js_quotes(mock_js)
+    if bad:
+        print("")
+        print("[!] mock 片段有问题（浏览器里 pywebview 会是 undefined）：")
+        for msg in bad:
+            print("    " + msg)
+        return 1
+
     print(f"     直接在浏览器打开： {dst}")
     return 0
 

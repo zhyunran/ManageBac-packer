@@ -4,7 +4,7 @@ Option Explicit
 Dim sh, cmd
 Set sh = CreateObject("WScript.Shell")
 WScript.Sleep 20000
-cmd = "D:\Python hub\campus-pulse\.venv\Scripts\pythonw.exe" & " " & "D:\Python hub\campus-pulse\warmup.py" & " --quiet"
-sh.CurrentDirectory = "D:\Python hub\campus-pulse"
+cmd = "D:\Python hub\mb-widget\.venv\Scripts\pythonw.exe" & " " & "D:\Python hub\mb-widget\warmup.py" & " --quiet"
+sh.CurrentDirectory = "D:\Python hub\mb-widget"
 ' 参数2 = 0 → 隐藏窗口；参数3 = False → 不等待返回
 sh.Run cmd, 0, False

@@ -1,18 +1,9 @@
 # ManageBac-packer
 
-- 一个整合了希悦校园与managebac系统的一站式小组件，面向**国际部/国际学校**学生，计划接入更多网页......敬请期待！
+- 整合 ManageBac 与希悦校园数据的 Windows 桌面小组件，面向国际部 / 国际学校学生。
+- 如有 issues，欢迎提交至 zyr712zh123@gmail.com
+- 如需 iOS 版本，见 [CampusDesk](https://github.com/xuanqiwang645/CampusDesk)
 
-
-- Windows 桌面小组件，整合 ManageBac 与希悦校园管理系统的数据。
-
-
-- v0.3版本起，并在以后将对北京市101中学ID（Beijing 101 middle school international department) 环境提供优先技术支持。
-
-
-- 如有issues, 十分欢迎并建议提交zyr712zh123@gmail.com
-
-  
-- 各版本开发难点整理附于release的附带md文档，**非开发者不必下载！**
 ---
 
 ## 面向环境
@@ -21,23 +12,24 @@
 |---|---|
 | 操作系统 | Windows 10 / 11（x64） |
 | 运行时 | WebView2 Runtime（Win11 与较新 Win10 已预装） |
-| 账号 | 本人的 ManageBac 账号，希悦账号可选 |
+| 账号 | 本人的 ManageBac 账号；希悦账号可选；Teams 需登录一次 |
 
 不需要安装 Python，不需要配置环境变量。
 
+---
 
 ## 快速开始
 
 ### 用打包好的 exe
 
-双击 `CampusPulse.exe`，第一次会弹出登录页，填学校网址、账号、密码。
+双击 `ManageBac-packer.exe`。第一次会弹出登录页，填学校网址、账号、密码。
 
 ### 从源码运行
 
 需要 Python 3.11 以上。
 
 ```bash
-pip install pywebview beautifulsoup4 websocket-client
+pip install pywebview beautifulsoup4 websocket-client pypdf
 
 copy credentials.example.json credentials.json
 # 编辑 credentials.json，填入学校网址与账号
@@ -50,7 +42,7 @@ python widget.py
 ```bash
 pip install pyinstaller
 pyinstaller build.spec --noconfirm
-# 产物：dist/CampusPulse.exe
+# 产物：dist/ManageBac-packer.exe
 ```
 
 ---
@@ -71,7 +63,7 @@ pyinstaller build.spec --noconfirm
 ├── make_preview.py        生成带模拟数据的预览页
 ├── split_files.py         把 index.html 拆成 css / js
 │
-├── cold_start_check.py    冷启动自查（54 项）
+├── cold_start_check.py    冷启动自查
 ├── status.py              查看当前状态
 ├── status_all.py          查看全部状态
 │
@@ -126,6 +118,22 @@ pyinstaller build.spec --noconfirm
 | 成绩解析与换算表 | `app/gpa.py` |
 | 汇总计算 | `app/scraper.py` 的 `summarize_courses()` |
 | GPA 页面渲染 | `web/app.js` 的 `renderGpaPage()` |
+
+### Teams / EC
+
+Teams 频道里的消息与附件。EC（English Corner）是频道里每天发的消息和 PDF，
+同步后消息正文与 PDF 文字都会存在本机，可用搜索框全文查。
+
+| 功能 | 文件 |
+|---|---|
+| 消息分类、链接校验、PDF 文字提取 | `app/teams.py` |
+| 读 Teams 页面（含往回翻历史） | `app/teams_reader.py` |
+| 浏览器调试协议客户端 | `app/cdp.py` |
+| 找到 / 启动 Edge | `app/edge.py` |
+| 面板界面 | `web/app.js` 的 `tmRender()` / `bindTeams()` |
+
+读取方式是用自带的 Edge 打开 Teams 页面，读页面上已经渲染出来的内容。
+不需要额外登录，不需要填令牌，不导出浏览器凭据。
 
 ### 登录态维护
 
@@ -209,8 +217,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 ## 已知限制
 
-- 仅支持 ManageBac 与希悦校园管理系统，解析逻辑与这两个站点绑定
-- 首次公开测试，测试覆盖不完整
+- 仅支持 ManageBac、希悦校园与 Teams 三个站点，解析逻辑与它们绑定
+- Teams 读取依赖页面结构，页面改版可能导致读不到
+- Teams 只能翻到它自己愿意加载的位置，不保证完整历史
+- PDF 走文字层提取，扫描件需要 OCR，目前不支持
 - 部分课程类型或页面布局可能导致解析失败
 
 ---
@@ -220,11 +230,12 @@ sys.stdout.reconfigure(encoding="utf-8")
 MIT License。
 
 第三方依赖：pywebview（BSD 3-Clause）、BeautifulSoup4（MIT）、
-websocket-client（Apache 2.0）、PyInstaller（GPL 2.0 + 例外条款）。
-
+websocket-client（Apache 2.0）、pypdf（BSD 3-Clause）、
+PyInstaller（GPL 2.0 + 例外条款）。
 
 ### 特别鸣谢
 
-- @xuanqiwang645     提供的UI美化技术支持
-- @hs89n5km86-coder  提供灵感、建议与支持
-- 如需iOS版本，请移步[CampusDesk](https://github.com/xuanqiwang645/CampusDesk)
+- @xuanqiwang645 提供的界面与交互技术支持
+- @hs89n5km86-coder 提供灵感、建议与支持
+- Teams 读取思路参考了 [teams-web-chat-exporter](https://github.com/gediz/teams-web-chat-exporter)
+  与 [teams-api](https://github.com/Maxim-Mazurok/teams-api)

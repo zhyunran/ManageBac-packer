@@ -1,4 +1,4 @@
-/* CampusPulse —— 样式表
+/* ManageBac-packer —— 样式表
  * 由 web/split_files.py 从 index.html 的 <style> 块抽出（2026-09-20）。
  * 拆开是为了避免单文件过大导致编辑器写入丢内容。
  */
@@ -150,6 +150,23 @@
     backdrop-filter:var(--glassBlur);
     box-shadow:var(--glassTop);
     position:sticky;top:0;z-index:60;
+    /*  按钮数量会随功能增加（现在 11 个），窄窗口下必然放不下。
+       与 tab 栏同策略：不换行、不撑破页面，需要时横向滚动。
+       滚动条隐藏，但鼠标滚轮 / 触控板仍可滚。 */
+    overflow-x:auto;overflow-y:hidden;
+    scrollbar-width:none;
+  }
+  #bar::-webkit-scrollbar{display:none}
+  /*  窄窗口（<=560px）收紧间距与内边距，尽量让它「不用滚也放得下」。
+      470px 实测：收紧后 11 个按钮刚好排开。 */
+  @media (max-width:560px){
+    #bar{gap:3px;padding-left:var(--sp-3);padding-right:var(--sp-3)}
+    #bar .ibtn{min-width:28px;height:28px;padding:0 5px}
+    #bar .brand small{display:none}
+  }
+  @media (max-width:420px){
+    #bar .logo{display:none}
+    #bar{gap:2px;padding-left:var(--sp-2);padding-right:var(--sp-2)}
   }
   .logo{
     width:28px;height:28px;border-radius:9px;flex:0 0 auto;
@@ -1519,6 +1536,7 @@
   }
   .emptystate .es-ic{display:flex;justify-content:center;align-items:center;
     margin-bottom:13px;opacity:.5;color:var(--muted);
+    /* ★ 只在元素**第一次插入**时播（配合 JS 的签名比对） */
     animation:esIconIn .5s var(--spring) both}
   @keyframes esIconIn{
     from{opacity:0;transform:scale(.72) rotate(-7deg)}
@@ -1663,7 +1681,9 @@
   /* ══════════ 区块入场：交错浮现（stagger） ══════════ */
   /* 每个区块依次浮现 —— 比整块硬闪更有「内容在展开」的感觉。
      上限 8 个，避免长列表越等越久。 */
-  .sec{animation:riseIn .38s var(--ease) both}
+  /* ★ .sec 是常驻折叠容器，不放入场动画（理由同上）。
+     新出现的区块由 JS 主动加 .fresh 类来播一次。 */
+  .sec.fresh{animation:riseIn .38s var(--ease) both}
   .sec:nth-child(1){animation-delay:0ms}
   .sec:nth-child(2){animation-delay:45ms}
   .sec:nth-child(3){animation-delay:90ms}
@@ -1674,7 +1694,9 @@
   .sec:nth-child(n+8){animation-delay:300ms}
 
   /* ══════════ 统计卡：数字滚动入场 ══════════ */
-  #stats{animation:riseIn .34s var(--ease) both}
+  /* ★ #stats 不加入场动画 —— 它是常驻容器，
+     内容每秒可能重建，动画会跟着重播。
+     入场效果由内部 .stat 自己负责（也做了签名比对）。 */
 
   /* 整页纵向布局：标题栏 / 页签 / 统计 / 内容区 */
   body{display:flex;flex-direction:column;height:100vh}
@@ -2209,3 +2231,154 @@
 }
 .setprev .pv-t{font-size:12px;font-weight:700;color:var(--text)}
 .setprev .pv-s{font-size:10.4px;color:var(--muted);margin-top:3px}
+
+/* ══════════════════════════════════════════════════════════════════
+   Teams / EC 面板
+
+   EC = English Corner，每天会在 Teams 的 ENGLISH CORNER 频道发 PDF。
+   这个面板把那些消息和附件文字集中到一处，方便查。
+   ══════════════════════════════════════════════════════════════════ */
+.ibtn.teams-on{color:#5b5fc7;border-color:rgba(91,95,199,.4);
+  background:rgba(91,95,199,.10)}
+
+#teampanel .clwrap{max-width:430px}
+#teampanel .clwrap{top:50%;transform:translate(-50%,-50%);
+  left:50%;right:auto;width:calc(100% - 28px)}
+
+/* 状态条 */
+.tm-bar{
+  display:flex;align-items:center;gap:9px;
+  padding:11px 13px;margin-bottom:13px;
+  background:var(--card2);border:1px solid var(--line);
+  border-radius:var(--r-sm);font-size:11px;color:var(--muted);
+}
+.tm-bar .tm-dot{
+  width:7px;height:7px;border-radius:50%;flex:0 0 auto;
+  background:var(--dim);
+}
+.tm-bar.on .tm-dot{background:var(--green)}
+.tm-bar .tm-txt{flex:1;min-width:0;line-height:1.5}
+.tm-bar .tm-txt b{color:var(--text);font-weight:650}
+
+/* 按钮组 */
+.tm-acts{display:flex;gap:7px;margin-bottom:13px}
+.tm-btn{
+  flex:1;padding:9px 12px;border-radius:var(--pill);cursor:pointer;
+  border:1px solid var(--line2);background:var(--card2);color:var(--muted);
+  font-size:11.4px;font-weight:650;font-family:inherit;
+  display:flex;align-items:center;justify-content:center;gap:6px;
+  transition:all .15s var(--fast);
+}
+.tm-btn:hover{border-color:#5b5fc7;color:#5b5fc7;
+  transform:translateY(-1.5px)}
+.tm-btn:active{transform:translateY(0) scale(.97)}
+.tm-btn.primary{
+  background:#5b5fc7;color:#fff;border-color:#5b5fc7;
+  box-shadow:0 2px 9px rgba(91,95,199,.28);
+}
+.tm-btn.primary:hover{filter:brightness(1.08);color:#fff}
+/* 「多翻一点」：用虚描边提示它是可选动作，不跟主按钮抢注意力 */
+.tm-btn#tmMore{border-style:dashed;color:var(--dim)}
+.tm-btn#tmMore:hover{color:#5b5fc7;border-color:rgba(91,95,199,.5);
+  border-style:solid}
+.tm-btn.busy{pointer-events:none;opacity:.7}
+.tm-btn.busy .oi{animation:spin 1s linear infinite}
+
+/* 搜索框 */
+.tm-search{
+  width:100%;padding:9px 13px;font-size:11.8px;font-family:inherit;
+  color:var(--text);background:rgba(255,255,255,.7);
+  border:1.5px solid var(--line);border-radius:var(--r-sm);
+  outline:none;margin-bottom:12px;
+  transition:border-color .15s var(--fast),box-shadow .15s var(--fast);
+}
+.tm-search:focus{border-color:#5b5fc7;
+  box-shadow:0 0 0 3.5px rgba(91,95,199,.14)}
+
+/* 分组标题 */
+.tm-sec{
+  font-size:9.6px;font-weight:750;letter-spacing:.7px;
+  color:var(--dim);text-transform:uppercase;
+  margin:14px 0 8px;display:flex;align-items:center;gap:6px;
+}
+.tm-sec:first-of-type{margin-top:4px}
+.tm-sec .tm-n{
+  font-size:9.5px;font-weight:700;color:var(--muted);
+  background:var(--card2);border:1px solid var(--line);
+  border-radius:var(--pill);padding:0 7px;
+}
+
+/* 条目 */
+.tm-item{
+  padding:11px 13px;margin-bottom:7px;
+  background:var(--glass);border:1px solid rgba(226,217,199,.8);
+  border-radius:var(--r-sm);cursor:pointer;
+  transition:border-color .15s var(--fast),transform .16s var(--spring),
+             box-shadow .15s var(--fast);
+}
+.tm-item:hover{border-color:var(--line2);transform:translateX(2px);
+  box-shadow:var(--sh-sm)}
+.tm-item .tm-h{
+  display:flex;align-items:baseline;gap:8px;margin-bottom:4px;
+}
+.tm-item .tm-t{
+  flex:1;min-width:0;font-size:12px;font-weight:650;color:var(--text);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.tm-item .tm-d{
+  font-size:10px;color:var(--dim);flex:0 0 auto;
+  font-variant-numeric:tabular-nums;
+}
+.tm-item .tm-p{
+  font-size:11px;color:var(--muted);line-height:1.62;
+  overflow:hidden;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;
+}
+.tm-item.open .tm-p{-webkit-line-clamp:unset}
+.tm-item .tm-m{
+  display:flex;align-items:center;gap:7px;margin-top:6px;flex-wrap:wrap;
+}
+.tm-tag{
+  font-size:9.4px;font-weight:700;padding:1.5px 8px;
+  border-radius:var(--pill);
+  background:rgba(91,95,199,.13);color:#4b4fa8;
+  border:1px solid rgba(91,95,199,.3);
+}
+.tm-tag.att{
+  background:rgba(201,154,46,.14);color:#8a6818;
+  border-color:rgba(201,154,46,.32);
+}
+.tm-tag.pdf{
+  background:rgba(194,91,80,.12);color:#a94a40;
+  border-color:rgba(194,91,80,.3);
+}
+/* PDF 提取出来的文字 */
+.tm-file{
+  margin-top:8px;padding:10px 12px;
+  background:var(--card2);border:1px solid var(--line);
+  border-radius:var(--r-xs);
+  font-size:10.8px;line-height:1.7;color:var(--muted);
+  white-space:pre-wrap;word-break:break-word;
+  max-height:220px;overflow-y:auto;user-select:text;
+}
+.tm-file .tm-note{
+  display:block;margin-bottom:6px;padding-bottom:6px;
+  border-bottom:1px dashed var(--line);
+  font-size:10px;color:var(--dim);font-style:italic;
+}
+/* 关键词高亮 */
+.tm-file mark, .tm-p mark{
+  background:rgba(201,154,46,.28);color:inherit;
+  border-radius:2px;padding:0 1px;
+}
+/* 空状态 */
+.tm-empty{
+  text-align:center;padding:22px 16px;color:var(--dim);font-size:11.4px;
+  line-height:1.8;
+}
+.tm-empty .oi{display:block;margin:0 auto 10px;opacity:.5}
+.tm-hint{
+  font-size:10.4px;color:var(--dim);line-height:1.75;
+  margin-top:11px;padding-top:10px;
+  border-top:1px dashed var(--line);
+}

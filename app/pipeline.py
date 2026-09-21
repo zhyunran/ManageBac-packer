@@ -107,15 +107,15 @@ def _friendly_login_msg(raw: str) -> str:
     """
     raw = raw or ""
     if any(k in raw for k in ("锁定", "锁")):
-        return ("账号被学校系统临时锁定了（通常是密码输错几次导致）。\n"
-                "稍等一会儿会自动恢复，程序会自己重试，你不用管。")
+        return ("账号被学校系统临时锁定（通常是密码输错几次）。\n"
+                "稍等一会儿会自动恢复，程序会自动重试。")
     if any(k in raw for k in ("不正确", "密码", "credential")):
         return ("账号或密码不正确。\n"
-                "请检查项目里的 credentials.json 是否填对（注意学校域名容易写错）。")
+                "点「填写账号」重新填一次。注意邮箱域名容易写错。")
     if "风控" in raw or "webdriver" in raw:
-        return "浏览器指纹被识别了，正在用另一种方式重试……"
+        return "浏览器指纹被识别，正在换一种方式重试。"
     if "超时" in raw or "timeout" in raw.lower():
-        return "登录超时了（网络慢或学校网站忙）。稍后会自动重试。"
+        return "登录超时（网络慢或学校网站忙）。稍后会自动重试。"
     if not raw:
         return "登录状态过期，正在自动重新登录……"
     return f"自动重新登录未成功：{raw}\n稍后会自动再试。"

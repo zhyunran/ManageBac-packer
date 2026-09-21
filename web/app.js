@@ -1,4 +1,4 @@
-/* CampusPulse —— 主逻辑
+/* ManageBac-packer —— 主逻辑
  * 由 web/split_files.py 从 index.html 内联脚本抽出（2026-09-20）。
  */
 const $ = s => document.querySelector(s);
@@ -516,6 +516,12 @@ function renderStats(tasks){
      title: mp!=null ? `${s.graded_count||0} 门有总评的课程平均` : ''},
     gpaCell,
   ];
+  /* ★ 同样要防重播：这段每秒执行，而 #stats .stat 上有入场动画。
+     比对签名，内容没变就不碰 DOM。 */
+  const stSig = JSON.stringify(st.map(x => [x.n, x.l, x.c]));
+  if(stSig === lastStatsSig) return;
+  lastStatsSig = stSig;
+
   $('#stats').innerHTML = st.map(x=>`
     <div class="stat" style="--c:${x.c}" ${x.title?`title="${esc(x.title)}"`:''}>
       <div class="n" style="color:${x.c}">${x.n}</div>
@@ -1112,6 +1118,276 @@ function bindSettings(){
   /* 初始化：页面一打开就应用（不闪默认样式） */
   LOOK = loadLook();
   applyLook(LOOK);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Teams / EC 面板
+
+   EC = English Corner，每天会在 Teams 频道里发 PDF（名单 / 安排）。
+   这里把消息和 PDF 文字集中到一处，方便查。
+
+   ★ 交互
+     · 「打开 Teams」→ 弹出浏览器窗口，你登录（只需一次）
+     · 「同步」     → 往回翻几屏，读消息，分类存在本机
+     · 「取附件」   → 下载 EC 的 PDF 并提取文字
+     · 搜索框       → 在 EC 文字里全文搜索，命中的词会高亮
+   ══════════════════════════════════════════════════════════════════ */
+
+let TM_ITEMS = [];
+let TM_KEY = '';
+
+function tmEsc(s){
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+/* 高亮搜索词（先转义再做标记，避免 XSS） */
+function tmHilite(text, kw){
+  const safe = tmEsc(text);
+  if(!kw) return safe;
+  try{
+    const re = new RegExp('(' + kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+    return safe.replace(re, '<mark>$1</mark>');
+  }catch(e){ return safe; }
+}
+
+function tmSetStatus(html, ok){
+  const bar = $('#tmBar'), txt = $('#tmStatus');
+  if(bar) bar.classList.toggle('on', !!ok);
+  if(txt) txt.innerHTML = html;
+}
+
+function tmRender(){
+  const box = $('#tmList');
+  if(!box) return;
+
+  const kw = TM_KEY.trim();
+  let items = TM_ITEMS;
+  if(kw){
+    const low = kw.toLowerCase();
+    /*  搜索范围：标题 / 正文 / PDF 文字 / 频道 / 人名 / 附件名 / 日期。
+       人名一定要能搜 —— EC 的核心用法就是查「我在不在名单上」。 */
+    items = items.filter(it => {
+      const atts = (it.attachments || []).map(a => a.name || '').join(' ');
+      const blob = (it.title||'') + ' ' + (it.text||'') + ' ' +
+                   (it.file_text||'') + ' ' + (it.channel||'') + ' ' +
+                   (it.author||'') + ' ' + (it.date||'') + ' ' + atts;
+      return blob.toLowerCase().indexOf(low) >= 0;
+    });
+  }
+
+  if(!items.length){
+    box.innerHTML = kw
+      ? `<div class="tm-empty">没有匹配「${tmEsc(kw)}」的内容</div>`
+      : `<div class="tm-empty">
+           <span class="oi">${icon('i-teams','xxl')}</span>
+           还没有数据。<br>先点「打开 Teams」登录，再点「同步」。
+         </div>`;
+    return;
+  }
+
+  /* 按日期分组（新的在前） */
+  const byDate = {};
+  items.forEach(it=>{
+    const d = it.date || '未标注日期';
+    (byDate[d] = byDate[d] || []).push(it);
+  });
+  const dates = Object.keys(byDate).sort().reverse();
+
+  let h = '';
+  dates.forEach(d=>{
+    const list = byDate[d];
+    h += `<div class="tm-sec">${tmEsc(d)}
+      <span class="tm-n">${list.length}</span></div>`;
+    list.forEach((it, i)=>{
+      const isEc = it.kind === 'ec';
+      const txt = (it.text || '').slice(0, 600);
+      const atts = it.attachments || [];
+      const hasFile = !!(it.file_text || '').trim();
+
+      h += `<div class="tm-item" data-tmi="${d}|${i}">
+        <div class="tm-h">
+          <span class="tm-t">${tmHilite(it.title || '消息', kw)}</span>
+          <span class="tm-d">${tmEsc((it.timeLabel||'').slice(0,18))}</span>
+        </div>
+        ${txt ? `<div class="tm-p">${tmHilite(txt, kw)}</div>` : ''}
+        <div class="tm-m">
+          ${isEc ? '<span class="tm-tag">EC</span>' : ''}
+          ${it.author ? `<span class="tm-tag">${tmHilite(it.author, kw)}</span>` : ''}
+          ${atts.length ? `<span class="tm-tag att">附件 ${atts.length}</span>` : ''}
+          ${hasFile ? '<span class="tm-tag pdf">已读 PDF</span>' : ''}
+        </div>
+        ${hasFile ? `<div class="tm-file">
+          ${it.file_note ? `<span class="tm-note">${tmEsc(it.file_note)}</span>` : ''}
+          ${tmHilite(it.file_text.slice(0, 8000), kw)}
+        </div>` : ''}
+      </div>`;
+    });
+  });
+
+  box.innerHTML = h;
+
+  /* 点击展开/收起 */
+  box.querySelectorAll('[data-tmi]').forEach(el=>{
+    el.addEventListener('click', e=>{
+      if(e.target.tagName === 'MARK') return;
+      el.classList.toggle('open');
+    });
+  });
+}
+
+async function tmLoad(keepStatus){
+  let st = {}, items = [];
+  try{
+    st = await apiTeamsStatus();
+    const r = await apiEcList('', '');
+    items = (r && r.items) || [];
+  }catch(e){}
+
+  TM_ITEMS = items;
+
+  /*  keepStatus=true 时只刷新列表，不动状态栏 ——
+      否则刚同步完的结果会被「上次同步 …」立刻盖掉。 */
+  if(!keepStatus){
+    if(st && st.ready){
+      tmSetStatus(
+        `上次同步 <b>${tmEsc((st.updated||'').slice(5,16))}</b>` +
+        ` · EC <b>${st.ec_count}</b> 条 · 其他 <b>${st.post_count}</b> 条` +
+        ` · 附件 <b>${st.attach_count}</b>`, true);
+    }else{
+      tmSetStatus(st && st.note ? tmEsc(st.note) : '还没同步过');
+    }
+  }
+  tmRender();
+}
+
+function openTeams(){
+  const host = $('#teampanel');
+  if(host) host.classList.add('open');
+  tmLoad();
+}
+
+function closeTeams(){
+  $('#teampanel')?.classList.remove('open');
+}
+
+function bindTeams(){
+  const btn = $('#btnTeams');
+
+  btn?.addEventListener('click', e=>{
+    e.stopPropagation();
+    if($('#teampanel')?.classList.contains('open')) closeTeams();
+    else openTeams();
+  });
+
+  $('#tmClose')?.addEventListener('click', closeTeams);
+  $('#teampanel')?.addEventListener('click', e=>{
+    if(e.target && e.target.id === 'teampanel') closeTeams();
+  });
+
+  /* 打开 Teams（浏览器窗口） */
+  $('#tmOpen')?.addEventListener('click', async e=>{
+    e.stopPropagation();
+    const b = $('#tmOpen');
+    b?.classList.add('busy');
+    tmSetStatus('正在打开 Teams 窗口……');
+    try{
+      const r = await apiTeamsOpen();
+      tmSetStatus(r && r.ok
+        ? '窗口已打开，在里面登录 Teams，然后回来点「同步」'
+        : '打开失败：' + ((r && r.error) || '未知原因'));
+    }catch(err){
+      tmSetStatus('打开失败：' + err);
+    }finally{
+      b?.classList.remove('busy');
+    }
+  });
+
+  /* 同步（共用函数：普通同步 / 多翻一点） */
+  async function doSync(rounds, btn){
+    if(btn?.classList.contains('busy')) return;
+    btn?.classList.add('busy');
+    $('#tmSync')?.classList.add('busy');
+    $('#tmMore')?.classList.add('busy');
+    tmSetStatus(rounds > 10
+      ? '正在往更深处翻，并读取页面……可能要一两分钟'
+      : '正在往回翻并读取页面……大约 15~40 秒');
+
+    try{
+      const r = await apiTeamsSync(rounds);
+      if(r && r.ok){
+        /*  如实报告：翻了几轮、有几轮真的加载出了新内容、到没到最早 */
+        const roundsTxt = r.scroll_rounds
+          ? ` · 往回翻 <b>${r.scroll_rounds}</b> 轮` +
+            (r.scroll_grew ? `（<b>${r.scroll_grew}</b> 轮有新内容）` : '（没有更早的）')
+          : '';
+        tmSetStatus(
+          `同步完成 · 读了 <b>${r.scanned||0}</b> 条 · ` +
+          `EC <b>${r.ec||0}</b> · 其他 <b>${r.posts||0}</b> · ` +
+          `附件 <b>${r.attachments||0}</b>` +
+          roundsTxt +
+          (r.at_top ? ' · <b>已到最早</b>' : ''), true);
+        toast('Teams 同步完成', 'ok', '');
+      }else{
+        tmSetStatus('未完成：' + ((r && r.reason) || '未知原因'));
+        toast('同步未完成：' + ((r && r.reason) || ''), 'err', '');
+      }
+      await tmLoad(true);   /* 只刷新列表，保住刚同步出来的状态文字 */
+      tmRender();
+    }catch(err){
+      tmSetStatus('出错：' + err);
+    }finally{
+      btn?.classList.remove('busy');
+      $('#tmSync')?.classList.remove('busy');
+      $('#tmMore')?.classList.remove('busy');
+    }
+  }
+
+  $('#tmSync')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    doSync(8, $('#tmSync'));
+  });
+
+  /* 多翻一点：往更深处翻，拿更早的历史 */
+  $('#tmMore')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    doSync(25, $('#tmMore'));
+  });
+
+  /* 下载 EC 附件 + 提取 PDF 文字 */
+  $('#tmDL')?.addEventListener('click', async e=>{
+    e.stopPropagation();
+    const b = $('#tmDL');
+    if(b?.classList.contains('busy')) return;
+    b?.classList.add('busy');
+    tmSetStatus('正在下载附件并读取 PDF……');
+
+    try{
+      const r = await apiTeamsDownload();
+      if(r && r.ok){
+        tmSetStatus(
+          `已下载 <b>${r.downloaded}</b> / ${r.total} 个附件 · ` +
+          `读到文字 <b>${r.text_extracted}</b> 份`, true);
+        toast('附件处理完成', 'ok', '');
+      }else{
+        tmSetStatus('未完成：' + ((r && r.reason) || '未知原因'));
+      }
+      await tmLoad(true);   /* 只刷新列表，保住刚处理完的状态文字 */
+      tmRender();
+    }catch(err){
+      tmSetStatus('出错：' + err);
+    }finally{
+      b?.classList.remove('busy');
+    }
+  });
+
+  /* 搜索（防抖 200ms，避免每敲一个字就重绘） */
+  let tmTimer = null;
+  $('#tmSearch')?.addEventListener('input', e=>{
+    const v = e.target.value || '';
+    clearTimeout(tmTimer);
+    tmTimer = setTimeout(()=>{ TM_KEY = v; tmRender(); }, 200);
+  });
 }
 
 /* ══════════ 自编课表面板 ══════════
@@ -2401,6 +2677,8 @@ function tickCountdown(){
 
 /* ══════════ 主渲染 ══════════ */
 let lastSig = '';
+let lastEmptySig = '';      /* 空状态的签名（避免每秒重建） */
+let lastStatsSig = '';      /* 统计卡的签名 */
 
 function render(){
   if(!DATA) return;
@@ -2463,10 +2741,23 @@ function render(){
   }
 
   if(!tasks.length && !courses.length){
-    /* 没有任何数据 → 显示明确的原因与操作指引，绝不空白 */
-    $('#page-grade').innerHTML = emptyState();
-    $('#page-sch').innerHTML = DATA.schedule && DATA.schedule.ready
-      ? schedulePage() : scheduleEmptyState();
+    /* 没有任何数据 → 显示明确的原因与操作指引，绝不空白。
+       ★ 必须先比对签名再写 DOM —— 这段每秒都会执行，
+         无条件重建会让里面的入场动画每秒重播（看起来像在闪）。 */
+    const eSig = JSON.stringify([
+      DATA.status, DATA.message, DATA.login_error,
+      DATA.schedule && DATA.schedule.ready,
+      DATA.schedule && DATA.schedule.error,
+      HAS_CREDENTIALS,
+    ]);
+    if(eSig !== lastEmptySig){
+      lastEmptySig = eSig;
+      $('#page-grade').innerHTML = emptyState();
+      $('#page-sch').innerHTML = DATA.schedule && DATA.schedule.ready
+        ? schedulePage() : scheduleEmptyState();
+      bindRelogin(document);
+      bindOpenSetup(document);
+    }
 
     /* 即使成绩抓不到，课表也要能正常显示计数 */
     const bt0 = $('#badge-tasks'), bs0 = $('#badge-sch');
@@ -2487,7 +2778,12 @@ function render(){
   }
 
   if(DATA.status==='running' && !tasks.length && !courses.length){
-    $('#page-grade').innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+    /* 骨架屏同样要防重播 */
+    if(lastEmptySig !== '__skeleton__'){
+      lastEmptySig = '__skeleton__';
+      $('#page-grade').innerHTML =
+        '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+    }
     lastSig = '';
     return;
   }
@@ -3940,6 +4236,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   bootSetup();
   bindCustomPanel();
   bindSettings();
+  bindTeams();
 
   /* Tab 点击 */
   document.querySelectorAll('.tab').forEach(el=>{
@@ -4079,6 +4376,90 @@ $('#live').addEventListener('click',()=>{
   lastSig = '';
   poll();
 });
+
+/* ══════════════════════════════════════════════════════════════════
+   动画节流兜底：同一元素 0.7 秒内不允许重播动画
+
+   ★ 为什么要有这个
+     即使上面两处都加了签名比对，将来新加的元素仍可能踩同样的坑
+     （「每秒重建 + 元素上有动画」）。这是**结构性问题**，
+     而不是某两处的 bug。
+
+     这里加一道全局兜底：监听 animationstart，如果同一元素
+     在 0.7 秒内又要开始动画，就把它取消掉。
+
+   ★ 为什么是 0.7 秒
+     · 正常动效时长 0.28~0.42 秒，播完后 0.7 秒内不会再重播
+     · 每秒重播的情况会被挡掉（间隔 1 秒 > 0.7 秒？不，是挡住）
+       实际逻辑：记录上次**开始**时间，间隔 < 0.7s 就拦。
+       每秒一次的间隔是 1.0s，比 0.7s 长……
+       ★ 所以还要看「动画时长」：如果动效本身没播完就重播，那才是鬼畜。
+       这里改成判断「上次动画是否已结束」——
+       没结束又重播 = 鬼畜，直接取消。
+
+   ★ 会不会误伤正常动效
+     不会。正常动效每次都能播完（用户主动触发，间隔远大于时长）。
+     只有「上一轮还没播完就被重建」才会被拦。
+     另外给用户主动触发的动效开了白名单（hover/click 类）。
+   ══════════════════════════════════════════════════════════════════ */
+const _animGuard = new WeakMap();      /* element -> 上次开始时间 */
+const _animAllow = new WeakSet();      /* 用户主动触发的动画 */
+
+document.addEventListener('animationstart', e=>{
+  const el = e.target;
+  if(!el || !el.nodeType) return;
+  if(_animAllow.has(el)) return;
+
+  const now = performance.now();
+  const prev = _animGuard.get(el) || 0;
+  const gap = now - prev;
+
+  /* 距上次开始不到 0.7 秒 → 判定为重播，立刻停掉 */
+  if(prev && gap < 700){
+    try{
+      el.style.animation = 'none';
+      /* 下一帧恢复 —— 否则后续正常的动画也播不出来 */
+      requestAnimationFrame(()=>{ el.style.animation = ''; });
+    }catch(err){}
+    return;
+  }
+  _animGuard.set(el, now);
+}, true);      /* 用捕获阶段，赶在浏览器绘制前拦下 */
+
+/* 用户点击时，允许该元素（及其子元素）播动画 */
+document.addEventListener('pointerdown', e=>{
+  let n = e.target;
+  let depth = 0;
+  while(n && n.nodeType === 1 && depth < 3){
+    _animAllow.add(n);
+    setTimeout(()=>_animAllow.delete(n), 1500);
+    n = n.parentElement;
+    depth++;
+  }
+}, true);
+
+/* ══════════ Teams / EC API ══════════ */
+function apiTeamsStatus(){
+  if(window.pywebview?.api?.teams_status) return window.pywebview.api.teams_status();
+  return Promise.resolve({ok:false, ready:false, note:'当前模式不支持'});
+}
+function apiTeamsOpen(){
+  if(window.pywebview?.api?.teams_open) return window.pywebview.api.teams_open();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+function apiTeamsSync(rounds){
+  if(window.pywebview?.api?.teams_sync)
+    return window.pywebview.api.teams_sync(rounds == null ? 8 : rounds);
+  return Promise.resolve({ok:false, reason:'当前模式不支持'});
+}
+function apiEcList(kw, date){
+  if(window.pywebview?.api?.ec_list) return window.pywebview.api.ec_list(kw||'', date||'');
+  return Promise.resolve({ok:false, items:[]});
+}
+function apiTeamsDownload(){
+  if(window.pywebview?.api?.teams_download_ec) return window.pywebview.api.teams_download_ec();
+  return Promise.resolve({ok:false, reason:'当前模式不支持'});
+}
 
 /* ══════════ 通信 ══════════ */
 window.updateData = json=>{

@@ -1,10 +1,10 @@
 # ══════════════════════════════════════════════════════════════════
-#  CampusPulse —— PyInstaller 打包配置
+#  ManageBac-packer —— PyInstaller 打包配置
 #
 #  用法：
 #      .venv\Scripts\pyinstaller.exe build.spec --noconfirm
 #
-#  产物：dist\CampusPulse.exe（单文件，约 30~40 MB）
+#  产物：dist\ManageBac-packer.exe（单文件，约 20 MB）
 #
 #   设计要点（都是踩过的坑）：
 #
@@ -93,6 +93,21 @@ hiddenimports = [
     "app.models",
     "app.gpa",
     "app.lock",
+    #   Teams / EC（读网页消息 + PDF 文字提取）
+    "app.teams",
+    "app.teams_reader",
+    #   上面两个用到下面这些：CDP 驱动 Edge、并发、下载
+    "app.cdp",
+    "app.edge",
+    "app.browser",
+    "app.download",
+    "app.flow",
+    "app.server",
+    "app.schedule",
+    #  PDF 文字层解析（app/teams.py 里是延迟 import，静态分析看不见）
+    "pypdf",
+    #  CDP 用 websocket-client 跟浏览器握手（app/cdp.py）
+    "websocket",
 ]
 
 
@@ -149,7 +164,7 @@ exe = EXE(pyz,
     a.zipfiles,
     a.datas,
     [],
-    name="CampusPulse",
+    name="ManageBac-packer",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
