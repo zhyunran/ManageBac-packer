@@ -1,6 +1,6 @@
 [project]
 name = "mb-widget"
-version = "0.1.0"
+version = "0.4.2"
 description = "ManageBac 桌面小组件：待办任务、成绩、GPA 一屏总览，点击跳转原网页"
 requires-python = ">=3.11"
 dependencies = [

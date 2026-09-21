@@ -180,6 +180,12 @@
   }
   .brand{font-weight:700;font-size:13.2px;letter-spacing:.1px}
   .brand small{font-weight:500;color:var(--dim);font-size:10.5px;margin-left:5px}
+  /* 版本号：淡到不抢注意力，但一直都在 */
+  .ver{
+    font-size:9.5px;font-weight:700;color:var(--dim);
+    letter-spacing:.3px;flex:0 0 auto;
+    margin-left:3px;opacity:.75;
+  }
   .flex{flex:1}
   .ibtn{
     /*  顶栏按钮：改成圆形（胶囊的极端形式 = 正圆），
@@ -377,14 +383,39 @@
     padding:14px 17px;border-bottom:1px solid var(--line);
   }
   .clwrap .clh .t{font-size:13.5px;font-weight:750;flex:1}
+  /*  ══════════ 关闭按钮（三个面板统一）══════════
+      要求：统一用「红叉」，且要有动效，不要红底色块。
+
+      做法：底色保持和普通图标按钮一样，只有叉号本身
+      在 hover 时变红 + 转 90°；按下再缩一下。
+      旋转用 --spring（带回弹），手感更「活」。 */
   .clwrap .clx{
     width:26px;height:26px;border-radius:var(--pill);
     border:1px solid var(--line);background:var(--card2);
     color:var(--muted);cursor:pointer;
     display:grid;place-items:center;flex:0 0 auto;
-    transition:.16s var(--fast);
+    transition:border-color .16s var(--fast),
+               background .16s var(--fast),
+               color .16s var(--fast),
+               transform .16s var(--spring);
   }
-  .clwrap .clx:hover{background:var(--red);color:#fff;border-color:var(--red)}
+  .clwrap .clx .oi{
+    width:14px;height:14px;stroke-width:2.2;
+    transition:transform .28s var(--spring),stroke .16s var(--fast);
+  }
+  .clwrap .clx:hover{
+    color:var(--red);border-color:rgba(194,91,80,.45);
+    background:rgba(194,91,80,.07);
+  }
+  .clwrap .clx:hover .oi{transform:rotate(90deg)}
+  .clwrap .clx:active{transform:scale(.9)}
+  .clwrap .clx:active .oi{transform:rotate(90deg) scale(.9)}
+  /* 键盘聚焦时给个可见的环（无障碍） */
+  .clwrap .clx:focus-visible{
+    outline:none;color:var(--red);
+    box-shadow:0 0 0 3px rgba(194,91,80,.18);
+  }
+
   .clbody{padding:15px 17px 17px}
   .clrow{margin-bottom:12px}
   .clrow label{
@@ -416,6 +447,31 @@
     background:var(--violet);color:#fff;border-color:var(--violet);
     box-shadow:0 2px 8px rgba(139,107,181,.3);
   }
+  /* 「按节次 / 按时刻」两档切换（同一套胶囊观感） */
+  .clmodes{display:flex;gap:5px}
+  .clmodes .clmode{
+    flex:1;padding:8px 0;cursor:pointer;font-family:inherit;
+    font-size:11px;font-weight:650;color:var(--muted);
+    background:var(--card2);border:1px solid var(--line);
+    border-radius:var(--r-sm);
+    transition:all .15s var(--fast);
+  }
+  .clmodes .clmode:hover{border-color:var(--line2)}
+  .clmodes .clmode.on{
+    background:var(--violet);color:#fff;border-color:var(--violet);
+    box-shadow:0 2px 8px rgba(139,107,181,.3);
+  }
+  /* 起止时刻：两个 time 输入并排 */
+  .cltimes{display:flex;align-items:center;gap:7px}
+  .cltimes input{flex:1;min-width:0}
+  .cltimes .cltsep{color:var(--dim);font-size:12px;flex:0 0 auto}
+  /* 输入框下面的小提示（自动带出的节次 / 落位位置） */
+  .clhint{
+    margin-top:5px;font-size:10.5px;color:var(--dim);
+    line-height:1.5;min-height:14px;
+  }
+  .clhint b{color:var(--violet);font-weight:700}
+  .clhint.warn{color:var(--orange)}
   .clbtn-go{
     width:100%;padding:12px 18px;border-radius:var(--pill);
     border:1px solid var(--violet);background:var(--violet);color:#fff;

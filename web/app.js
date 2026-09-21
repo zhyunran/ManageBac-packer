@@ -1411,6 +1411,100 @@ function clPeriodsOptions(){
   return list;
 }
 
+/* ══════════ 时刻 ↔ 节次 换算 ══════════
+   自编课要支持两种填法，且两边联动：
+     · 按节次：选 P3 → 自动带出 09:40–10:20
+     · 按时刻：填 09:45 → 自动认出落在 P3
+   时间表来自后端抓的 sch.periods；抓不到时退化成只有节次名。 */
+
+/* "09:40" → 580（分钟数）。非法值返回 null。 */
+function hm2min(s){
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s == null ? '' : s).trim());
+  if(!m) return null;
+  const h = +m[1], mi = +m[2];
+  if(h > 23 || mi > 59) return null;
+  return h * 60 + mi;
+}
+
+/* 580 → "09:40" */
+function min2hm(v){
+  const n = ((Math.round(v) % 1440) + 1440) % 1440;
+  return String(Math.floor(n / 60)).padStart(2, '0') + ':'
+       + String(n % 60).padStart(2, '0');
+}
+
+/* 节次表里某一节的起止时间；查不到返回 null */
+function periodTimes(name){
+  const sch = (DATA && DATA.schedule) || {};
+  const key = String(name || '').trim().toUpperCase();
+  if(!key) return null;
+  return (sch.periods || []).find(
+    x => String(x.period || '').toUpperCase() === key) || null;
+}
+
+/* 某一时刻最贴近哪一节（用于「按时刻」反推节次）
+   命中区间内的优先；都不在区间里就取起点最近的。 */
+function periodForTime(hm, endHm){
+  const sch = (DATA && DATA.schedule) || {};
+  const ps = sch.periods || [];
+  if(hm2min(hm) == null || !ps.length) return '';
+  /*  有结束时间 → 按重叠判定（最准）。
+      只给了起点 → 退回「是不是落在某一节里」。 */
+  if(endHm){
+    const hit = bestPeriodByOverlap(hm, endHm, ps);
+    if(hit) return hit.period || '';
+  }
+  const t = hm2min(hm);
+  let best = '', bestD = Infinity;
+  for(const p of ps){
+    const a = hm2min(p.start), b = hm2min(p.end);
+    if(a == null) continue;
+    if(b != null && t >= a && t < b) return p.period || '';
+    const d = Math.abs(t - a);
+    if(d < bestD){ bestD = d; best = p.period || ''; }
+  }
+  return best;
+}
+
+/*  时刻 → 位置值。用来把「只有时间」的自编课插到恰当位置。
+     整数 = 落在该节次里；x.5 = 插在第 x 节之后（两节之间）。 */
+function timeToSlotPos(t, periods){
+  for(let i = 0; i < periods.length; i++){
+    const a = hm2min(periods[i].start);
+    const b = hm2min(periods[i].end);
+    if(a == null) continue;
+    if(t < a) return i - 0.5;
+    if(b == null || t <= b) return i;
+  }
+  return periods.length - 0.5;
+}
+
+/*  更准的落位：看「这节课的整段」和哪一节重叠最多。
+     为什么不能只看起点：09:45 开始的社团活动，起点比 P3 早 5 分钟，
+     按起点算会插到 P2 和 P3 中间 —— 但它 10:35 结束，
+     正好是 P3 的下课点，明显就是 P3 的课。
+     所以按重叠比例判定，重叠超过一半就认定属于那一节。 */
+function bestPeriodByOverlap(start, end, periods){
+  const a = hm2min(start);
+  if(a == null) return null;
+  let b = hm2min(end);
+  if(b == null || b <= a) b = a + 45;      /* 没填结束就按一节 45 分钟估 */
+
+  let best = null, bestOv = 0;
+  for(const p of periods){
+    const pa = hm2min(p.start);
+    const pb = hm2min(p.end);
+    if(pa == null || pb == null) continue;
+    const ov = Math.min(b, pb) - Math.max(a, pa);     /* 重叠分钟数 */
+    if(ov > bestOv){ bestOv = ov; best = p; }
+  }
+  const span = b - a;
+  /*  重叠要过半才算「就是这一节」；否则说明它横跨两节或落在课间，
+      交给 timeToSlotPos 按起点插到中间。 */
+  if(best && span > 0 && bestOv / span >= 0.5) return best;
+  return null;
+}
+
 function openCustomPanel(){
   const host = $('#clpanel');
   if(!host) return;
@@ -1442,9 +1536,136 @@ function openCustomPanel(){
       .map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
   }
 
+  clBindModes();
+  clSyncFromPeriod();        /* 初始化时把提示刷出来 */
+
   clRenderList();
   host.classList.add('open');
   setTimeout(() => { try{ $('#clName')?.focus(); }catch(e){} }, 300);
+}
+
+/*  两种填法共用同一份数据：clMode 决定用哪一档，
+    切换时互相带出对方的值（选了 P3 就填上 09:40，反之亦然）。 */
+let clMode = 'period';
+
+function clBindModes(){
+  const box = $('#clMode');
+  if(!box || box.dataset.built) return;
+  box.dataset.built = '1';
+
+  box.querySelectorAll('.clmode').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      const m = b.dataset.mode;
+      if(m === clMode) return;
+
+      /*  切换时以「刚填的那一档」为准，带出另一档的值。
+          关键：目标那一档的旧值要**覆盖**而不是保留 ——
+          否则切来切去会留下上一次填的残值（曾出现过：
+          切到按时刻后，显示的还是几轮前填的 13:00）。 */
+      if(m === 'time'){
+        const pt = periodTimes($('#clPeriod')?.value);
+        const s = $('#clStart'), e = $('#clEnd');
+        if(pt && s && e){
+          s.value = pt.start || '';
+          e.value = pt.end   || '';
+        }
+      }else{
+        const st = $('#clStart')?.value || '';
+        const en = $('#clEnd')?.value   || '';
+        const p = st ? periodForTime(st, en) : '';
+        if(p) $('#clPeriod').value = p;
+      }
+
+      clMode = m;
+      box.querySelectorAll('.clmode').forEach(x=>
+        x.classList.toggle('on', x.dataset.mode === m));
+      const rp = $('#clRowPeriod'), rt = $('#clRowTime');
+      if(rp) rp.hidden = (m !== 'period');
+      if(rt) rt.hidden = (m !== 'time');
+      if(m === 'period') clSyncFromPeriod(); else clSyncFromTime();
+    });
+  });
+
+  /* 节次变了 → 带出时间 */
+  $('#clPeriod')?.addEventListener('change', clSyncFromPeriod);
+
+  /* 时刻变了 → 反推节次；两端互相补全 */
+  $('#clStart')?.addEventListener('input', ()=>{
+    const a = hm2min($('#clStart')?.value);
+    const b = hm2min($('#clEnd')?.value);
+    /* 结束时间比开始早（或没填）→ 自动补一节 45 分钟 */
+    if(a != null && (b == null || b <= a)){
+      const e = $('#clEnd');
+      if(e) e.value = min2hm(a + 45);
+    }
+    clSyncFromTime();
+  });
+  $('#clEnd')?.addEventListener('input', ()=>{
+    const a = hm2min($('#clStart')?.value);
+    const b = hm2min($('#clEnd')?.value);
+    /*  结束早于（或等于）开始 → 直接纠正成「开始 + 一节课」。
+        课表不会跨天，所以这里不用问，改了就是。 */
+    if(a != null && b != null && b <= a){
+      const e = $('#clEnd');
+      if(e) e.value = min2hm(a + 45);
+      clSyncFromTime();
+      toast('结束时间改到 ' + min2hm(a + 45), 'ok', '');
+      return;
+    }
+    clSyncFromTime();
+  });
+}
+
+/* 选了节次 → 提示里显示对应时刻 */
+function clSyncFromPeriod(){
+  const hint = $('#clPHint');
+  if(!hint) return;
+  const name = $('#clPeriod')?.value || '';
+  const pt = periodTimes(name);
+  if(pt && pt.start){
+    hint.innerHTML = `${esc(name)} 是 <b>${esc(pt.start)}` +
+      (pt.end ? `–${esc(pt.end)}` : '') + `</b>，会自动落在这里。`;
+    hint.classList.remove('warn');
+  }else{
+    hint.innerHTML = '没抓到这节课的时间表，会按节次名排在对应位置。';
+    hint.classList.add('warn');
+  }
+}
+
+/* 填了时刻 → 反推节次并提示 */
+function clSyncFromTime(){
+  const hint = $('#clTHint');
+  if(!hint) return;
+  const st = $('#clStart')?.value || '';
+  const en = $('#clEnd')?.value || '';
+  const a = hm2min(st);
+  if(a == null){
+    hint.innerHTML = '填好起止时刻，会自动认出对应的节次。';
+    hint.classList.remove('warn');
+    return;
+  }
+  const p = periodForTime(st, en);
+  const pt = periodTimes(p);
+  const parts = [];
+  if(p){
+    parts.push(`会自动落到 <b>${esc(p)}</b>`);
+  }else{
+    parts.push('没比对出节次，会按时间插在对应位置');
+  }
+  if(pt && pt.start){
+    const pa = hm2min(pt.start);
+    const diff = pa == null ? null : a - pa;
+    if(diff != null && Math.abs(diff) > 3){
+      const sign = diff > 0 ? '晚' : '早';
+      parts.push(`比这一节${sign} ${Math.abs(diff)} 分钟`);
+    }
+  }
+  if(en){
+    const b = hm2min(en);
+    if(b != null && b <= a) parts.push('结束时间比开始早');
+  }
+  hint.innerHTML = parts.join(' · ');
+  hint.classList.toggle('warn', !p);
 }
 
 function closeCustomPanel(){
@@ -1464,8 +1685,16 @@ function clRenderList(){
     const when = c.once
       ? (c.day || '')
       : (c.weekdays || []).map(w => CL_WD[w]).join('、');
+    /* 时间那一段：有节次显示节次，没节次就显示时刻 */
+    const pt = periodTimes(c.period);
+    const st = c.start || (pt && pt.start) || '';
+    const en = c.end   || (pt && pt.end)   || '';
+    let timeTxt = c.period || '';
+    if(st){
+      timeTxt = (c.period ? c.period + ' ' : '') + st + (en ? '–' + en : '');
+    }
     h += `<div class="clitem">
-      <span class="cln">${esc(c.period || '')} ${esc(c.subject || '')}${
+      <span class="cln">${esc(timeTxt)}${timeTxt ? ' · ' : ''}${esc(c.subject || '')}${
         c.room ? ` · ${esc(c.room)}` : ''}</span>
       <span class="clw">${esc(when)}</span>
       <button class="cld" data-cldel="${idx}" title="删除"></button>
@@ -1489,7 +1718,23 @@ function clRenderList(){
 function clSave(){
   const name  = ($('#clName')?.value || '').trim();
   const room  = ($('#clRoom')?.value || '').trim();
-  const per   = $('#clPeriod')?.value || '';
+  const byTime = (clMode === 'time');
+  let per   = $('#clPeriod')?.value || '';
+  let st    = '';
+  let en    = '';
+
+  if(byTime){
+    st = $('#clStart')?.value || '';
+    en = $('#clEnd')?.value   || '';
+    /* 按时刻填的：反推一个节次名存着（列表里好认，也便于排序）
+       带结束时间 → 用重叠判定，比只看起点准。 */
+    const guess = periodForTime(st, en);
+    if(guess) per = guess;
+  }else{
+    const pt = periodTimes(per);
+    st = (pt && pt.start) || '';
+    en = (pt && pt.end)   || '';
+  }
 
   if(!name){
     toast('先填个名称', 'err', '');
@@ -1500,25 +1745,49 @@ function clSave(){
     toast('选一下星期几', 'err', '');
     return;
   }
+  /*  按节次填时必须有节次；按时刻填时必须有开始时间。
+      两者都没有 → 存下来也没法落位，不如当场说清楚。 */
+  if(byTime && hm2min(st) == null){
+    toast('填一下开始时刻', 'err', '');
+    try{ $('#clStart')?.focus(); }catch(e){}
+    return;
+  }
+  /*  结束时间：没填或填反了，都按「开始 + 45 分钟」补正。
+      不在这里拦人 —— 用户只想快速加一条时，多一次报错很烦。 */
+  if(byTime){
+    const a = hm2min(st), b = hm2min(en);
+    if(b == null || b <= a) en = min2hm(a + 45);
+  }
+  if(!byTime && !per){
+    toast('选一下第几节', 'err', '');
+    return;
+  }
 
   const list = customLessons();
   list.push({
     id: 'c-' + Date.now(),
     weekdays: clDays.slice().sort(),
     period: per,
+    start: st,
+    end: en,
+    byTime: byTime,
     subject: name,
     room: room,
     flag: '',
   });
   saveCustomLessons(list);
 
-  /* 清掉输入，方便连着加下一条 */
+  /* 清掉输入，方便连着加下一条（保留星期与模式，通常要连加几条） */
   try{
     $('#clName').value = '';
     $('#clRoom').value = '';
+    $('#clStart').value = '';
+    $('#clEnd').value = '';
   }catch(e){}
 
   clRenderList();
+  clSyncFromPeriod();
+  clSyncFromTime();
   toast('已添加：' + name, 'ok', '');
 
   lastSig = '';
@@ -1544,8 +1813,8 @@ function bindCustomPanel(){
     if(e.target && e.target.id === 'clpanel') closeCustomPanel();
   });
 
-  /* 回车直接保存 */
-  ['#clName', '#clRoom'].forEach(sel => {
+  /* 回车直接保存（time 输入框回车不太顺手，也一起绑上） */
+  ['#clName', '#clRoom', '#clStart', '#clEnd'].forEach(sel => {
     const el = $(sel);
     el?.addEventListener('keydown', e => {
       if(e.key === 'Enter'){ e.preventDefault(); clSave(); }
@@ -1595,8 +1864,14 @@ const CL_WD  = ['周日','周一','周二','周三','周四','周五','周六'];
 
 /* 读自编课 */
 function customLessons(){
-  try{ return JSON.parse(localStorage.getItem(CL_KEY) || '[]') || []; }
-  catch(e){ return []; }
+  try{
+    const v = JSON.parse(localStorage.getItem(CL_KEY) || '[]');
+    /*  只认数组。localStorage 可能被别的版本或手工改坏
+        （存成对象、字符串），这时当空处理，不要抛异常 ——
+        否则整个课表页都渲染不出来。 */
+    if(!Array.isArray(v)) return [];
+    return v.filter(x => x && typeof x === 'object');
+  }catch(e){ return []; }
 }
 function saveCustomLessons(list){
   try{ localStorage.setItem(CL_KEY, JSON.stringify(list || [])); }catch(e){}
@@ -1606,19 +1881,29 @@ function saveCustomLessons(list){
 function customForDay(dayISO){
   const wd = new Date(dayISO + 'T00:00:00').getDay();   /* 0=周日 */
   return customLessons().filter(c=>{
+    if(!c) return false;
     if(c.once) return c.day === dayISO;
     return (c.weekdays || []).indexOf(wd) >= 0;
-  }).map(c=>({
-    /* 转成和抓取数据一样的结构，后面渲染就不用分叉了 */
-    day: dayISO,
-    period: c.period || '',
-    subject: (c.flag ? '[' + c.flag + '] ' : '') + (c.subject || ''),
-    room: c.room || '',
-    teacher: '',
-    start: '', end: '',
-    kind: '自定义',
-    custom: true,
-  }));
+  }).map(c=>{
+    /*  起止时间的来源：
+         ① 用户手填的 start/end（按时刻那一档）
+         ② 没填就用节次表里这一节的时间
+       两者都没有就留空 —— 后面按「不在节次表里」追加到末尾。 */
+    const pt = periodTimes(c.period);
+    return {
+      /* 转成和抓取数据一样的结构，后面渲染就不用分叉了 */
+      day: dayISO,
+      period: c.period || '',
+      subject: (c.flag ? '[' + c.flag + '] ' : '') + (c.subject || ''),
+      room: c.room || '',
+      teacher: '',
+      start: c.start || (pt && pt.start) || '',
+      end:   c.end   || (pt && pt.end)   || '',
+      kind: '自定义',
+      custom: true,
+      byTime: !!c.byTime,   /* 按时刻填的 → 允许按时间落位 */
+    };
+  });
 }
 
 /* 给一天补空档 + 合并自编课
@@ -1642,6 +1927,46 @@ function fillDay(dayLessons, periods){
       (byP[key] = byP[key] || []).push(l);
     }else{
       noP.push(l);
+    }
+  }
+
+  /*  没写节次的课：按时间算它该落在第几节。
+      自编课按时刻填的时候走这条路 —— 用户填 09:45，
+      它 10:35 结束，就该出现在 P3 那一行，而不是被丢到最后。
+
+      判定顺序：
+        ① 整段与某一节重叠过半 → 直接归到那一节
+        ② 否则按起点算位置（x.5 = 插在两节之间）
+        ③ 都算不出 → 追加到末尾 */
+  const after = {};                   /* i → [插在第 i 节之后的课] */
+  const tail = [];                    /* 实在算不出的，留在末尾 */
+  const slotOf = {};
+  my.forEach((pd, i)=>{ slotOf[pd.period.toUpperCase()] = i; });
+
+  for(const l of noP){
+    const t = hm2min(l.start);
+    if(t == null){ tail.push(l); continue; }
+
+    /* ① 重叠过半 → 就是那一节 */
+    const hit = bestPeriodByOverlap(l.start, l.end, my);
+    if(hit){
+      const key = String(hit.period || '').toUpperCase();
+      if(!l.period) l.period = hit.period;      /* 标上节次名，数据更一致 */
+      (byP[key] = byP[key] || []).push(l);
+      continue;
+    }
+
+    /* ② 按起点插在两节之间 */
+    const pos = timeToSlotPos(t, my);
+    const idx = Math.floor(pos);
+    const whole = Math.abs(pos - Math.round(pos)) < 0.001;
+    if(whole && idx >= 0 && idx < my.length){
+      const key = my[idx].period.toUpperCase();
+      (byP[key] = byP[key] || []).push(l);
+    }else if(idx >= 0 && idx < my.length){
+      (after[idx] = after[idx] || []).push(l);
+    }else{
+      tail.push(l);
     }
   }
 
@@ -1673,10 +1998,12 @@ function fillDay(dayLessons, periods){
         selfStudy: true,
       });
     }
+    /* 插在这一节之后的（按时刻算出来落在两节之间的） */
+    if(after[idx]) out.push(...after[idx]);
   });
   /* 不在节次表里的（晚自习等）追加在后面，按时间排 */
-  noP.sort((a,b)=>String(a.start||'').localeCompare(String(b.start||'')));
-  out.push(...noP);
+  tail.sort((a,b)=>String(a.start||'').localeCompare(String(b.start||'')));
+  out.push(...tail);
   return out;
 }
 
