@@ -16,6 +16,45 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 ROOT = Path(__file__).resolve().parent
 
+
+def _day(offset: int = 0) -> str:
+    """今天 + offset 天的日期（YYYY-MM-DD）。"""
+    import datetime as _dt
+    return (_dt.date.today() + _dt.timedelta(days=offset)).isoformat()
+
+
+def _mk_lessons() -> list[dict]:
+    """课表 mock —— 日期**相对今天**生成。
+
+    ★ 为什么要动态生成：以前这里写死 2026-09-18 之类的日期，
+      预览页过几天就成了「全在过去」的数据，自编课插不进去、
+      课表页也看不出效果。改成相对日期后，哪天打开都对。
+    """
+    rows = [
+        # 昨天
+        (0, -1, "P2", "08:55", "09:40", "生物", "C-105", "孙老师"),
+        # 今天：留出 P3 空档，方便看「自编课自动落位」
+        (0, 0, "P1", "08:00", "08:45", "数学", "A-301", "王老师"),
+        (0, 0, "P2", "08:55", "09:40", "物理", "实验楼 2", "刘老师"),
+        (0, 0, "P4", "10:45", "11:30", "语文", "A-208", "张老师"),
+        (0, 0, "P5", "13:00", "13:45", "英语", "B-102", "李老师"),
+        (0, 0, None, "18:30", "22:00", "晚自习", "自习室", ""),
+        # 明天
+        (0, 1, "P1", "08:00", "08:45", "英语", "B-102", "李老师"),
+        (0, 1, "P3", "09:50", "10:35", "化学", "实验楼 1", "陈老师"),
+        # 后天
+        (0, 2, "P2", "08:55", "09:40", "生物", "C-105", "孙老师"),
+    ]
+    out = []
+    for _w, off, per, st, en, subj, room, teacher in rows:
+        row = {"day": _day(off), "start": st, "end": en,
+               "subject": subj, "room": room, "teacher": teacher}
+        if per:
+            row["period"] = per
+        out.append(row)
+    return out
+
+
 MOCK = {
     "status": "ok",
     "updated": "18:05",
@@ -120,22 +159,7 @@ MOCK = {
             {"period": "P7", "start": "14:50", "end": "15:35"},
             {"period": "P8", "start": "15:45", "end": "16:30"},
         ],
-        "lessons": [
-            {"day": "2026-09-18", "start": "08:00", "end": "08:45", "period": "P1",
-             "subject": "数学", "room": "A-301", "teacher": "王老师"},
-            {"day": "2026-09-18", "start": "08:55", "end": "09:40", "period": "P2",
-             "subject": "物理", "room": "实验楼 2", "teacher": "刘老师"},
-            {"day": "2026-09-18", "start": "10:45", "end": "11:30", "period": "P4",
-             "subject": "语文", "room": "A-208", "teacher": "张老师"},
-            {"day": "2026-09-18", "start": "18:30", "end": "22:00",
-             "subject": "晚自习", "room": "自习室", "teacher": ""},
-            {"day": "2026-09-19", "start": "08:00", "end": "08:45", "period": "P1",
-             "subject": "英语", "room": "B-102", "teacher": "李老师"},
-            {"day": "2026-09-19", "start": "09:50", "end": "10:35", "period": "P3",
-             "subject": "化学", "room": "实验楼 1", "teacher": "陈老师"},
-            {"day": "2026-09-21", "start": "08:55", "end": "09:40", "period": "P2",
-             "subject": "生物", "room": "C-105", "teacher": "孙老师"},
-        ],
+        "lessons": _mk_lessons(),
     },
 }
 
