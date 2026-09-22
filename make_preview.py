@@ -355,6 +355,21 @@ window.pywebview = {{
     save_setup: () => Promise.resolve({{
       ok:true, path:'C:/Users/me/AppData/Local/ManageBac-packer/credentials.json'
     }}),
+    /*  开机自启：预览里模拟一台「支持但还没装」的 Windows。
+        用 localStorage 记住开关，这样点一下能看到状态变化。 */
+    autostart_status: () => Promise.resolve({{
+      installed: localStorage.getItem('mb.preview.autostart') === '1',
+      path: 'C:/Users/me/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/ManageBac-packer 预热.lnk',
+      supported: true
+    }}),
+    autostart_install: () => {{
+      localStorage.setItem('mb.preview.autostart', '1');
+      return Promise.resolve({{ok:true, path:'（预览）'}});
+    }},
+    autostart_uninstall: () => {{
+      localStorage.removeItem('mb.preview.autostart');
+      return Promise.resolve({{ok:true}});
+    }},
     open_data_folder: () => Promise.resolve({{ok:true}}),
     warmup_status: () => Promise.resolve({{
       ok:true, reason:'cache_fresh', message:'开机已预热',
@@ -414,6 +429,52 @@ window.pywebview = {{
        channel:'Homework', author:'Mr. Zhao', timeLabel:'10:30',
        text:'Write 500 words.', attachments:[{{name:'rubric.pdf'}}]}}
     ]}}),
+    /*  ★ 全部 Teams 消息（跨团队 / 跨频道）——
+        预览里给三条，覆盖「有回复」「作业」「EC」三种形态，
+        好把分组、回复列表、标签都跑一遍。 */
+    tm_all: () => Promise.resolve({{ok:true, total:3, items:[
+      {{kind:'homework', title:'Homework - x2 To Scale videos',
+       date:'2026-09-11', timeLabel:'9/11 16:26',
+       team:'IDS Big History 2026-27', channel:'HOMEWORK',
+       author:'Mike Joyce',
+       text:"Hi IDS Big History 2026-27,\\nYour next homework is to watch and make notes on two very interesting videos.\\nThe videos are on ManageBac, in Files -> Unit 1",
+       replyCount:2, attachments:[],
+       replies:[
+         {{author:'Jonathan Liu Yuchen', time:'星期五 13:34',
+          text:'收到，谢谢老师'}},
+         {{author:'Bridges Wang Xuanqi', time:'星期四 19:44',
+          text:'看完了'}}
+       ]}},
+      {{kind:'ec', title:'English Corner roster - Week 3',
+       date:'2026-09-14', timeLabel:'9/14 10:46',
+       team:'Beijing 101 High School', channel:'ENGLISH CORNER ROSTER',
+       author:'Ms. Wang',
+       text:'This week EC is in B-203. Group A arrives 12:30.',
+       replyCount:0, attachments:[{{name:'EC_week3.pdf'}}],
+       file_text:'English Corner Roster\\n\\nGroup A: Zhang San, Li Si\\nGroup B: Wang Wu',
+       file_note:'1 页',
+       replies:[]}},
+      {{kind:'post', title:'House points!',
+       date:'2026-09-14', timeLabel:'9/14 10:30',
+       team:'Beijing 101 High School', channel:'House points!',
+       author:'Zane Hickman',
+       text:'Alan Liu (Phoenix), Frank Zhang (Qilin), Mabel Zhang (Thunderbird) - 10 points each.',
+       replyCount:0, attachments:[], replies:[]}}
+    ]}}),
+    tm_stats: () => Promise.resolve({{
+      ok:true, at:'2026-09-22 13:38:05',
+      nTeams:7, nChannels:17, nPosts:39, nReplies:33, teams:[]
+    }}),
+    tm_crawl: (n) => Promise.resolve({{
+      ok:true, partial:false, nTeams:7, nChannels:17,
+      nPosts:39, nReplies:33, at:'2026-09-22 13:38:05', teams:[]
+    }}),
+    tm_crawl_status: () => Promise.resolve({{
+      ok:true, running:false, message:''
+    }}),
+    tm_channels: () => Promise.resolve({{
+      ok:true, at:'2026-09-22 13:38:05', channels:[]
+    }}),
     teams_download_ec: () => Promise.resolve({{
       ok:true, downloaded:1, text_extracted:1, total:1, dir:'D:/x/ec'
     }}),

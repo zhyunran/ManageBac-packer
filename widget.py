@@ -206,6 +206,19 @@ class Api:
         log.info("凭据已保存到 %s", path)
         return {"ok": True, "path": str(path)}
 
+    # ══════════ 开机自启（打包版「装好即用」的最后一步）══════════
+    def autostart_status(self):
+        """开机自启装没装。"""
+        return autostart_status()
+
+    def autostart_install(self):
+        """装开机自启（在「启动」文件夹放一个指向 exe 的快捷方式）。"""
+        return autostart_install()
+
+    def autostart_uninstall(self):
+        """卸掉开机自启。"""
+        return autostart_uninstall()
+
     def test_login(self, login: str, password: str, url: str = ""):
         """用**用户刚填的**凭据试登录一次。
 
@@ -349,6 +362,117 @@ class Api:
         except Exception as e:
             return {"ok": False, "items": [], "error": str(e)}
 
+    def tm_all(self, keyword="", date="", channel="", team=""):
+        """**全部** Teams 消息（所有团队 / 所有频道）。
+
+        Teams 标签页用这个 —— 数据来自 `teams_crawl` 的全量抓取结果，
+        每条都带 `team` / `channel` 两个来源字段，便于分组显示。
+
+        优先读全量缓存；没有的话退回旧的单频道缓存（兼容老数据）。
+        """
+        try:
+            from app import teams_crawl
+            items = teams_crawl.all_messages(keyword or "", date or "",
+                                             channel or "", team or "")
+            if items:
+                return {"ok": True, "items": items, "total": len(items),
+                        "source": "crawl"}
+        except Exception as e:
+            log.warning("读全量 Teams 消息失败：%s", e)
+
+        try:
+            from app import teams
+            items = teams.all_messages(keyword or "", date or "",
+                                       channel or "")
+            return {"ok": True, "items": items, "total": len(items),
+                    "source": "single"}
+        except Exception as e:
+            log.warning("读取 Teams 消息失败：%s", e)
+            return {"ok": False, "items": [], "total": 0, "error": str(e)}
+
+    def tm_stats(self):
+        """Teams 全量数据的概览（团队 / 频道 / 帖子数 / 抓取时间）。"""
+        try:
+            from app import teams_crawl
+            return {"ok": True, **teams_crawl.stats()}
+        except Exception as e:
+            log.warning("读 Teams 概览失败：%s", e)
+            return {"ok": False, "at": "", "nTeams": 0, "nChannels": 0,
+                    "nPosts": 0, "nReplies": 0, "teams": [], "error": str(e)}
+
+    def tm_crawl(self, scroll=10):
+        """全量抓取：所有团队 → 所有频道 → 消息。
+
+        这个函数**不需要你在 Teams 里点任何东西** ——
+        程序自己进每个团队收集频道，再用深度链接逐个频道取数。
+
+        17 个频道实测约 280 秒，所以放后台线程跑，界面不卡。
+        """
+        if getattr(self, "_tm_crawling", False):
+            return {"ok": True, "already": True}
+        self._tm_crawling = True
+
+        try:
+            n = max(1, min(int(scroll or 10), 30))
+        except Exception:
+            n = 10
+
+        box: dict = {}
+
+        def progress(msg: str) -> None:
+            self._tm_progress = msg            # 供 tm_crawl_status 读取
+
+        def work() -> None:
+            try:
+                from app import teams_crawl
+                r = teams_crawl.crawl_all(scroll_rounds=n, progress=progress)
+                teams_crawl.save({
+                    "ok": True,
+                    "partial": r.get("partial", False),
+                    "teams": r.get("teams") or [],
+                    "at": r.get("at") or "",
+                })
+                box.update(r)
+            except Exception as e:
+                log.warning("Teams 全量抓取失败：%s", e)
+                box.update({"ok": False, "reason": str(e)})
+            finally:
+                self._tm_crawling = False
+                self._tm_progress = ""
+
+        self._tm_progress = "正在整理团队与频道…"
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(timeout=1500)
+        return box or {"ok": False, "reason": "抓取超时"}
+
+    def tm_crawl_status(self):
+        """全量抓取是否在跑 + 当前进度文字。"""
+        return {
+            "ok": True,
+            "running": bool(getattr(self, "_tm_crawling", False)),
+            "message": getattr(self, "_tm_progress", "") or "",
+        }
+
+    def tm_channels(self):
+        """频道清单（供界面做筛选胶囊）。"""
+        try:
+            from app import teams_crawl
+            st = teams_crawl.stats()
+            out = []
+            for t in st.get("teams") or []:
+                for c in t.get("channels") or []:
+                    if c.get("nPosts") or not c.get("error"):
+                        out.append({
+                            "team": t.get("name") or "",
+                            "channel": c.get("name") or "",
+                            "nPosts": c.get("nPosts", 0),
+                            "nReplies": c.get("nReplies", 0),
+                        })
+            return {"ok": True, "channels": out, "at": st.get("at") or ""}
+        except Exception as e:
+            return {"ok": False, "channels": [], "error": str(e)}
+
     def ec_open_dir(self):
         """打开 EC 附件所在目录。"""
         try:
@@ -467,13 +591,20 @@ class Api:
             pass
         return {"ok": True}
 
-    # ---- 跳转：用系统默认浏览器（你已登录的 Edge）----
+    # ---- 跳转：用**组件自己的** Edge（已经登录过）----
     def open_url(self, url: str):
         """打开链接 ——  先过安全校验，阻止「退出/删除/上传/提交」类操作。
 
         参考 CampusDesk 的做法：只允许「查看页面」类链接通过。
         这不是防坏人，是**防解析出错** —— 页面结构一变，
         可能顺手抓到旁边的「删除」按钮链接，用户点下去就出事了。
+
+        ★ 用组件自己的 Edge profile 打开（不是系统默认浏览器）：
+          抓数据用的就是那个 profile，登录态在里面 ——
+          所以点进去直接就是登录状态，不用再输一遍账号密码。
+
+          自己的 Edge 仍然照常能用：两个实例用不同的 user-data-dir，
+          Edge 原生支持并存。
         """
         if not url:
             return {"ok": False}
@@ -491,10 +622,23 @@ class Api:
             return {"ok": False, "blocked": True,
                     "error": "这个链接可能是「退出/删除」类操作，为安全起见没有打开"}
 
+        #  ① 首选：组件自己的 Edge（带登录态）
+        try:
+            from app import opener
+            r = opener.open_in_own_profile(safe, reuse=True)
+            if r.get("ok"):
+                log.info("打开（%s）：%s", r.get("how"), safe[:140])
+                return {"ok": True, "how": r.get("how")}
+            log.warning("自带 profile 打开失败（%s），退回系统浏览器",
+                        r.get("error") or r.get("how"))
+        except Exception as e:
+            log.warning("自带 profile 打开异常，退回系统浏览器：%s", e)
+
+        #  ② 兜底：系统默认浏览器（至少能打开，虽然要重新登录）
         try:
             webbrowser.open(safe, new=2)
-            log.info("打开：%s", safe)
-            return {"ok": True}
+            log.info("打开（系统浏览器）：%s", safe[:140])
+            return {"ok": True, "how": "system"}
         except Exception as e:
             log.warning("打开失败：%s", e)
             return {"ok": False, "error": str(e)}
@@ -992,7 +1136,136 @@ def _show_missing_webview2() -> None:
         pass
 
 
+def _run_warmup_only() -> int:
+    """静默预热：不开窗口，后台登录 + 抓一次，写完缓存就退出。
+
+    由开机启动项调用（见 autostart_install）。全程无界面，
+    所以任何异常都必须吞掉 —— 开机时报错弹框会吓到用户。
+    """
+    try:
+        from app import warmup as _w
+        res = _w.startup_prepare(verbose=False)
+        log.info("静默预热完成：%s", (res or {}).get("message") or "ok")
+    except Exception as e:
+        log.warning("静默预热失败（忽略）：%s", e)
+    return 0
+
+
+# ══════════ 开机自启（打包版自己管理，不依赖 make_startup.py）══════════
+#
+#  为什么不在打包时用 make_startup.py：
+#    那个脚本是给源码环境写的 —— 它找 .venv 的 pythonw.exe、
+#    调 warmup.py。exe 版没有这些，宿主就是 exe 自己。
+#
+#  做法：在「启动」文件夹放一个 .lnk，指向 exe 自己 + --warmup。
+#    为什么不用注册表 Run 键：启动文件夹用户看得见、能自己删，
+#    出问题时好排查；注册表藏在深处，反而不好收拾。
+
+AUTOSTART_LNK_NAME = "ManageBac-packer 预热.lnk"
+
+
+def _startup_dir() -> Path:
+    return Path(os.environ.get("APPDATA", "")) / (
+        r"Microsoft\Windows\Start Menu\Programs\Startup")
+
+
+def _host_command() -> tuple[str, str]:
+    """返回 (要启动的程序, 附加参数)。
+
+    打包版 → (exe 自身, "--warmup")
+    源码版 → (pythonw.exe, "warmup.py --quiet")
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable, "--warmup"
+    py = Path(sys.executable)
+    pw = py.with_name("pythonw.exe")
+    if pw.exists():
+        py = pw
+    return str(py), f'"{Path(__file__).resolve().parent / "warmup.py"}" --quiet'
+
+
+def _make_lnk(lnk: Path, target: str, args: str, workdir: str) -> bool:
+    """用 PowerShell 的 WScript.Shell 建快捷方式。"""
+    import subprocess as _sp
+    ps = (
+        "$W = New-Object -ComObject WScript.Shell; "
+        f"$s = $W.CreateShortcut('{lnk}'); "
+        f"$s.TargetPath = '{target}'; "
+        f"$s.Arguments = '{args}'; "
+        f"$s.WorkingDirectory = '{workdir}'; "
+        f"$s.WindowStyle = 7; "
+        "$s.Description = 'ManageBac-packer 开机后台预热'; "
+        "$s.Save(); Write-Output 'ok'"
+    )
+    try:
+        r = _sp.run(["powershell", "-NoProfile", "-NonInteractive",
+                     "-Command", ps],
+                    capture_output=True, text=True, timeout=30)
+        return lnk.exists()
+    except Exception as e:
+        log.warning("创建开机启动快捷方式失败：%s", e)
+        return False
+
+
+def autostart_status() -> dict:
+    """开机自启当前是什么状态。"""
+    lnk = _startup_dir() / AUTOSTART_LNK_NAME
+    return {
+        "installed": lnk.exists(),
+        "path": str(lnk),
+        "supported": sys.platform == "win32",
+    }
+
+
+def autostart_install() -> dict:
+    """装开机自启。失败时返回可读原因，不抛异常。"""
+    if sys.platform != "win32":
+        return {"ok": False, "error": "只有 Windows 支持开机自启"}
+    try:
+        d = _startup_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        target, args = _host_command()
+        lnk = d / AUTOSTART_LNK_NAME
+        ok = _make_lnk(lnk, target, args, str(Path(target).parent))
+        if ok:
+            log.info("已安装开机自启：%s", lnk)
+            return {"ok": True, "path": str(lnk)}
+        return {"ok": False, "error": "快捷方式没能创建成功"}
+    except Exception as e:
+        log.warning("安装开机自启失败：%s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def autostart_uninstall() -> dict:
+    """卸掉开机自启。"""
+    try:
+        lnk = _startup_dir() / AUTOSTART_LNK_NAME
+        if lnk.exists():
+            lnk.unlink()
+            log.info("已卸载开机自启")
+            return {"ok": True}
+        return {"ok": True, "already": True}
+    except Exception as e:
+        log.warning("卸载开机自启失败：%s", e)
+        return {"ok": False, "error": str(e)}
+
+
 def main() -> int:
+    #  ══════════ 静默预热模式（开机自启走这里）══════════
+    #   exe 被开机启动项调用时带 --warmup：
+    #     不开窗口、不弹任何东西，后台登录 + 抓一次就退出。
+    #   独立成一条路径的原因：这是打包版唯一需要的「第二种用法」，
+    #   放在主流程里会让窗口逻辑和后台逻辑互相干扰。
+    if "--warmup" in sys.argv or "--quiet" in sys.argv:
+        return _run_warmup_only()
+
+    #  卸载时由安装包调用：清掉开机自启的快捷方式。
+    #   不做的话，卸载后每次开机都会报「找不到文件」。
+    if "--uninstall-cleanup" in sys.argv:
+        r = autostart_uninstall()
+        log.info("卸载清理：开机自启已移除（%s）", r)
+        return 0
+
     config.ensure_dirs()
     log.info("=" * 52)
     log.info("启动 ManageBac-packer（解释器 %s）", sys.executable)
