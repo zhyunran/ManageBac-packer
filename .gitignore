@@ -19,3 +19,8 @@ __pycache__/
 
 # ── 归档 ──
 _archive/
+
+# ── 打包产物（安装包走 release 资产，不进仓库）──
+build/
+dist/
+release/

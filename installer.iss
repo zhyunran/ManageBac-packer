@@ -17,7 +17,7 @@
 ; ════════════════════════════════════════════════════════════════════
 
 #define MyAppName "ManageBac-packer"
-#define MyAppVersion "0.4.6"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "zhyunran"
 #define MyAppURL "https://github.com/zhyunran/ManageBac-packer"
 #define MyAppExeName "ManageBac-packer.exe"
@@ -81,7 +81,8 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; \
 Source: "dist\ManageBac-packer.exe"; DestDir: "{app}"; \
     Flags: ignoreversion
 ;  说明文档（能帮用户看懂这是干什么的）
-Source: "_tools\_update_report.md"; DestDir: "{app}"; \
+;   更新报告在「源码」的上一级目录，文件名带版本号 —— 发新版时记得同步改这里
+Source: "..\更新报告-0.5.0.md"; DestDir: "{app}"; \
     DestName: "更新报告.md"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion

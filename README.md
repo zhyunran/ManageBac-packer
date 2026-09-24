@@ -73,7 +73,7 @@ pyinstaller build.spec --noconfirm
 ├── auto_login.py          手动触发自动登录
 │
 ├── make_startup.py        安装/卸载开机预热
-├── mb_warmup_launch.vbs   开机预热启动器（由 make_startup.py 生成）
+│   （mb_warmup_launch.vbs 开机预热启动器由它在安装时生成，不入库）
 ├── stress_start.py        反复启动测试
 │
 ├── diag_detail_speed.py   详情页耗时诊断

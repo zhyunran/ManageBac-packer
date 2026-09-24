@@ -31,6 +31,7 @@
 #          这也是「填账密即用」这个需求的完整闭环。
 # ══════════════════════════════════════════════════════════════════
 
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,33 @@ ROOT = Path(SPECPATH).resolve()
 
 block_cipher = None
 
+
+# ── 生成 app/_version.py ──
+#
+#  ★ 为什么要有这一步：
+#    exe 里读不到 pyproject.toml（它没被打进去），
+#    所以打包时**先把版本号固化成 .py**。
+#
+#  ★ 版本号的唯一权威仍然是 pyproject.toml —— 这里只是把它抄一份。
+#    抄完记得清掉，免得开发时读到过期的那个。
+_ver = "unknown"
+try:
+    _m = re.search(r'^\s*version\s*=\s*"([^"]+)"',
+                   (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+                   re.M)
+    if _m:
+        _ver = _m.group(1)
+except Exception:
+    pass
+
+_verfile = ROOT / "app" / "_version.py"
+try:
+    _verfile.write_text(
+        '"""打包时由 build.spec 生成 —— 不要手改，也不要提交。"""\n'
+        f'VERSION = "{_ver}"\n', encoding="utf-8")
+    print(f"[build.spec] app/_version.py 已生成：VERSION = {_ver!r}")
+except Exception as e:
+    print(f"[build.spec] ！生成 _version.py 失败：{e}")
 
 # ── 需要一起打包的数据文件 ──
 datas = [
@@ -93,17 +121,35 @@ hiddenimports = [
     "app.models",
     "app.gpa",
     "app.lock",
+    "app.win_effects",
     #   Teams / EC（读网页消息 + PDF 文字提取）
     "app.teams",
     "app.teams_reader",
+    #   Teams 抓取的另外几块（v0.5.0 加的）：
+    #     teams_crawl  —— 读频道消息、滚动翻页
+    #     teams_scroll —— 真滚轮（CDP 模拟）
+    #     teams_guard  —— 抓取前的守卫
+    "app.teams_crawl",
+    "app.teams_scroll",
+    "app.teams_guard",
+    #   EC 名单关注（扫描名单里有没有你的名字）
+    "app.ec_watch",
+    #  EC 名单抓取（2026-09-23 新增）：
+    #     ec_fetch     —— 认频道 → 收附件 → 下载 PDF → 抽文字
+    #     sp_download  —— SharePoint 取字节（导航预览页 + 页面内 fetch）
+    #  ★ 少一个都会让「查 EC」在打包版里静默失效 —— 必须列全
+    "app.ec_fetch",
+    "app.sp_download",
+    #   今日新增（今天新出的成绩 / 新布置的作业）
+    "app.today_new",
     #   上面两个用到下面这些：CDP 驱动 Edge、并发、下载
     "app.cdp",
     "app.edge",
-    "app.browser",
     "app.download",
-    "app.flow",
     "app.server",
     "app.schedule",
+    #   打开外部程序（用系统默认程序打开文件/文件夹）
+    "app.opener",
     #  PDF 文字层解析（app/teams.py 里是延迟 import，静态分析看不见）
     "pypdf",
     #  CDP 用 websocket-client 跟浏览器握手（app/cdp.py）

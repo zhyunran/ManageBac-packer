@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 
@@ -89,7 +90,7 @@ def _check_js_api_safe(api_obj: object) -> None:
                 ", ".join(bad),
             )
         else:
-            log.info("js_api 自检通过（无公开的非函数属性）")
+            log.info("js_api 自检通过")
     except Exception as e:
         log.warning("js_api 自检异常：%s", e)
 
@@ -111,6 +112,8 @@ class Api:
         #   全被堵住，窗口就一直「未响应」。
         #   改成 `_window` 后 0.00 秒（下划线开头的属性会被跳过）。
         self._window = None
+        #  前端报到标志（见 win_ready 的说明）
+        self._front_ready = False
         self._warming = False
         self._served = False          # 前端是否已经成功拿到过数据
         self._relogging = False       # 是否正在自动重新登录
@@ -137,24 +140,90 @@ class Api:
 
     # ══════════ 首次运行引导（ 打包版的关键：填账密即用） ══════════
     def setup_status(self):
-        """前端问「需要引导吗？」
+        """前端问「需要引导吗？」+ 已填过的值（用来回填）。
 
          只看本地有没有填过账号，不发网络请求 ——
           这样界面一打开就能立刻决定显示引导页还是主界面。
+
+         ★ 顺带把**已经存过的账号**带回去：
+           引导页现在分成三页（学校 / 课表 / EC），
+           用户可能只是漏了某一页，重新打开时不该让他把
+           已经填过的再打一遍。密码**不回传** —— 没必要，
+           也不该在界面上暴露。
         """
+        cred = config.CREDENTIALS or {}
+        mb = cred.get("_managebac") or {}
+        sch = cred.get("_schedule") or {}
+        try:
+            from app import ec_watch
+            ec_names = ec_watch.load_names()
+        except Exception:
+            ec_names = []
         return {
             "need_setup": not config.has_credentials(),
             "data_dir": str(config.ROOT),
             "frozen": bool(getattr(sys, "frozen", False)),
+            #  ── 回填用（只有账号，没有密码）──
+            "mb_user": str(mb.get("login") or ""),
+            "mb_host": str(mb.get("url") or ""),
+            "sch_user": str(sch.get("login") or ""),
+            "has_schedule": bool(sch.get("login") and sch.get("password")),
+            "ec_names": ec_names,
         }
 
+    def save_schedule(self, login: str, password: str):
+        """单独保存课表账号（引导页第 2 页）。
+
+         ★ 为什么单独开一个方法，不复用 save_setup：
+           引导页分成了三页，课表是**第二页**才填的。
+           这时学校的账号已经存好了 —— 再调 save_setup 会把
+           第一页的内容重写一遍（虽然值一样，但等于多一次写盘，
+           而且万一用户回头改了第一页又没重新提交就麻烦了）。
+           这里只动 `_schedule` 那一段，别的一律不碰。
+
+         课表是**另一个网站**（希悦校园），账号形态跟学校系统不同
+         （手机号），所以单独存、也不做「必须填」的强制。
+        """
+        login = (login or "").strip()
+        password = (password or "").strip()
+        if not login or not password:
+            return {"ok": False, "error": "手机号和密码都要填"}
+        try:
+            #  ★★ 以**磁盘上的文件**为准来合并，不用内存里那份。
+            #
+            #    原因：引导页现在分两步写盘 ——
+            #      第 1 页 save_setup 写学校账号
+            #      第 2 页 save_schedule 写课表账号
+            #    两次之间如果内存那份是旧的（或另一个进程改过文件），
+            #    拿内存去合就会把前一步的内容冲掉。
+            #    文件才是唯一的事实来源，每一步都从它读。
+            cred = config._load_credentials() or {}
+            sc = dict(cred.get("_schedule") or {})
+            sc["login"] = login
+            sc["password"] = password
+            sc.setdefault("url", "https://yly.seiue.com/")
+            sc.setdefault("note", "课表系统（yly.seiue.com），用手机号登录")
+            cred["_schedule"] = sc
+            config.save_credentials(cred)
+            #  让内存那份跟上（别让后续调用读到旧的）
+            config.CREDENTIALS = cred
+            log.info("课表账号已保存：%s", login)
+            return {"ok": True}
+        except Exception as e:
+            log.exception("保存课表账号失败")
+            return {"ok": False, "error": f"保存失败：{e}"}
+
     def save_setup(self, login: str, password: str, url: str = "",
-                   schedule_login: str = "", schedule_password: str = ""):
+                   schedule_login: str = "", schedule_password: str = "",
+                   ec_names: str = ""):
         """保存账号密码（引导页提交）。
 
          只写「真正需要的键」，不覆盖已有的其他配置。
          写完立刻用新凭据试一次登录，让用户当场知道对不对 ——
           不然他以为填好了，其实要等半小时后才发现是错的。
+
+         ec_names 是**可选**的：用户填「可能出现在 EC 名单里的名字」，
+           以后每次抓到 EC 名单自动扫一遍。空着也能用，只是没提醒。
         """
         login = (login or "").strip()
         password = (password or "").strip()
@@ -186,6 +255,19 @@ class Api:
             sc.setdefault("note", "课表系统（可选）")
             cred["_schedule"] = sc
 
+        # EC 关注名字（可选）—— 存 _ec 段，不和账号混在一起
+        try:
+            from app import ec_watch
+            names = ec_watch.parse_names(ec_names or "")
+            if names:
+                ec = dict(cred.get("_ec") or {})
+                ec["names"] = names
+                ec.setdefault("notify", True)
+                cred["_ec"] = ec
+                log.info("EC 关注名字：%s", "、".join(names))
+        except Exception as e:
+            log.debug("解析 EC 名字失败，不影响保存：%s", e)
+
         try:
             path = config.save_credentials(cred)
         except Exception as e:
@@ -201,10 +283,49 @@ class Api:
             _hc.CREDENTIALS = _cfg.CREDENTIALS
             _hc.CRED_FILE = _cfg.ROOT / "credentials.json"
         except Exception as e:
-            log.warning("重载凭据失败（重启后生效）：%s", e)
+            log.warning("重载凭据失败，重启后生效：%s", e)
 
         log.info("凭据已保存到 %s", path)
         return {"ok": True, "path": str(path)}
+
+    # ══════════ EC 名单关注（用户要求「每回出名单自动扫描」）══════════
+    def ec_watch_status(self):
+        """给界面看的 EC 关注状态：填了哪些名字、最近有没有命中。"""
+        try:
+            from app import ec_watch
+            return {"ok": True, **ec_watch.status()}
+        except Exception as e:
+            log.debug("读 EC 关注状态失败：%s", e)
+            return {"ok": False, "error": str(e), "names": [],
+                    "alert": False, "found": []}
+
+    def ec_watch_save(self, names, notify=True):
+        """保存/修改 EC 关注的名字（设置里也能改）。"""
+        try:
+            from app import ec_watch
+            r = ec_watch.save_names(names if isinstance(names, str)
+                                    else "、".join(names or []),
+                                    bool(notify))
+            if r.get("ok"):
+                #  存完立刻扫一次 —— 用户填完就想知道「现在我中了吗」
+                try:
+                    ec_watch.scan_recent()
+                except Exception:
+                    pass
+            return r
+        except Exception as e:
+            log.debug("保存 EC 名字失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def ec_watch_scan(self):
+        """手动触发一次扫描（设置里的「立刻检查」）。"""
+        try:
+            from app import ec_watch
+            ec_watch.scan_recent()
+            return {"ok": True, **ec_watch.status()}
+        except Exception as e:
+            log.debug("扫 EC 失败：%s", e)
+            return {"ok": False, "error": str(e)}
 
     # ══════════ 开机自启（打包版「装好即用」的最后一步）══════════
     def autostart_status(self):
@@ -485,50 +606,90 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     def teams_download_ec(self):
-        """下载 EC 消息里的附件，并尝试提取 PDF 文字。"""
-        try:
-            from app import teams
-            data = teams.load()
-            ec = data.get("ec") or []
-            urls = []
-            for it in ec:
-                for a in (it.get("attachments") or []):
-                    u = teams.safe_url(a.get("url") or "")
-                    if u and all(x["url"] != u for x in urls):
-                        urls.append({"url": u, "name": a.get("name") or "attach.pdf"})
-            if not urls:
-                return {"ok": False, "reason": "EC 消息里还没有附件（先同步一次）"}
+        """下载 EC 频道里的名单 PDF，抽出文字，然后扫一遍关注的名字。
 
-            from app import httpclient
-            teams.EC_DIR.mkdir(parents=True, exist_ok=True)
-            got, texts = 0, 0
-            for item in urls[:teams.MAX_ATTACH]:
+        ★ 这是 EC 功能的**主入口**。整条链路：
+
+            ① 从缓存里认出 EC 频道
+               （团队名含 Beijing 101，频道名含 ENGLISH CORNER / EC）
+            ② 打开 Teams 窗口（复用 profile —— SharePoint 的登录态在里面）
+            ③ 逐个附件下载：
+                 分享链接（`:b:`）→ 导航到预览页 → **页面内 fetch** 取字节
+               （纯 HTTP 直连拿到的是 26KB 的 HTML，不是 PDF）
+            ④ pypdf 抽文字（EC 名单是真文字，不是扫描件）
+            ⑤ 存回缓存 + 落一份 .txt 旁文件
+            ⑥ 扫一遍用户填的名字 → 命中就亮红点
+
+        ★ 站点文档库那两份（带 `/sites/` 的链接）下不了 ——
+          会跳 Microsoft 的二次验证（MFA）。这种情况如实报告，
+          不做无谓重试（实测：不完成安全设置的话重试也不通）。
+        """
+        if getattr(self, "_ec_downloading", False):
+            return {"ok": True, "already": True,
+                    "note": "上一次下载还在进行中"}
+        self._ec_downloading = True
+
+        box: dict = {}
+
+        def progress(msg: str) -> None:
+            self._ec_progress = msg
+            log.info("EC：%s", msg)
+
+        def work() -> None:
+            try:
+                from app import ec_fetch, ec_watch
+                r = ec_fetch.download_and_extract(progress=progress)
+                box.update(r)
+                #  下完就扫 —— 用户要的是「有名字就提醒」，不是「下好了」
                 try:
-                    dest = teams.EC_DIR / item["name"][:120]
-                    ok = httpclient.download_direct(item["url"], dest)
-                    if not ok:
-                        continue
-                    got += 1
-                    if dest.suffix.lower() == ".pdf":
-                        r = teams.extract_pdf_text(dest)
-                        if r.get("ok"):
-                            texts += 1
-                            # 把提取到的文字挂回对应的 EC 记录
-                            for it in ec:
-                                for a in (it.get("attachments") or []):
-                                    if a.get("url") == item["url"]:
-                                        it["file_text"] = r["text"][:20000]
-                                        it["file_note"] = r.get("note") or ""
+                    ec_watch.scan_recent()
                 except Exception as e:
-                    log.debug("下载 EC 附件失败：%s", e)
+                    log.debug("扫名字失败：%s", e)
+                try:
+                    box["watch"] = ec_watch.status()
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning("EC 下载失败：%s", e)
+                box.update({"ok": False, "note": str(e)})
+            finally:
+                self._ec_downloading = False
+                self._ec_progress = ""
 
-            data["ec"] = ec
-            teams.save(data)
-            return {"ok": True, "downloaded": got, "text_extracted": texts,
-                    "total": len(urls), "dir": str(teams.EC_DIR)}
+        self._ec_progress = "准备下载 EC 名单…"
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join(timeout=900)
+        return box or {"ok": False, "note": "下载超时"}
+
+    def ec_download_status(self):
+        """EC 下载是否在跑 + 当前进度文字。"""
+        return {
+            "ok": True,
+            "running": bool(getattr(self, "_ec_downloading", False)),
+            "message": getattr(self, "_ec_progress", "") or "",
+        }
+
+    def ec_roster(self):
+        """当前最新一份 EC 名单的文字（给界面「今日名单」用）。"""
+        try:
+            from app import ec_fetch
+            r = ec_fetch.latest_roster_text()
+            if not r.get("ok"):
+                return {"ok": False, "note": r.get("note") or "还没有名单",
+                        "text": "", "name": ""}
+            #  顺手把命中标出来 —— 界面好高亮
+            try:
+                from app import ec_watch
+                names = ec_watch.load_names()
+                r["names"] = names
+                r["found"] = ec_watch.scan_text(r.get("text") or "", names)
+            except Exception:
+                r["names"], r["found"] = [], []
+            return r
         except Exception as e:
-            log.warning("下载 EC 附件失败：%s", e)
-            return {"ok": False, "reason": str(e)}
+            log.warning("读 EC 名单失败：%s", e)
+            return {"ok": False, "note": str(e), "text": "", "name": ""}
 
     # ---- 晚报（每个工作日晚 9 点自动生成）----
     def digest_status(self):
@@ -590,6 +751,317 @@ class Api:
         except Exception:
             pass
         return {"ok": True}
+
+    def win_maximize(self):
+        """最大化 / 还原（按钮在自绘标题栏上）。
+
+        ★★★ 这里踩过一个「点了就卡死」的坑，说明白免得改回去 ——
+
+          WinForms 是**单线程**的：控件的属性只能在创建它的
+          UI 线程上改。而 js_api 的方法是被 pywebview 从
+          **另一个线程**调起来的 —— 在那里直接写：
+
+              n.WindowState = FormWindowState.Maximized
+
+          会**死锁**（不是抛异常，是整个进程卡住）。
+
+          实测复现：单写这一句，进程立刻不动，
+          连别处的看门狗定时器都打不出字来。
+
+          → 必须走 `win_effects.ui_thread_call()`，
+            它用 WinForms 的 `Control.Invoke` 把操作排队到 UI 线程。
+            （pywebview 自己的 maximize() 也是这么做的 ——
+              见它 platforms/winforms.py 里那段 InvokeRequired 判断。）
+        """
+        from app import win_effects
+
+        def work(n):
+            from System.Windows.Forms import FormWindowState  # type: ignore
+            cur = getattr(FormWindowState, "Maximized")
+            if n.WindowState == cur:
+                n.WindowState = getattr(FormWindowState, "Normal")
+                return "normal"
+            n.WindowState = cur
+            return "max"
+
+        try:
+            box = {"state": None}
+
+            def run(n):
+                box["state"] = work(n)
+
+            if win_effects.ui_thread_call(self._window, run) and box["state"]:
+                return {"ok": True, "state": box["state"]}
+            #  拿不到 native 或切线程失败 → 退回 pywebview 自己的接口
+            #  （它内部也是 Invoke，安全）
+            self._window.maximize()
+            return {"ok": True, "state": "max"}
+        except Exception as e:
+            log.debug("最大化失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def win_close(self):
+        """关窗口。
+
+        这里刻意**不退出进程** —— 主循环还在跑自动刷新，
+        下次点托盘/快捷方式还能秒开。真要退，用「设置」里的退出。
+        """
+        try:
+            self._window.hide()
+            return {"ok": True, "how": "hidden"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def win_quit(self):
+        """真退出（设置面板里的「退出程序」）。"""
+        try:
+            self._window.destroy()
+        except Exception:
+            pass
+        try:
+            os._exit(0)          # noqa: SLF001  界面都关了，直接走
+        except Exception:
+            return {"ok": True}
+        return {"ok": True}
+
+    def win_show(self):
+        """把窗口显示出来（从隐藏状态回来）。"""
+        try:
+            self._window.show()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # ---- 前端就绪心跳（安全网）----
+
+    def win_ready(self):
+        """前端报到：「我加载好了，标题栏按钮已就位」。
+
+        ★★ 这个函数是**安全网**，不是装饰。
+
+        原因：窗口开了无边框之后，就**没有系统标题栏**了 ——
+        关窗、最小化全靠界面自己画的按钮。
+        万一前端因为某个 JS 错误没跑起来，那些按钮就不存在，
+        窗口变成一个关不掉的方块，用户只能去任务管理器强杀。
+
+        所以后端建窗后会开一个定时器：
+          等 ``READY_TIMEOUT`` 秒，如果这个函数没被调用过，
+          就把窗口退回「有系统边框」的样子 ——
+          至少还给用户一个能点的关闭键。
+        """
+        self._front_ready = True
+        log.info("前端已就绪")
+        return {"ok": True}
+
+    # ---- 窗口形态 ----
+
+    def win_cfg(self):
+        """当前的窗口偏好（形态 / 毛玻璃 / 置顶 / 贴右上角）。"""
+        try:
+            cfg = _load_window_cfg()
+            return {"ok": True, "cfg": cfg,
+                    "shape": getattr(self, "_shape", cfg.get("shape")),
+                    "glass_ok": _glass_status()}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "cfg": {}}
+
+    def win_set(self, key: str, value=None):
+        """改一项窗口偏好并立刻生效。
+
+        能改的：
+            shape      full / compact —— 切形态（会调整窗口大小与位置）
+            glass      true / false   —— 毛玻璃开关
+            on_top     true / false   —— 置顶开关
+            pin_right  true / false   —— 摆到右上角
+        """
+        key = str(key or "").strip()
+        if key not in ("shape", "glass", "on_top", "pin_right"):
+            return {"ok": False, "error": f"改不了这一项：{key}"}
+
+        cfg = _load_window_cfg()
+        cfg[key] = value
+        _save_window_cfg(cfg)
+        self._window_cfg = cfg
+        log.info("窗口偏好改成 %s = %r", key, value)
+
+        from app import win_effects
+
+        #  ── 切形态 ──
+        if key == "shape":
+            shape = str(value or "full")
+            if shape not in _WINDOW_PRESETS:
+                return {"ok": False, "error": f"没有这个形态：{shape}"}
+            self._shape = shape
+            sizes = _window_sizes(shape)
+
+            #  ★ 一、先改尺寸下限。
+            #    建窗时 pywebview 把 min_size 交给了 WinForms 的
+            #    MinimumSize（物理像素），它自己会拦住改尺寸的请求。
+            #    不先放开下限，下面的 resize 根本推不动 ——
+            #    实测：min_size=(370,500) 在 2.0 缩放下变成
+            #    MinimumSize = 740x1000，小浮窗想缩到 340 就被卡住。
+            pre = _WINDOW_PRESETS.get(shape) or {}
+            rng = win_effects.set_size_range(self._window,
+                                             min_css=pre.get("min"),
+                                             max_css=pre.get("max"))
+
+            #  ★ 二、改窗口大小（CSS 尺寸，后端换算）。
+            ok_r = win_effects.resize_css(self._window,
+                                          sizes["w"], sizes["h"])
+            time.sleep(0.12)          # 让系统把新尺寸落实
+            #  ★ 三、再摆位置。
+            #    顺序不能反 —— 先摆位置的话，那时窗口还是旧尺寸，
+            #    算出来的坐标是基于旧宽高的，新尺寸一生效就偏了。
+            corner = "top-right" if shape == "compact" else "center"
+            r = win_effects.pin_to_corner(self._window, corner)
+
+            return {"ok": bool(ok_r and r.get("ok")), "shape": shape,
+                    "size": [sizes["w"], sizes["h"]],
+                    "range": rng,
+                    "pos": [r.get("x"), r.get("y")],
+                    "real": [r.get("w"), r.get("h")],
+                    "scale": r.get("scale")}
+
+        #  ── 置顶 ──
+        if key == "on_top":
+            ok = win_effects.set_always_on_top(self._window, bool(value))
+            #  pywebview 自己的属性也设一下，两处一起才稳。
+            #  ★ 走 ui_thread_call —— 直接写 native.TopMost 同样会死锁
+            win_effects.ui_thread_call(
+                self._window,
+                lambda n: setattr(n, "TopMost", bool(value)))
+            return {"ok": ok, "on_top": bool(value)}
+
+        #  ── 贴右上角 ──
+        if key == "pin_right":
+            if not value:
+                return {"ok": True, "pin_right": False}
+            try:
+                r = win_effects.pin_to_corner(self._window, "top-right")
+                if r.get("ok"):
+                    shape = getattr(self, "_shape", "compact")
+                    cfg[f"{shape}_pos"] = [r["x"], r["y"]]
+                    _save_window_cfg(cfg)
+                return {"ok": bool(r.get("ok")),
+                        "pos": [r.get("x"), r.get("y")],
+                        "real": [r.get("w"), r.get("h")],
+                        "scale": r.get("scale"),
+                        "screen": r.get("screen"),
+                        "why": r.get("why")}
+            except Exception as e:
+                log.debug("贴右上角失败：%s", e)
+                return {"ok": False, "error": str(e)}
+
+        #  ── 毛玻璃 ──
+        if key == "glass":
+            if value:
+                r = win_effects.apply_glass(self._window, "acrylic")
+                _set_glass_status(bool(r.get("ok")))
+                return {"ok": bool(r.get("ok")),
+                        "glass": r.get("how") or r.get("why")}
+            win_effects.apply_glass(self._window, "none")
+            _set_glass_status(False)
+            return {"ok": True, "glass": "closed"}
+
+        return {"ok": True}
+
+    def win_resize(self, width, height):
+        """按当前形态记住用户调的大小（下次启动照旧）。"""
+        try:
+            w = max(200, min(int(width), 4000))
+            h = max(160, min(int(height), 4000))
+        except Exception:
+            return {"ok": False, "error": "尺寸不是数字"}
+        cfg = _load_window_cfg()
+        shape = getattr(self, "_shape", cfg.get("shape") or "full")
+        cfg[f"{shape}_size"] = [w, h]
+        _save_window_cfg(cfg)
+        return {"ok": True, "size": [w, h]}
+
+    # ══════════ 使用教程「看过了」标记 ══════════
+    def tour_status(self):
+        """教程看过了吗。
+
+        ★ 前端在启动时会问一次：
+            · 后端说看过 → 不弹
+            · 后端说没看过 → 再看一眼 localStorage，两边都不记得才弹
+          所以两边只要有一边记得，就不会再骚扰用户。
+        """
+        try:
+            return {"ok": True,
+                    "done": bool(_load_window_cfg().get("tour_done"))}
+        except Exception as e:
+            log.debug("读教程标记失败：%s", e)
+            return {"ok": False, "done": False}
+
+    def tour_done(self):
+        """记下「教程看过了」（用户点了跳过 / 走完 / 按 Esc 退）。"""
+        try:
+            cfg = _load_window_cfg()
+            cfg["tour_done"] = True
+            _save_window_cfg(cfg)
+            return {"ok": True}
+        except Exception as e:
+            log.debug("存教程标记失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    def tour_reset(self):
+        """把标记清掉（设置里「看一遍使用教程」用不到，
+        留着是为了排查问题时能手动重现「首次运行」。）"""
+        try:
+            cfg = _load_window_cfg()
+            cfg["tour_done"] = False
+            _save_window_cfg(cfg)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _win_size(self):
+        """读当前窗口宽高。
+
+        ★ 三个来源依次试，不能只信一个 ——
+          实测 ``native.Width`` 在某些时刻返回 None
+          （窗口刚建好、或正在做最大化动画），
+          直接 ``int()`` 会抛 ``TypeError: NoneType``。
+        """
+        #  ① 直接读客户区（最准，而且不受窗口装饰影响）
+        try:
+            from app import win_effects
+            w, h = win_effects.client_size(self._window)
+            if w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+
+        #  ② pywebview 自己的属性
+        try:
+            w = getattr(self._window, "width", None)
+            h = getattr(self._window, "height", None)
+            if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                return w, h
+        except Exception:
+            pass
+
+        #  ③ 后端窗体（.NET Form）
+        try:
+            n = getattr(self._window, "native", None)
+            if n is not None:
+                w = getattr(n, "Width", None)
+                h = getattr(n, "Height", None)
+                if w is not None and h is not None:
+                    w, h = int(w), int(h)
+                    if w > 0 and h > 0:
+                        return w, h
+        except Exception as e:
+            log.debug("读 native 尺寸失败：%s", e)
+
+        #  ④ 按当前形态的默认值兜底
+        try:
+            shape = getattr(self, "_shape", "full")
+            s = _window_sizes(shape)
+            return int(s["w"]), int(s["h"])
+        except Exception:
+            return 0, 0
 
     # ---- 跳转：用**组件自己的** Edge（已经登录过）----
     def open_url(self, url: str):
@@ -1141,6 +1613,7 @@ def _run_warmup_only() -> int:
 
     由开机启动项调用（见 autostart_install）。全程无界面，
     所以任何异常都必须吞掉 —— 开机时报错弹框会吓到用户。
+    日志照样写（logging 是全局的），真出问题在日志里能查到。
     """
     try:
         from app import warmup as _w
@@ -1250,6 +1723,199 @@ def autostart_uninstall() -> dict:
         return {"ok": False, "error": str(e)}
 
 
+# ══════════════════════════════════════════════════════════════
+#  窗口形态与外观偏好（v0.5.0）
+#
+#  两种形态：
+#    完整   —— 现在的样子，七个标签页，能看全部内容
+#    小浮窗 —— 一张小卡片，只有关键几条，默认贴右上角浮在别的应用上
+#
+#  偏好存 data/window.json，下次启动照旧。
+#  存文件而不是存 localStorage 的原因：窗口尺寸得在**建窗之前**就知道，
+#  那时前端还没跑起来。
+# ══════════════════════════════════════════════════════════════
+
+WINDOW_CFG_FILE = config.DATA_DIR / "window.json"
+
+#  ★★ 无边框的前端就绪标志。
+#
+#  为什么要这个开关：
+#    无边框意味着「窗口没有系统标题栏」——
+#    没有标题栏就没有最小化/最大化/关闭按钮，也拖不动。
+#    这些必须由界面自己画出来。
+#    后端先开 frameless、前端还没画，用户看到的就是
+#    「白屏、点不动、像卡死」（这是真踩到的）。
+#
+#    所以顺序必须是：前端标题栏做好、验证过 → 再把这里改成 True。
+#    没改之前，即使配置里写了 frameless，也会被忽略。
+#
+#  v0.5.0：前端标题栏已做好（右上角有最小化/最大化/关闭，
+#          标题栏可拖），并加了「后端没人报到就装回边框」的安全网，
+#          所以这里可以开了。
+FRONTEND_HAS_TITLEBAR = True
+
+#  前端就绪的等待时长（秒）。
+#  超时就把系统边框装回去 —— 免得到前端挂了、窗口关不掉。
+READY_TIMEOUT = 12.0
+
+#  各形态的默认尺寸。
+#  min 是下限，拖太小会把内容挤坏。
+_WINDOW_PRESETS = {
+    "full": {
+        "w": W, "h": H,
+        "min": (370, 500),
+    },
+    "compact": {
+        "w": 340, "h": 420,
+        "min": (260, 240),
+        "max": (620, 900),
+    },
+}
+
+
+def _load_window_cfg() -> dict:
+    """读窗口偏好；文件不在或坏了就用默认值。"""
+    default = {
+        "shape": "full",         # full / compact
+        #  毛玻璃默认**关**。
+        #  它需要 transparent 窗口，而透明窗口在没有
+        #  DWM 材质支持的机器上会变成一块黑 —— 那是不可逆的破坏。
+        #  想用就在设置里自己开，开了会记下来。
+        "glass": False,
+        "on_top": False,         # 置顶
+        "pin_right": False,      # 开机摆到右上角
+        #  无边框默认**开**（前端已有自绘标题栏 + 安全网）。
+        "frameless": True,
+        #  使用教程「看过了」的标记。
+        #  ★ 为什么存在这里而不是只存 localStorage：
+        #    localStorage 现在能留住了（见 webview.start 那段），
+        #    但它是跟着 WebView2 的缓存目录走的 ——
+        #    用户清一下缓存、或者换了缓存目录，就全没了。
+        #    教程这种「弹一次就别再弹」的东西，
+        #    留个服务端副本更稳（两边只要有一边记得就算看过）。
+        "tour_done": False,
+    }
+    if not WINDOW_CFG_FILE.exists():
+        return default
+    try:
+        d = json.loads(WINDOW_CFG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return default
+        out = dict(default)
+        out.update({k: v for k, v in d.items() if k in default})
+        if out.get("shape") not in _WINDOW_PRESETS:
+            out["shape"] = "full"
+        #  前端标题栏没做好之前，一律不给无边框 ——
+        #  否则窗口会变成一个动不了的方块。
+        if not FRONTEND_HAS_TITLEBAR:
+            out["frameless"] = False
+            out["glass"] = False
+        return out
+    except Exception as e:
+        log.debug("读窗口偏好失败（用默认值）：%s", e)
+        return default
+
+
+def _save_window_cfg(d: dict) -> None:
+    try:
+        config.ensure_dirs()
+        WINDOW_CFG_FILE.write_text(
+            json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        log.warning("存窗口偏好失败：%s", e)
+
+
+def _window_sizes(shape: str) -> dict:
+    """算出一个形态的窗口尺寸与位置。
+
+    ★ 尺寸用 **CSS 像素**（界面上说的宽高）——
+      建窗时 pywebview 收的就是这个单位。
+
+    ★ 位置分两种情况，不能混：
+        ① pywebview **还没启动**（建窗之前）：
+           系统报的是逻辑坐标，和 create_window(x=, y=) 一致 → 直接给
+        ② pywebview **已经启动**（运行时切形态）：
+           系统报的是物理坐标，要另外算 ——
+           那条路走 ``win_effects.pin_to_corner()``，不读这里的位置。
+      所以这里只负责第 ① 种。
+    """
+    from app import win_effects
+
+    pre = _WINDOW_PRESETS.get(shape) or _WINDOW_PRESETS["full"]
+    out = dict(pre)
+
+    cfg = _load_window_cfg()
+    #  用户手动调过大小 → 用他调的
+    key = f"{shape}_size"
+    saved = cfg.get(key)
+    if (isinstance(saved, (list, tuple)) and len(saved) == 2
+            and all(isinstance(v, int) and v > 0 for v in saved)):
+        out["w"], out["h"] = int(saved[0]), int(saved[1])
+
+    #  位置：小浮窗默认右上角；完整形态交给系统居中（不给 x/y）
+    pos_key = f"{shape}_pos"
+    pos = cfg.get(pos_key)
+    if (isinstance(pos, (list, tuple)) and len(pos) == 2
+            and all(isinstance(v, int) for v in pos)):
+        #  存过的位置是**物理**的，而这里要逻辑的 ——
+        #  除以缩放倍率换回去。
+        s = win_effects.dpi_scale() or 1.0
+        out["x"] = int(round(pos[0] / s)) if s > 1.01 else int(pos[0])
+        out["y"] = int(round(pos[1] / s)) if s > 1.01 else int(pos[1])
+    elif shape == "compact":
+        x, y = win_effects.top_right_position(out["w"], out["h"])
+        out["x"], out["y"] = x, y
+
+    return out
+
+
+def _apply_window_effects(window, wcfg: dict) -> None:
+    """窗口显示之后，把毛玻璃 / 圆角 / 置顶这些配上。
+
+    必须在 ``shown`` 之后 —— 那时才有稳定的句柄。
+    任何一项失败都只是少一个效果，不影响使用，所以全程兜住异常。
+    """
+    try:
+        from app import win_effects
+    except Exception as e:
+        log.debug("窗体效果模块不可用：%s", e)
+        return
+
+    import time as _t
+    _t.sleep(0.7)               # 等 WebView2 画出首帧
+
+    try:
+        r = win_effects.setup(
+            window,
+            glass=bool(wcfg.get("glass")),
+            rounded=True,
+            on_top=bool(wcfg.get("on_top")),
+            dark_titlebar=False,
+            shadow=True,
+        )
+        g = r.get("glass")
+        _set_glass_status(bool(g and g.get("ok")))
+        if g and not g.get("ok"):
+            log.info("毛玻璃没生效（%s），界面会退回不透明背景",
+                     g.get("why"))
+    except Exception as e:
+        log.warning("窗体效果设置失败：%s", e)
+
+
+#  毛玻璃到底成没成 —— 前端要拿它决定「给不给半透明底」。
+#  不透明窗口配半透明背景 = 看起来像蒙了层灰，不如直接给纯色。
+_GLASS_OK = False
+
+
+def _set_glass_status(ok: bool) -> None:
+    global _GLASS_OK
+    _GLASS_OK = bool(ok)
+
+
+def _glass_status() -> bool:
+    return _GLASS_OK
+
+
 def main() -> int:
     #  ══════════ 静默预热模式（开机自启走这里）══════════
     #   exe 被开机启动项调用时带 --warmup：
@@ -1265,6 +1931,24 @@ def main() -> int:
         r = autostart_uninstall()
         log.info("卸载清理：开机自启已移除（%s）", r)
         return 0
+
+    #  ══════════ 命令行指定形态 ══════════
+    #  开机自启可以带 --compact 直接以小浮窗开。
+    #  写在偏好文件里也能达到同样效果，但命令行更直接 ——
+    #  用户从「启动」文件夹里能一眼看见自己配的是哪种。
+    if "--compact" in sys.argv:
+        cfg = _load_window_cfg()
+        cfg["shape"] = "compact"
+        cfg["pin_right"] = True
+        _save_window_cfg(cfg)
+    if "--full" in sys.argv:
+        cfg = _load_window_cfg()
+        cfg["shape"] = "full"
+        _save_window_cfg(cfg)
+    if "--no-glass" in sys.argv:
+        cfg = _load_window_cfg()
+        cfg["glass"] = False
+        _save_window_cfg(cfg)
 
     config.ensure_dirs()
     log.info("=" * 52)
@@ -1284,16 +1968,124 @@ def main() -> int:
     #  启动自检：确保 js_api 没有「公开的非函数属性」，
     #   否则 pywebview 会递归遍历 → 窗口「未响应」。
     _check_js_api_safe(api)
-    window = webview.create_window(TITLE,
+
+    #  ══════════ 窗口形态（v0.5.0）══════════
+    #  两种形态：
+    #    完整 = 现在的样子，七个标签页
+    #    小浮窗 = 一张小卡片，只显示关键信息，默认贴右上角
+    #  形态与外观偏好存在 data/window.json，下次启动照旧。
+    wcfg = _load_window_cfg()
+    shape = wcfg.get("shape") or "full"
+    sizes = _window_sizes(shape)
+
+    #  ★ 透明 + 无边框是毛玻璃的前提：
+    #    窗口自己不透明的话，DWM 再怎么设也透不出背后的东西。
+    want_glass = bool(wcfg.get("glass"))
+
+    #  ★★ 但「无边框」要等前端把标题栏做出来才能开。
+    #     踩过的坑：后端先开了 frameless，前端还没画标题栏，
+    #     结果窗口既没有系统边框、也没有自绘按钮，
+    #     连拖都不能拖 —— 用户看到的就是
+    #     「白屏、点不动、像卡死」。
+    cfg_frameless = bool(wcfg.get("frameless"))
+    if not FRONTEND_HAS_TITLEBAR:
+        cfg_frameless = False
+
+    #  ══════════ 拖动机制（无边框窗口靠它）
+    #  pywebview 内建两种拖法，差别很大：
+    #
+    #    easy_drag=True
+    #        注册 ``window.addEventListener('mousedown')``
+    #        —— 页面**任何地方**按下都算开始拖。
+    #        看卡片、选文字时手一抖窗口就跟着动，不能用。
+    #
+    #    easy_drag=False + 给元素加 ``.pywebview-drag-region`` 类
+    #        pywebview 会从点击处往上找带这个类的元素，
+    #        找到才算拖动。**只有标题栏能拖**，正文不受影响。
+    #
+    #  再配上 ``DRAG_REGION_DIRECT_TARGET_ONLY = True``：
+    #        只认「直接点在拖动区上」。点在标题栏里的按钮上时，
+    #        目标是按钮本身、不是拖动区 → 不会误拖，按钮照常能点。
+    #
+    #  这个类名不是 Electron 的 ``-webkit-app-region``，
+    #  pywebview 用的是自己的一套，别写错。
+    try:
+        webview.settings["DRAG_REGION_DIRECT_TARGET_ONLY"] = True
+    except Exception as e:
+        log.debug("设拖动选项失败（不影响启动）：%s", e)
+
+    #  把建窗参数记进日志 —— 白屏那类问题全靠这行排查。
+    #  之前没记，只能猜「到底是无边框没生效还是前端挂了」。
+    log.info("建窗参数：形态=%s 尺寸=%sx%s 位置=(%s,%s) 无边框=%s "
+             "毛玻璃=%s 置顶=%s",
+             shape, sizes["w"], sizes["h"],
+             sizes.get("x"), sizes.get("y"),
+             cfg_frameless, want_glass, bool(wcfg.get("on_top")))
+
+    window = webview.create_window(
+        TITLE,
         url=str(config.WEB_DIR / "index.html"),
         js_api=api,
-        width=W, height=H, min_size=(370, 500),
-        resizable=True, easy_drag=False, text_select=True,
+        width=sizes["w"], height=sizes["h"],
+        #  ★ pywebview 只认 min_size，**没有 max_size** 这个参数
+        #    （我一开始按直觉写了 max_size，会直接 TypeError）。
+        min_size=sizes["min"],
+        x=sizes.get("x"), y=sizes.get("y"),
+        resizable=True,
+        frameless=cfg_frameless,
+        #  固定 False：拖动交给 .pywebview-drag-region（见上面说明）。
+        #  无边框和有边框两种情况都用这套 —— 有边框时它不起作用，
+        #  系统标题栏自己管拖动。
+        easy_drag=False,
+        on_top=bool(wcfg.get("on_top")),
+        transparent=want_glass,
+        text_select=True,
+        #  ★★ background_color 必须给**合法的 6 位十六进制**。
+        #     传 None 会让 pywebview 内部
+        #         re.match(valid_color, None)
+        #     抛 TypeError: expected string or bytes-like object
+        #     —— 建窗直接崩，界面根本没机会出现。
+        #     想要透明就靠 transparent=True；
+        #     Windows 那边会用 Color.Transparent 覆盖掉这个底色，
+        #     所以这里给什么色都不影响透明效果。
         background_color="#f5f1e8",
     )
     api._window = window
+    api._window_cfg = wcfg
+    api._shape = shape
 
     def after_start() -> None:
+        #  窗体效果要在窗口显示之后配 —— 那时句柄才稳定。
+        _apply_window_effects(window, wcfg)
+
+        #  ══════════ 无边框安全网 ══════════
+        #  无边框窗口没有系统标题栏，关窗全靠界面自己画的按钮。
+        #  前端要是没跑起来，窗口就成了关不掉的方块
+        #  （用户只能强杀进程 —— 这个坑已经踩过一次）。
+        #
+        #  所以：等 READY_TIMEOUT 秒，前端还没调 win_ready()，
+        #  就主动把系统边框装回去，至少留一个能点的关闭键。
+        if cfg_frameless:
+            def watch_ready() -> None:
+                for _ in range(int(READY_TIMEOUT * 2)):
+                    time.sleep(0.5)
+                    if getattr(api, "_front_ready", False):
+                        return
+                #  超时了 —— 前端没报到
+                log.warning("前端 %.0f 秒内没报到，把系统边框装回去"
+                            "（免得窗口关不掉）", READY_TIMEOUT)
+                try:
+                    #  恢复边框 = 把 FormBorderStyle 设回 Sizable
+                    from System.Windows.Forms import (  # type: ignore
+                        FormBorderStyle)
+                    window.native.FormBorderStyle = getattr(
+                        FormBorderStyle, "Sizable")
+                    window.set_title(TITLE)
+                except Exception as e:
+                    log.warning("装回边框失败：%s", e)
+
+            threading.Thread(target=watch_ready, daemon=True).start()
+
         # 启动自动刷新循环（每 config.AUTO_REFRESH_SEC 秒抓一次）
         pipeline.start_auto_refresh()
 
@@ -1321,7 +2113,58 @@ def main() -> int:
 
         threading.Thread(target=work, daemon=True).start()
 
-    webview.start(after_start, debug=False)
+    # ══════════════════════════════════════════════════════════════
+    #  让 WebView2 的存储**跨启动保留**
+    #
+    #  ★★ 这一条是实测出来的，不是照文档写的。
+    #
+    #     pywebview 的 `private_mode` **默认是 True**，而它的实现是：
+    #
+    #         if not _state['private_mode'] or _state['storage_path']:
+    #             cache_dir = _state['storage_path'] or .../pywebview
+    #         else:
+    #             cache_dir = tempfile.TemporaryDirectory().name   # ← 每次都是新的
+    #
+    #     也就是说，隐私模式下每次启动都拿一个**全新的临时目录**，
+    #     于是 localStorage 每次都是空的。
+    #
+    #     实测（`_tools/probe_localstorage.py` 连起两次窗口）：
+    #         阶段1 读到的 probe = null   →  GONE
+    #         阶段2 读到的 probe = null   →  GONE
+    #
+    #  ★ 影响面比想象的大：
+    #     界面上有 34 处在用 localStorage —— 主题、配色、背景图、
+    #     字体颜色、窗口形态、页签位置、教程的「看过了」……
+    #     这​​些原来**全部在每次启动时归零**。
+    #     （「教程每次启动都弹出来」就是这个问题显出来的样子。）
+    #
+    #  ★ 为什么以前没这么写：
+    #     `_archive/diag/test_storage.py` 里查过「指定 storage_path
+    #     会不会导致 WebView2 初始化卡死」——怕引入卡死就没改。
+    #     现在实测确认不会：`_tools/probe_persist.py` 两次都是
+    #     5 秒内正常退出，第二次正确读到第一次写的值（KEEP）。
+    #
+    #  ★ 目录放在 config.DATA_DIR 下面，跟着其它数据一起走
+    #     （打包版在 %LOCALAPPDATA%，不在只读的安装目录里）。
+    # ══════════════════════════════════════════════════════════════
+    _wv_storage = None
+    try:
+        _wv_storage = config.DATA_DIR / "webview2"
+        _wv_storage.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        #  目录建不出来就算了 —— 退回原来的行为（本次启动能用，
+        #  只是设置不保留），总比起不来好。
+        log.warning("WebView2 存储目录准备失败，本次设置不会保留：%s", e)
+        _wv_storage = None
+
+    if _wv_storage:
+        webview.start(after_start, debug=False,
+                      private_mode=False,
+                      storage_path=str(_wv_storage))
+    else:
+        webview.start(after_start, debug=False)
+
+    log.info("正常退出")
     return 0
 
 

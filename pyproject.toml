@@ -1,15 +1,17 @@
 [project]
 name = "mb-widget"
-version = "0.4.6"
+version = "0.5.0"
 description = "ManageBac 桌面小组件：待办任务、成绩、GPA 一屏总览，点击跳转原网页"
 requires-python = ">=3.11"
 dependencies = [
     "pywebview>=5.1",
-    "playwright>=1.49",
     "beautifulsoup4>=4.12",
     "websocket-client>=1.9.2",
     "pypdf>=5.1",
 ]
+
+#  注：v0.5 起不再依赖 playwright —— 取数走 app/cdp.py 的纯 WebSocket
+#    CDP 实现。uv.lock 里残留它的条目，下次 `uv lock` 会自动清掉。
 
 [tool.uv]
 package = false
