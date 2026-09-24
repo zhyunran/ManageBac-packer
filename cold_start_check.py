@@ -178,9 +178,9 @@ def main() -> int:
     try:
         from app import config
         ok(f"站点地址  {config.BASE_URL}")
-        if config.AUTO_REFRESH_SEC == 1800:
+        if config.AUTO_REFRESH_SEC == 300:
             ok(f"刷新间隔  {config.AUTO_REFRESH_TEXT}"
-               f"（避免触发站点限速）")
+               f"（0.5.1 起 5 分钟；失败会指数退避防限速）")
         else:
             warn(f"刷新间隔是 {config.AUTO_REFRESH_SEC} 秒"
                  f"（{config.AUTO_REFRESH_SEC // 60} 分钟）")

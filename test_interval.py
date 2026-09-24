@@ -1,4 +1,4 @@
-"""验证：自动刷新间隔真的是 30 分钟（在同一个进程里测）。
+"""验证：自动刷新间隔真的是 5 分钟（在同一个进程里测）。
 
 背景：`pipeline.snapshot()` 的 `next_refresh_in` 依赖进程内的
       `_state["next_run_ts"]`。在**独立进程**里读它永远是 0，
@@ -25,8 +25,8 @@ def main() -> int:
     print(f"    AUTO_REFRESH_SEC  = {config.AUTO_REFRESH_SEC}")
     print(f"    换算成分钟        = {config.AUTO_REFRESH_SEC / 60:.1f}")
     print(f"    显示文案          = {config.AUTO_REFRESH_TEXT!r}")
-    ok_cfg = config.AUTO_REFRESH_SEC == 1800
-    print(f"    {'[OK]' if ok_cfg else '[X]'} 是 30 分钟吗")
+    ok_cfg = config.AUTO_REFRESH_SEC == 300
+    print(f"    {'[OK]' if ok_cfg else '[X]'} 是 5 分钟吗")
 
     print(f"\n[2] 启动自动刷新循环")
     pipeline.load_from_cache()
@@ -42,9 +42,9 @@ def main() -> int:
           f"= {s['next_refresh_in'] / 60:.1f} 分钟")
 
     remain = s["next_refresh_in"]
-    # 刚启动应该接近 1800（允许循环开销）
-    ok_remain = 1700 <= remain <= 1800
-    print(f"    {'[OK]' if ok_remain else '[X]'} 倒计时接近 30 分钟吗")
+    # 刚启动应该接近 300（允许循环开销）
+    ok_remain = 270 <= remain <= 300
+    print(f"    {'[OK]' if ok_remain else '[X]'} 倒计时接近 5 分钟吗")
 
     print(f"\n[3] 倒计时在递减吗")
     a = pipeline.snapshot()["next_refresh_in"]

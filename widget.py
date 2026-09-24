@@ -438,6 +438,23 @@ class Api:
             log.warning("打开 Teams 失败：%s", e)
             return {"ok": False, "error": str(e)}
 
+    #  ── Teams 操作互斥闸 ──
+    #  全量收取 / 单页同步 / EC 名单下载 **共用同一个浏览器页面**。
+    #  原来三道各自的本操作闸门（_tm_crawling 等）只防自己重入，
+    #  互不认识 —— 实测踩中：全量收取正在翻频道时点了「同步」，
+    #  同步读到加载到一半的页面，报「没有识别到消息」。
+    #  所以加一道「谁在占用」的总闸：后来者拿到明白话，而不是误报。
+    _TEAMS_OP_NAMES = {"crawl": "全量收取", "sync": "同步", "ec": "EC 名单下载"}
+
+    def _teams_busy(self, me: str):
+        """别的 Teams 操作正在跑 → 返回给用户看的提示；空闲 → None。"""
+        who = getattr(self, "_teams_op", None)
+        if who and who != me:
+            name = self._TEAMS_OP_NAMES.get(who, who)
+            return (f"正在{name}，等它跑完再试"
+                    f"（这几个功能共用同一个 Teams 页面，同时跑会互相踩）")
+        return None
+
     def teams_sync(self, rounds=8):
         """同步一次（往回翻 → 读页面 → 分类 → 存本地）。
 
@@ -449,7 +466,11 @@ class Api:
         """
         if getattr(self, "_teams_syncing", False):
             return {"ok": True, "already": True}
+        busy = self._teams_busy("sync")
+        if busy:
+            return {"ok": False, "busy": True, "reason": busy}
         self._teams_syncing = True
+        self._teams_op = "sync"
 
         try:
             n = max(1, min(int(rounds or 8), 40))
@@ -469,6 +490,7 @@ class Api:
                 box.update({"ok": False, "reason": str(e)})
             finally:
                 self._teams_syncing = False
+                self._teams_op = None
 
         t = threading.Thread(target=work, daemon=True)
         t.start()
@@ -531,7 +553,11 @@ class Api:
         """
         if getattr(self, "_tm_crawling", False):
             return {"ok": True, "already": True}
+        busy = self._teams_busy("crawl")
+        if busy:
+            return {"ok": False, "busy": True, "reason": busy}
         self._tm_crawling = True
+        self._teams_op = "crawl"
 
         try:
             n = max(1, min(int(scroll or 10), 30))
@@ -560,6 +586,7 @@ class Api:
             finally:
                 self._tm_crawling = False
                 self._tm_progress = ""
+                self._teams_op = None
 
         self._tm_progress = "正在整理团队与频道…"
         t = threading.Thread(target=work, daemon=True)
@@ -627,7 +654,11 @@ class Api:
         if getattr(self, "_ec_downloading", False):
             return {"ok": True, "already": True,
                     "note": "上一次下载还在进行中"}
+        busy = self._teams_busy("ec")
+        if busy:
+            return {"ok": False, "busy": True, "reason": busy, "note": busy}
         self._ec_downloading = True
+        self._teams_op = "ec"
 
         box: dict = {}
 
@@ -655,6 +686,7 @@ class Api:
             finally:
                 self._ec_downloading = False
                 self._ec_progress = ""
+                self._teams_op = None
 
         self._ec_progress = "准备下载 EC 名单…"
         t = threading.Thread(target=work, daemon=True)
@@ -776,11 +808,18 @@ class Api:
         from app import win_effects
 
         def work(n):
-            from System.Windows.Forms import FormWindowState  # type: ignore
+            from System.Windows.Forms import (  # type: ignore
+                FormWindowState, Screen)
             cur = getattr(FormWindowState, "Maximized")
             if n.WindowState == cur:
                 n.WindowState = getattr(FormWindowState, "Normal")
                 return "normal"
+            #  无边框窗最大化默认铺满整屏（连任务栏一起盖）——
+            #  先把边界框到工作区。和 win_effects.maximize 同一副药。
+            try:
+                n.MaximizedBounds = Screen.FromHandle(n.Handle).WorkingArea
+            except Exception:
+                pass
             n.WindowState = cur
             return "max"
 
@@ -915,9 +954,14 @@ class Api:
             corner = "top-right" if shape == "compact" else "center"
             r = win_effects.pin_to_corner(self._window, corner)
 
-            return {"ok": bool(ok_r and r.get("ok")), "shape": shape,
+            #  ★ ok 只看 resize —— 那才是「切形态」的关键。
+            #    pin_to_corner 的 ok 会误报（SetWindowPos 在
+            #    窗口动画途中返回 0，但位置其实已经摆好了），
+            #    把它 AND 进去会让前端误弹「没能切换窗口大小」。
+            return {"ok": bool(ok_r), "shape": shape,
                     "size": [sizes["w"], sizes["h"]],
                     "range": rng,
+                    "pin_ok": bool(r.get("ok")),
                     "pos": [r.get("x"), r.get("y")],
                     "real": [r.get("w"), r.get("h")],
                     "scale": r.get("scale")}
@@ -974,9 +1018,53 @@ class Api:
             return {"ok": False, "error": "尺寸不是数字"}
         cfg = _load_window_cfg()
         shape = getattr(self, "_shape", cfg.get("shape") or "full")
+        #  ★ 0.5.1：按形态的量程夹取后再存。
+        #    前端的 resize 监听在「形态切换途中」也会触发 ——
+        #    那时类已经是 compact、窗口还是大尺寸，不夹就会把
+        #    大尺寸存成小浮窗的「用户偏好」，下次开机界面和
+        #    窗口对不上（留白 + 按钮出屏）。
+        pre = _WINDOW_PRESETS.get(shape) or {}
+        mn, mx = pre.get("min"), pre.get("max")
+        if mn:
+            w, h = max(w, mn[0]), max(h, mn[1])
+        if mx:
+            w, h = min(w, mx[0]), min(h, mx[1])
+        else:
+            #  full 没写上限，但不能存一个比工作区还大的尺寸
+            try:
+                from app import win_effects as _we
+                wa = _we.work_area()
+                s0 = _we.dpi_scale(self._window) or 1.0
+                w = min(w, int(wa["w"] / s0))
+                h = min(h, int(wa["h"] / s0))
+            except Exception:
+                pass
         cfg[f"{shape}_size"] = [w, h]
         _save_window_cfg(cfg)
         return {"ok": True, "size": [w, h]}
+
+    def win_drag(self, dx, dy):
+        """自绘拖动的位移接口（0.5.1）。
+
+        ★ 为什么存在：pywebview 内建拖动（.pywebview-drag-region）
+          在这条链路（内建 http 分发 + 无边框 + WinForms）上实测不生效，
+          window.move 调了窗口也不动。所以前端自己算增量送过来，
+          这里走 win_effects.move_by（SetWindowPos）。
+
+        增量是 **CSS 像素**（前端 screenX 的差值），后端乘 DPI。
+        """
+        try:
+            dx = max(-400, min(int(dx), 400))   # 夹一下，防前端算疯
+            dy = max(-400, min(int(dy), 400))
+        except Exception:
+            return {"ok": False, "error": "位移不是数字"}
+        try:
+            from app import win_effects
+            ok = win_effects.move_by(self._window, dx, dy)
+            return {"ok": bool(ok)}
+        except Exception as e:
+            log.debug("win_drag 失败：%s", e)
+            return {"ok": False, "error": str(e)}
 
     # ══════════ 使用教程「看过了」标记 ══════════
     def tour_status(self):
@@ -1766,9 +1854,16 @@ _WINDOW_PRESETS = {
         "min": (370, 500),
     },
     "compact": {
-        "w": 340, "h": 420,
-        "min": (260, 240),
-        "max": (620, 900),
+        #  ★ 0.5.1 改成横版小卡片（520x320 ≈ 16:10）：
+        #    用户反馈竖版 340x420 里内容只填一半、底部按钮
+        #    会被顶到任务栏以下看不见。横版配网格布局刚好铺满。
+        #  ★ 收尾又调了一轮（480x300 → 520x320，下限 360x250 → 400x290）：
+        #    旧下限 250 高装不下卡片内容（课名 + 标签 + 时间行），
+        #    overflow 会把「晚自习」三个字啃掉一半 ——
+        #    下限的意义是「默认内容完整显示」，不是「能开就行」。
+        "w": 520, "h": 320,
+        "min": (400, 290),
+        "max": (820, 620),
     },
 }
 
@@ -1794,6 +1889,13 @@ def _load_window_cfg() -> dict:
         #    教程这种「弹一次就别再弹」的东西，
         #    留个服务端副本更稳（两边只要有一边记得就算看过）。
         "tour_done": False,
+        #  用户自己调过的尺寸 / 摆过的位置（win_resize / pin_right 写入）。
+        #  ★ 这几个键必须列在 default 里：下面的白名单只保留
+        #    default 已有的键，不列的话存了也读不回来 ——
+        #    用户拖好的小浮窗尺寸每次开机都被打回默认。
+        #    None 表示「还没存过」，_window_sizes 校验不过就回预设。
+        "full_size": None, "full_pos": None,
+        "compact_size": None, "compact_pos": None,
     }
     if not WINDOW_CFG_FILE.exists():
         return default
@@ -1851,6 +1953,28 @@ def _window_sizes(shape: str) -> dict:
     if (isinstance(saved, (list, tuple)) and len(saved) == 2
             and all(isinstance(v, int) and v > 0 for v in saved)):
         out["w"], out["h"] = int(saved[0]), int(saved[1])
+        #  ★ 0.5.1：存的尺寸要按这个形态的量程夹一遍。
+        #    踩过的坑：前端在「形态已经是 compact、窗口还没缩小」的
+        #    间隙把 745 高的尺寸写进了 compact_size，之后每次开机
+        #    都是「小浮窗界面 + 大窗口」—— 大片空白、按钮被顶到
+        #    屏幕外。夹到 min/max 之间，脏数据当场失效。
+        mn, mx = pre.get("min"), pre.get("max")
+        if mn:
+            out["w"] = max(out["w"], mn[0])
+            out["h"] = max(out["h"], mn[1])
+        if mx:
+            out["w"] = min(out["w"], mx[0])
+            out["h"] = min(out["h"], mx[1])
+        else:
+            #  没写上限的形态（full）也不能比工作区还大 ——
+            #  以前最大化尺寸会被误存进来，下次启动直接顶满屏。
+            try:
+                wa = win_effects.work_area()
+                s0 = win_effects.dpi_scale() or 1.0
+                out["w"] = min(out["w"], int(wa["w"] / s0))
+                out["h"] = min(out["h"], int(wa["h"] / s0))
+            except Exception:
+                pass
 
     #  位置：小浮窗默认右上角；完整形态交给系统居中（不给 x/y）
     pos_key = f"{shape}_pos"
@@ -1992,28 +2116,19 @@ def main() -> int:
         cfg_frameless = False
 
     #  ══════════ 拖动机制（无边框窗口靠它）
-    #  pywebview 内建两种拖法，差别很大：
+    #  ★ 0.5.1 起：拖动是程序自己实现的（app.js selfDrag →
+    #    win_drag → win_effects.move_by → SetWindowPos）。
     #
-    #    easy_drag=True
-    #        注册 ``window.addEventListener('mousedown')``
-    #        —— 页面**任何地方**按下都算开始拖。
-    #        看卡片、选文字时手一抖窗口就跟着动，不能用。
+    #    pywebview 内建的两套都试过、都阵亡了：
+    #      easy_drag=True            —— 全页面误拖，不可用
+    #      .pywebview-drag-region    —— 这条链路（内建 http 分发 +
+    #        无边框 + WinForms）上它的 move 回调每次都抛
+    #        ctypes.ArgumentError（winforms.py:635 把 None 传给
+    #        SetWindowPos），窗口纹丝不动，日志刷屏。
     #
-    #    easy_drag=False + 给元素加 ``.pywebview-drag-region`` 类
-    #        pywebview 会从点击处往上找带这个类的元素，
-    #        找到才算拖动。**只有标题栏能拖**，正文不受影响。
-    #
-    #  再配上 ``DRAG_REGION_DIRECT_TARGET_ONLY = True``：
-    #        只认「直接点在拖动区上」。点在标题栏里的按钮上时，
-    #        目标是按钮本身、不是拖动区 → 不会误拖，按钮照常能点。
-    #
-    #  这个类名不是 Electron 的 ``-webkit-app-region``，
-    #  pywebview 用的是自己的一套，别写错。
-    try:
-        webview.settings["DRAG_REGION_DIRECT_TARGET_ONLY"] = True
-    except Exception as e:
-        log.debug("设拖动选项失败（不影响启动）：%s", e)
-
+    #    另一个教训：webview.settings 是 ImmutableDict，
+    #    当年那句 ``webview.settings["DRAG_REGION_DIRECT_TARGET_ONLY"]=True``
+    #    其实从来没写进去过 —— 写设置要趁早查类型。
     #  把建窗参数记进日志 —— 白屏那类问题全靠这行排查。
     #  之前没记，只能猜「到底是无边框没生效还是前端挂了」。
     log.info("建窗参数：形态=%s 尺寸=%sx%s 位置=(%s,%s) 无边框=%s "
@@ -2033,9 +2148,7 @@ def main() -> int:
         x=sizes.get("x"), y=sizes.get("y"),
         resizable=True,
         frameless=cfg_frameless,
-        #  固定 False：拖动交给 .pywebview-drag-region（见上面说明）。
-        #  无边框和有边框两种情况都用这套 —— 有边框时它不起作用，
-        #  系统标题栏自己管拖动。
+        #  固定 False：拖动由前端 selfDrag 实现（见上面说明）。
         easy_drag=False,
         on_top=bool(wcfg.get("on_top")),
         transparent=want_glass,
@@ -2057,6 +2170,20 @@ def main() -> int:
     def after_start() -> None:
         #  窗体效果要在窗口显示之后配 —— 那时句柄才稳定。
         _apply_window_effects(window, wcfg)
+
+        #  ══════════ 双击打开默认最大化（0.5.1，用户要求）══════════
+        #  完整形态：打开就铺满屏幕，不用再点一下最大化。
+        #  小浮窗除外 —— 浮窗的意义就是「一小块」，最大化就荒谬了。
+        #  _apply_window_effects 里已经等了 0.7 秒，窗口画出来了再最大化，
+        #  顺序反了会闪一下小窗再弹大。
+        if shape == "full":
+            try:
+                from app import win_effects as _we
+                ok = _we.maximize(window)
+                log.info("启动即最大化（形态=full）：%s",
+                         "已最大化" if ok else "没成（不影响使用）")
+            except Exception as e:
+                log.debug("启动最大化失败（不影响使用）：%s", e)
 
         #  ══════════ 无边框安全网 ══════════
         #  无边框窗口没有系统标题栏，关窗全靠界面自己画的按钮。

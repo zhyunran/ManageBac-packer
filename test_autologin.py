@@ -32,8 +32,8 @@ def main() -> int:
          f" = {config.AUTO_REFRESH_SEC // 60} 分钟")
     line(f"    显示文案    : {config.AUTO_REFRESH_TEXT}")
     line(f"    退避上限    : {config.AUTO_REFRESH_MAX_BACKOFF} 秒")
-    ok_interval = config.AUTO_REFRESH_SEC == 1800
-    line(f"    {'[OK]' if ok_interval else '[X]'} 是 30 分钟吗: {ok_interval}")
+    ok_interval = config.AUTO_REFRESH_SEC == 300
+    line(f"    {'[OK]' if ok_interval else '[X]'} 是 5 分钟吗: {ok_interval}")
 
     line()
     line("[2] 自动登录配置")
