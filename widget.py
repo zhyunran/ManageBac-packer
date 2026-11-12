@@ -200,7 +200,17 @@ class Api:
         if not self._served:
             self._served = True
             log.info("界面已就绪（前端首次请求数据）")
-        return pipeline.snapshot()
+        d = pipeline.snapshot()
+        #  ★ 版本号由后端给 ★
+        #    以前 web/index.html 里写死 `v0.5.2`，一升级就漏改 ——
+        #    预览页验收正好是靠比对这里发现的。现在统一以 _version.py 为准。
+        try:
+            from app import _version as _v
+            d = dict(d or {})
+            d["version"] = str(getattr(_v, "VERSION", "") or "")
+        except Exception:
+            pass
+        return d
 
     def refresh(self):
         pipeline.refresh_async()

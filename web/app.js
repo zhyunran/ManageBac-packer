@@ -5352,6 +5352,14 @@ let lastFilesSig = '';      /* 资料页的课程列表签名（只在课程变�
 function render(){
   if(!DATA) return;
 
+  /*  ★ 版本号以数据为准 ★
+      早先在 index.html 里写死 `v0.5.2`，每次升级都得记得手改，
+      漏了就会在界面上显示旧版本。 */
+  try{
+    const vEl = document.querySelector('.ver');
+    if(vEl && DATA.version) vEl.textContent = 'v' + DATA.version;
+  }catch(_){}
+
   /*  每次渲染都用当前时间重算剩余天数 —— 数据不会随时间变旧 */
   const tasks = (DATA.tasks||[]).map(liveTask);
   const courses = DATA.courses||[];
