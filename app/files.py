@@ -36,7 +36,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-from . import config, httpclient
+from . import config, dlprogress, httpclient
 
 log = logging.getLogger("files")
 
@@ -306,15 +306,23 @@ def download_item(item: dict, cookies: dict[str, str] | None = None,
         out["error"] = f"建目录失败：{e}"
         return out
 
+    #  ★ 不再「同名就改名叫 (1)」。
+    #    以前发现目标已存在就自动加序号，于是同一份文件被点第二次时
+    #    会完整再下一份 —— 实测桌面里出现了 Biology.pdf 与 Biology (1).pdf
+    #    两个 **SHA256 完全相同、各 213 MB** 的文件，白白多下 203 MB。
+    #    现在：大小一致 → 跳过；大小不同 → 覆盖（更可能是更新版）。
     dest = dest_dir / name
-    # 重名自动加序号
-    if dest.exists():
-        stem, suf = dest.stem, dest.suffix
-        for i in range(1, 100):
-            cand = dest_dir / f"{stem} ({i}){suf}"
-            if not cand.exists():
-                dest = cand
-                break
+
+    progress = dlprogress
+    #  ★ 自己没会话就自己开一个（正常路径由 _dl_file_item / _dl_items_all 开）。
+    #    begin() 已有会话时返回 False，不会打乱批量的进度。
+    owner = progress.begin(1)
+    if not progress.claim(dest):
+        out["error"] = "这个文件正在下载中，请等它完成"
+        out["busy"] = True
+        if owner:
+            progress.end()
+        return out
 
     ck = cookies or httpclient.browser_cookies_dict()
     header = "; ".join(f"{k}={v}" for k, v in ck.items())
@@ -326,17 +334,82 @@ def download_item(item: dict, cookies: dict[str, str] | None = None,
         "Referer": referer or f"{config.BASE_URL}/student/home",
         "Accept": "*/*",
     })
+    tmp = dest.with_name(dest.name + ".part")
+    t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
-            data = r.read()
-        if not data:
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+
+            #  已存在且大小一致 → 跳过，不浪费流量也不留重复副本
+            if total > 0 and dest.exists():
+                try:
+                    if dest.stat().st_size == total:
+                        progress.note_skipped()
+                        log.info("已存在且大小一致，跳过：%s（%s）",
+                                 name, _human(total))
+                        out.update(ok=True, path=str(dest), size=total,
+                                   skipped=True)
+                        return out
+                except OSError:
+                    pass
+
+            progress.file_begin(name, size=total)
+            done = 0
+            with tmp.open("wb") as f:
+                while True:
+                    chunk = r.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    progress.add(len(chunk))
+
+        if done <= 0:
             out["error"] = "下载到 0 字节"
+            _cleanup_part(tmp)
+            progress.note_failed()
             return out
-        dest.write_bytes(data)
-        out.update(ok=True, path=str(dest), size=len(data))
+
+        tmp.replace(dest)      # 原子改名：中途失败不会留下半截文件冒充完整文件
+        dur = max(0.001, time.monotonic() - t0)
+        log.info("下载完成：%s（%s，用时 %.1f 秒，%.1f MB/s）",
+                 name, _human(done), dur, done / dur / 1024 / 1024)
+        out.update(ok=True, path=str(dest), size=done)
         return out
     except urllib.error.HTTPError as e:
         out["error"] = f"HTTP {e.code}"
+        progress.note_failed()
+        log.warning("下载失败（HTTP %s）：%s", e.code, name)
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
+        progress.note_failed()
+        log.warning("下载失败（%s）：%s —— %s", type(e).__name__, name, e)
+    finally:
+        progress.release(dest)
+        if not out.get("ok"):
+            _cleanup_part(tmp)
+        if owner:
+            progress.end(ok=bool(out.get("ok")))
     return out
+
+
+def _human(n: float) -> str:
+    """字节数转人话，只用于日志。"""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _cleanup_part(tmp: Path) -> None:
+    """删掉没下完的 .part。"""
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError as e:
+        log.debug("清理未完成文件失败：%s（%s）", tmp, e)

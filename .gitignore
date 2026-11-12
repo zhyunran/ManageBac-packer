@@ -24,3 +24,6 @@ _archive/
 build/
 dist/
 release/
+
+# ── 构建时下载的大件（不进仓库，构建前重新下载）──
+_tools/MicrosoftEdgeWebView2Setup.exe

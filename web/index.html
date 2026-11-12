@@ -167,6 +167,11 @@
     <symbol id="i-list" viewBox="0 0 24 24">
       <path d="M8.5 7h12M8.5 12h12M8.5 17h12M4 7h.01M4 12h.01M4 17h.01"/>
     </symbol>
+    <!-- 放大镜（搜索） -->
+    <symbol id="i-search" viewBox="0 0 24 24">
+      <circle cx="10.5" cy="10.5" r="6.4"/>
+      <path d="M15.4 15.4 21 21"/>
+    </symbol>
     <!-- 烧瓶（测验） -->
     <symbol id="i-flask" viewBox="0 0 24 24">
       <path d="M9.5 3.5v6.2L4.6 18a2 2 0 0 0 1.7 3h11.4a2 2 0 0 0 1.7-3l-4.9-8.3V3.5"/>
@@ -197,6 +202,13 @@
     <symbol id="i-sparkle" viewBox="0 0 24 24">
       <path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1L5 10.5l5.1-1.9Z"/>
       <path d="M18.5 16.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z"/>
+    </symbol>
+    <!-- 柱状图（课程分类占比） -->
+    <symbol id="i-chart" viewBox="0 0 24 24">
+      <path d="M3.5 20.5h17"/>
+      <rect x="5.5" y="12" width="3.4" height="6.6" rx="1.1"/>
+      <rect x="10.3" y="7.5" width="3.4" height="11.1" rx="1.1"/>
+      <rect x="15.1" y="14.4" width="3.4" height="4.2" rx="1.1"/>
     </symbol>
     <!-- 邮件（晚报） -->
     <symbol id="i-mail" viewBox="0 0 24 24">
@@ -262,36 +274,80 @@
       <path d="M3.5 5.5A2 2 0 0 1 5.5 3.5H11v17H5.5a2 2 0 0 1-2-2Z"/>
       <path d="M11 3.5h7.5a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2H11"/>
     </symbol>
+    <!-- 窗口最小化（细横线，位置偏下以贴合系统观感） -->
+    <symbol id="i-winmin" viewBox="0 0 12 12">
+      <path d="M2 8.5h8"/>
+    </symbol>
+    <!-- 窗口最大化（方框） -->
+    <symbol id="i-winmax" viewBox="0 0 12 12">
+      <rect x="2.2" y="2.2" width="7.6" height="7.6" rx="1.6"/>
+    </symbol>
+    <!-- 窗口还原（两个错开的方框） -->
+    <symbol id="i-winrest" viewBox="0 0 12 12">
+      <rect x="1.6" y="3.4" width="6.4" height="6.4" rx="1.4"/>
+      <path d="M4.2 3.4V2.6a1.4 1.4 0 0 1 1.4-1.4h3.4a1.4 1.4 0 0 1 1.4 1.4v3.4a1.4 1.4 0 0 1-1.4 1.4h-.8"/>
+    </symbol>
+            <!-- 电源（退出程序） -->
+    <symbol id="i-power" viewBox="0 0 24 24">
+      <path d="M12 3.5v8.5"/>
+      <path d="M6.9 6.6a8.5 8.5 0 1 0 10.2 0"/>
+    </symbol>
   </defs>
 </svg>
 
+<!-- ══════════════════════════════════════════════════════════════════
+     顶栏
+
+     ★ 拖动：0.5.1 起用 app.js 的「自绘拖动」（selfDrag）——
+       #bar 上按下左键，mousemove 把位移增量发给后端 win_drag()
+       走 SetWindowPos。点在按钮 / logo 上不拖（它们有自己的功能）。
+
+       历史上的做法（pywebview 内建 .pywebview-drag-region）
+       在这条链路上实测不生效，且 move 回调抛 ArgumentError 刷屏，
+       类名已摘除。这里的 pointer-events 穿透（见 app.css #bar）
+       依然重要：它决定 mousedown 的 target 是不是 #bar 自己。
+     ══════════════════════════════════════════════════════════════════ -->
 <div id="bar">
   <div class="logo">MB</div>
   <div class="brand">ManageBac <small id="upd">—</small></div>
-  <div class="ver">v0.4.2</div>
+  <div class="ver">v0.5.2</div>
   <div class="flex"></div>
+  <button class="ibtn" id="btnSearch" title="搜索作业与成绩">
+    <svg class="oi"><use href="#i-search"/></svg></button>
   <button class="ibtn" id="btnFold" title="全部折叠 / 展开">
     <svg class="oi"><use href="#i-chevdown"/></svg></button>
   <button class="ibtn" id="live" title="自动刷新倒计时"></button>
-  <button class="ibtn" id="btnAuto" title="开启 / 暂停自动刷新">
-    <svg class="oi"><use href="#i-pause"/></svg></button>
+  <!--  「暂停自动刷新」「重新登录」0.5.1 起收进设置面板的「操作」区
+        （opAuto / opLogin），顶栏只留每天会点的。 -->
   <button class="ibtn dig" id="btnDigest" title="晚报（每个工作日晚 9 点生成）">
     <svg class="oi"><use href="#i-mail"/></svg>
     <i class="digdot" id="digdot"></i></button>
-  <button class="ibtn" id="btnLogin" title="重新登录（自动）">
-    <svg class="oi"><use href="#i-key"/></svg></button>
   <button class="ibtn" id="btnTeams" title="Teams / EC">
     <svg class="oi"><use href="#i-teams"/></svg>
+    <i class="ecdot" id="ecdot"></i>
   </button>
   <button class="ibtn" id="btnSettings" title="外观设置">
     <svg class="oi"><use href="#i-settings"/></svg>
   </button>
-  <button class="ibtn" id="btnData" title="数据与备份（导出 / 导入）">
-    <svg class="oi"><use href="#i-shield"/></svg></button>
-  <button class="ibtn" id="btnRefresh" title="立即刷新">
-    <svg class="oi"><use href="#i-refresh"/></svg></button>
-  <button class="ibtn" id="btnMin" title="最小化">
-    <svg class="oi"><use href="#i-minus"/></svg></button>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       窗口按钮组（最小化 / 最大化 / 关闭）
+
+       为什么和上面那排功能按钮分开：
+         · 功能按钮是这个程序自己的（刷新、设置…）
+         · 这组是操作**窗口**的，位置固定在右上角，和别的程序一致
+         · 无边框窗口里，这是唯一能关窗/缩小的地方 ——
+           缺了它窗口就变成一个关不掉的方块（踩过这个坑）
+
+       ★ 拖动：0.5.1 起由 app.js 的 selfDrag 实现（#bar 空白处
+         按下并移动 → 后端 SetWindowPos），不再用 pywebview 内建机制。
+       ══════════════════════════════════════════════════════════════ -->
+  <div class="winbtns">
+    <button class="wbtn" id="btnWinMin" title="最小化">
+      <svg class="oi"><use href="#i-winmin"/></svg></button>
+    <button class="wbtn close" id="btnWinClose" title="关闭">
+      <svg class="oi"><use href="#i-x"/></svg></button>
+  </div>
 </div>
 
 <div id="tabs">
@@ -303,11 +359,17 @@
     ><span>GPA</span><span class="badge" id="badge-gpa">—</span></div>
   <div class="tab" data-tab="3"><svg class="oi"><use href="#i-folder"/></svg
     ><span>资料</span><span class="badge" id="badge-files">—</span></div>
+  <div class="tab" data-tab="4"><svg class="oi"><use href="#i-teams"/></svg
+    ><span>Teams</span><span class="badge" id="badge-tm">—</span></div>
 </div>
 
 <div id="stats"></div>
 <div id="wb"></div>
-<div id="msg"></div>
+<!-- 状态条：失败时右边会多出一个「立即刷新」键
+       ★ 按钮**静态**放在这里、平时 display:none ——
+         不动态创建，render() 每秒跑也不会增删 DOM 引起重排。 -->
+<div id="msg"><button class="retry" id="msgRetry" title="重新抓取一次">
+  <svg class="oi"><use href="#i-refresh"/></svg><span>立即刷新</span></button></div>
 
 <!-- 晚报面板（从顶部按钮展开） -->
 <div id="digest" class="dighost">
@@ -326,77 +388,244 @@
     <div class="page" id="page-sch"></div>
     <div class="page" id="page-gpa"></div>
     <div class="page" id="page-files"></div>
-  </div>
+    <div class="page" id="page-tm"></div>  </div>
 </div>
 
-<!-- ══════════ 首次运行引导页（填账密即用）══════════ -->
+</div>
+
+<!-- ══════════ 首次运行引导（一个网站一页）══════════
+     ★ 用户的反馈：
+       「初次开启时，输入帐密，一个网站一个页面，方便分辨。」
+
+     ★ 为什么分页而不是一页堆完：
+       要填的是**两个不同网站**的账号（学校系统 + 课表系统），
+       它们的账号形态还不一样（一个是邮箱，一个是手机号）。
+       堆在一页上，用户分不清哪个框填哪个 —— 填错了才报错，
+       还得回头找是哪个。分成页之后，每页顶上就写着「这是哪个系统」，
+       填完一个再走下一个，不用猜。
+
+     三个页面：
+       ① ManageBac（学校系统）—— 必填
+       ② 课表（希悦校园）—— 可跳过
+       ③ EC 名单名字 —— 可跳过
+
+     页面之间有步骤指示（小圆点），能看出「还有几页」。 -->
 <div id="setup">
   <div class="su-card">
+
+    <!-- 步骤指示：三个点，当前页高亮 -->
+    <div class="su-dots" id="suDots">
+      <i class="on"></i><i></i><i></i>
+    </div>
+
     <div class="su-ic" id="suIc"></div>
     <h1 id="suTitle">登录</h1>
-    <div class="su-sub" id="suSub">
-      使用学校账号登录，读取作业与成绩。
-    </div>
+    <div class="su-sub" id="suSub"></div>
 
     <div class="su-msg" id="suMsg"></div>
 
-    <!-- 学校网址 -->
-    <div class="su-field" id="suUrlField">
-      <label>学校网址</label>
-      <input class="su-in" id="suUrl" type="text" spellcheck="false"
-             placeholder="your-school.managebac.cn">
-    </div>
-
-    <!-- 账号 -->
-    <div class="su-field">
-      <label>ManageBac 账号</label>
-      <input class="su-in" id="suUser" type="text" spellcheck="false"
-             autocomplete="username" placeholder="学校邮箱">
-    </div>
-
-    <!-- 密码 -->
-    <div class="su-field">
-      <label>ManageBac 密码</label>
-      <div class="su-pw">
-        <input class="su-in" id="suPw" type="password"
-               autocomplete="current-password" placeholder="密码">
-        <button class="su-eye" id="suEye" type="button" title="显示/隐藏密码"></button>
+    <!-- ═══ 第 1 页：ManageBac ═══ -->
+    <div class="su-page on" id="suP1">
+      <div class="su-src">
+        <span class="su-srcname">ManageBac</span>
+        <span class="su-srcurl">beijing101.managebac.cn</span>
       </div>
-    </div>
 
-    <!-- 课表账号（可选，折叠） -->
-    <div class="su-fold" id="suFold">
-      <div class="su-fhead" id="suFhead">
-        <span id="suFic"></span>
-        课表账号<span class="opt">可选</span>
-        <span class="arw">▶</span>
+      <div class="su-field">
+        <label>账号</label>
+        <input class="su-in" id="suUser" type="text" spellcheck="false"
+               autocomplete="username" placeholder="学校邮箱">
       </div>
-      <div class="su-fbody"><div class="su-finner"><div class="su-fpad">
-        <div class="su-field" style="margin-bottom:11px">
-          <label>课表账号 <span class="opt">手机号</span></label>
-          <input class="su-in" id="suSUser" type="text" spellcheck="false"
-                 placeholder="手机号">
+
+      <div class="su-field">
+        <label>密码</label>
+        <div class="su-pw">
+          <input class="su-in" id="suPw" type="password"
+                 autocomplete="current-password" placeholder="密码">
+          <button class="su-eye" id="suEye" type="button"
+                  title="显示/隐藏密码"></button>
         </div>
-        <div class="su-field" style="margin-bottom:0">
-          <label>课表密码</label>
-          <input class="su-in" id="suSPw" type="password"
-                 placeholder="密码">
+      </div>
+
+      <!-- 学校网址（默认展开 —— 内置默认只是占位域名，多数人都要改；
+             折起来的话验证失败报「无法连接」时，用户找不到地方改） -->
+      <div class="su-fold open" id="suUrlFold">
+        <div class="su-fhead" id="suUrlHead">
+          <span>学校网址</span><span class="opt">确认是你学校的域名</span>
+          <span class="arw">▶</span>
         </div>
-        <div class="su-foot" style="text-align:left;margin-top:9px">
-          不填也可以，只影响「今日课表」页。
-        </div>
-      </div></div></div>
+        <div class="su-fbody"><div class="su-finner"><div class="su-fpad">
+          <input class="su-in" id="suUrl" type="text" spellcheck="false"
+                 placeholder="your-school.managebac.cn">
+        </div></div></div>
+      </div>
+
+      <button class="su-btn" id="suGo"></button>
+      <button class="su-skip" id="suSkip1" type="button" hidden>
+        先跳过，稍后再填
+      </button>
     </div>
 
-    <button class="su-btn" id="suGo"></button>
+    <!-- ═══ 第 2 页：课表（希悦校园）═══ -->
+    <div class="su-page" id="suP2">
+      <div class="su-src">
+        <span class="su-srcname">课表</span>
+        <span class="su-srcurl">yly.seiue.com</span>
+      </div>
+
+      <div class="su-field">
+        <label>手机号</label>
+        <input class="su-in" id="suSchUser" type="text" spellcheck="false"
+               autocomplete="username" placeholder="登录课表用的手机号">
+      </div>
+
+      <div class="su-field">
+        <label>密码</label>
+        <div class="su-pw">
+          <input class="su-in" id="suSchPw" type="password"
+                 autocomplete="current-password" placeholder="密码">
+          <button class="su-eye" id="suSchEye" type="button"
+                  title="显示/隐藏密码"></button>
+        </div>
+      </div>
+
+      <div class="su-hint">
+        填了才会显示课表。登录状态失效时组件会自己续期，
+        续不了会单独提示。
+      </div>
+
+      <button class="su-btn" id="suGo2"></button>
+      <button class="su-skip" id="suSkip2" type="button">
+        不用课表，跳过
+      </button>
+    </div>
+
+    <!-- ═══ 第 3 页：EC 名单名字 ═══ -->
+    <div class="su-page" id="suP3">
+      <div class="su-src">
+        <span class="su-srcname">English Corner</span>
+        <span class="su-srcurl">Teams · 每日名单</span>
+      </div>
+
+      <div class="su-field">
+        <label>名单里可能出现你的名字</label>
+        <input class="su-in" id="suEc" type="text" spellcheck="false"
+               placeholder="比如 San Zhang、Zhang San、张三">
+      </div>
+
+      <div class="su-hint">
+        填了之后，每天出的 EC 名单会**自动扫一遍**，
+        上面有你的名字就在组件里提醒。<br>
+        英文名 / 中文名都填上更保险；多个用逗号隔开。
+      </div>
+
+      <button class="su-btn" id="suGo3"></button>
+      <button class="su-skip" id="suSkip3" type="button">
+        先不填，跳过
+      </button>
+    </div>
 
     <div class="su-foot" id="suFoot">
-      账号信息保存在本机，不会上传到任何服务器。<br>
-      需要修改时，点右上角的 <b>钥匙</b> 图标。
+      账号保存在本机。
     </div>
   </div>
 </div>
 
+<!-- ══════════════════════════════════════════════════════════════════
+     使用教程（首次运行自动弹，可跳过，设置里能再叫出来）
+
+     ★ 用户的反馈：
+       「esc 之类太繁琐了，安装包里额外加初次使用页面教程，
+        指明几乎每一个可交互点的作用。可跳过，可在设置里面再次唤起。」
+
+     ★ 为什么教程和引导页分开：
+       引导页是「必须做的事」（不填账密用不了），
+       教程是「可以不做的事」（跳过照样能用）。
+       混在一起会让人以为不看完就不能用。
+
+     ★ 怎么标出「每个可交互点」：
+       用「高亮圈 + 说明卡」逐条走。每一页：
+         · 把要讲的那个元素**圈出来**（用它的实际位置画框）
+         · 旁边放一张说明卡，写清「这是什么 / 点了会怎样」
+         · 底部「上一步 / 下一步 / 跳过」
+       这样比一次性列一大段文字好读，也不容易漏。
+     ══════════════════════════════════════════════════════════════════ -->
+<div id="tour">
+  <div class="tr-mask" id="trMask"></div>
+  <div class="tr-spot" id="trSpot"></div>
+  <div class="tr-card" id="trCard">
+    <div class="tr-head">
+      <span class="tr-step" id="trStep"></span>
+      <span class="tr-title" id="trTitle"></span>
+      <button class="tr-x" id="trClose" title="关闭教程" aria-label="关闭">
+        <svg class="oi"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="tr-body" id="trBody"></div>
+    <div class="tr-foot">
+      <button class="tr-btn ghost" id="trSkip">跳过</button>
+      <span class="flex"></span>
+      <button class="tr-btn" id="trPrev">上一步</button>
+      <button class="tr-btn primary" id="trNext">下一步</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     窗口菜单（ESC 唤出）
+
+     ★ 为什么除了标题栏按钮还要有这一套：
+       窗口是无边框的 —— 关窗、最小化全靠界面上画的按钮。
+       万一标题栏那几个按钮点不到（界面被卡住、鼠标拖不动、
+       或者用户就是想少点两下），窗口就变成一个关不掉的方块。
+       这里用 ESC 唤出一层「重模糊的遮罩 + 三个大按钮」，
+       是**第二道保险**，也是顺手的一个快捷方式。
+
+     ★ 用重模糊是有意的：
+       遮罩一层 saturate + blur 把后面全部内容糊掉，
+       视线立刻聚焦到中间这三个按钮上，不会点错。
+     ══════════════════════════════════════════════════════════════════ -->
+<div class="wmhost" id="winmenu">
+  <div class="wmwrap" role="dialog" aria-label="窗口操作">
+    <div class="wmhead">
+      <span class="wmt">窗口</span>
+      <span class="wmtip">Esc 关闭</span>
+    </div>
+
+    <button class="wmbtn" id="wmMin">
+      <span class="wm-ic"><svg class="oi"><use href="#i-winmin"/></svg></span>
+      <span class="wm-tx">
+        <b>最小化</b>
+        <i>缩到任务栏，随时点回来</i>
+      </span>
+    </button>
+
+    <button class="wmbtn" id="wmMax">
+      <span class="wm-ic"><svg class="oi"><use href="#i-winmax"/></svg></span>
+      <span class="wm-tx">
+        <b>最大化 / 还原</b>
+        <i>铺满屏幕，或回到原来的大小</i>
+      </span>
+    </button>
+
+    <button class="wmbtn close" id="wmClose">
+      <span class="wm-ic"><svg class="oi"><use href="#i-x"/></svg></span>
+      <span class="wm-tx">
+        <b>关闭窗口</b>
+        <i>自动刷新仍会在后台继续</i>
+      </span>
+    </button>
+
+    <button class="wmbtn quit" id="wmQuit">
+      <span class="wm-ic"><svg class="oi"><use href="#i-power"/></svg></span>
+      <span class="wm-tx">
+        <b>退出程序</b>
+        <i>连后台一起停掉</i>
+      </span>
+    </button>
+  </div>
+</div>
+
+<script src="vendor/klinecharts.min.js"></script>
 <script src="app.js"></script>
 <!-- ══════════ 自编课表（添加网站没有的课） ══════════ -->
 <div class="clhost" id="clpanel">
@@ -502,7 +731,270 @@
         </div>
       </div>
 
+      <!-- 开机自动更新（只在桌面版显示） -->
+      <div class="setrow" id="setAutoRow">
+        <div class="settoggle">
+          <div>
+            <label>开机自动更新</label>
+            <div class="setdesc" id="setAutoDesc">开机会在后台抓好数据，打开即用</div>
+          </div>
+          <button class="sw" id="setAuto" title="开关"></button>
+        </div>
+      </div>
+
+      <!-- ══════════ 浏览器（只在桌面版显示）══════════
+           跳转链接、Teams、EC 名单、附件下载都靠它。
+           以前写死 Edge、只能手改 data/browser.json，
+           现在这里就能选，而且能直接复用你日常浏览器的登录态。 -->
+      <div class="setrow" id="setBrowserRow">
+        <div class="sethead">
+          <label>浏览器</label>
+          <span class="setval" id="setBrowserVal">自动</span>
+        </div>
+        <div class="themes" id="setBrowserPick"></div>
+        <div class="setdesc" id="setBrowserDesc">跳转、Teams、附件下载都靠它</div>
+        <div class="settoggle" style="margin-top:10px">
+          <div>
+            <label>复用日常浏览器的登录</label>
+            <div class="setdesc" id="setReuseDesc">
+              开启后直接用你平时那个浏览器里的登录态，不用再登一次
+            </div>
+          </div>
+          <button class="sw" id="setReuse" title="开关"></button>
+        </div>
+      </div>
+
+      <!-- ══════════ 诊断报告（只在桌面版显示）══════════
+           程序异常退出时会自动生成报告；也可以手动生成一份，
+           直接把内容贴到 GitHub issue 里，作者就能定位问题。 -->
+      <div class="setrow" id="setCrashRow">
+        <div class="sethead">
+          <label>诊断报告</label>
+          <span class="setval" id="setCrashVal">—</span>
+        </div>
+        <div class="setdesc" id="setCrashDesc">
+          程序异常退出时会自动保存一份报告（已去掉账号密码等敏感信息）
+        </div>
+        <div class="themes" style="margin-top:8px">
+          <button id="setCrashMake">生成一份诊断报告</button>
+          <button id="setCrashOpen">打开报告文件夹</button>
+        </div>
+      </div>
+
+      <!-- ══════════ 配色 ══════════
+           两个层次：先挑预设（一键整套换），
+           再按需要调自定义底色 / 背景图（覆盖预设）。 -->
+      <div class="setrow">
+        <div class="sethead">
+          <label>配色</label>
+          <span class="setval" id="setValTheme"></span>
+        </div>
+        <div class="themes" id="setTheme"></div>
+      </div>
+
+      <div class="setrow">
+        <div class="sethead">
+          <label>背景颜色</label>
+          <span class="setval" id="setValBg"></span>
+        </div>
+        <div class="bgpick">
+          <div class="bgsw" id="setBgSw">
+            <input type="color" id="setBg" value="#f5f1e8">
+          </div>
+          <div class="bgtx" id="setBgTx">选一个自己喜欢的底色</div>
+          <button class="setreset" id="setBgReset"
+                  style="width:auto;margin:0;padding:0 14px;height:30px"
+                  >跟预设</button>
+        </div>
+        <!-- 颜色存档：调过的颜色默认留下来，下次一键换回；
+             不想留就把勾去掉。点色块应用，点 × 删掉。 -->
+        <div class="archrow">
+          <label class="archchk" title="挑好颜色后自动存进下面的存档">
+            <input type="checkbox" id="setBgArchChk" checked><span>存入存档</span>
+          </label>
+          <div class="archsw" id="setBgArch"></div>
+        </div>
+        <div class="setdesc">只改底色；玻璃卡片会跟着一起算</div>
+      </div>
+
+      <!-- 字体颜色 ——
+           自己改底色最容易出的事就是字看不清，
+           所以这一项给了「自动」：按底色明暗算对比度挑一套，
+           挑完还会把对比度报出来。 -->
+      <div class="setrow">
+        <div class="sethead">
+          <label>字体颜色</label>
+          <span class="setval" id="setValFg"></span>
+        </div>
+        <div class="bgpick">
+          <div class="bgsw" id="setFgSw" style="background:#3d3830">
+            <input type="color" id="setFg" value="#3d3830">
+          </div>
+          <div class="bgtx" id="setTextTx">跟着预设走</div>
+          <button class="setreset" id="setFgAuto"
+                  style="width:auto;margin:0;padding:0 14px;height:30px"
+                  >自动</button>
+        </div>
+        <div class="archrow">
+          <label class="archchk" title="挑好颜色后自动存进下面的存档">
+            <input type="checkbox" id="setFgArchChk" checked><span>存入存档</span>
+          </label>
+          <div class="archsw" id="setFgArch"></div>
+        </div>
+        <div class="setdesc">改底色后如果看不清，点「自动」让它按底色挑</div>
+        <div class="ctr" id="setCtrRow">
+          <span>当前对比度</span><b id="setCtrVal"></b>
+          <span class="ctr-tip">小于 4.5 有可能出现看不清的情况</span>
+        </div>
+      </div>
+
+      <div class="setrow">
+        <div class="sethead">
+          <label>背景图片</label>
+          <span class="setval" id="setValBgi"></span>
+        </div>
+        <div class="bgimg">
+          <button id="setBgiPick">选择图片</button>
+          <button id="setBgiClear">移除</button>
+        </div>
+        <input type="file" id="setBgiFile" accept="image/*" hidden>
+        <div class="setdesc">图片存在本机，不会上传</div>
+      </div>
+
+      <div class="setrow" id="setBgAlphaRow">
+        <div class="sethead">
+          <label>图片浓度</label>
+          <span class="setval" id="setValBga"></span>
+        </div>
+        <input type="range" id="setBga" min="10" max="100" step="5" value="100">
+        <div class="setdesc">调低一点，字更容易看清</div>
+      </div>
+
+      <div class="setrow" id="setTopRow">
+        <div class="settoggle">
+          <div>
+            <label>固定在其他窗口上层</label>
+            <div class="setdesc">开启后不会被别的窗口盖住（像微信那样）</div>
+          </div>
+          <button class="sw" id="setTop" title="开关"></button>
+        </div>
+      </div>
+
       <button class="setreset" id="setReset">恢复默认</button>
+
+      <!-- ══════════ 操作 ══════════
+           把「不常用但偶尔要用」的几项从标题栏挪到这里 ——
+           标题栏挤了十一个按钮，小窗口下都要横向滚了。
+           标题栏只留「每天都会点」的：折叠、倒计时、晚报、
+           Teams/EC、设置、小浮窗。
+           「暂停自动刷新」「重新登录」0.5.1 起也收在这里。 -->
+      <div class="setsep"></div>
+
+      <div class="setrow">
+        <div class="sethead"><label>操作</label></div>
+        <div class="ops">
+          <button class="opbtn" id="opRefresh">
+            <svg class="oi"><use href="#i-refresh"/></svg>
+            <span>立即刷新</span></button>
+          <button class="opbtn" id="opAuto">
+            <svg class="oi"><use href="#i-pause"/></svg>
+            <span>暂停自动刷新</span></button>
+          <button class="opbtn" id="opLogin">
+            <svg class="oi"><use href="#i-key"/></svg>
+            <span>重新登录</span></button>
+          <button class="opbtn" id="opData">
+            <svg class="oi"><use href="#i-shield"/></svg>
+            <span>数据与备份</span></button>
+          <button class="opbtn" id="opTour">
+            <svg class="oi"><use href="#i-book"/></svg>
+            <span>看一遍使用教程</span></button>
+        </div>
+        <div class="setdesc">暂停 / 恢复每 5 分钟的自动刷新；登录过期了点「重新登录」，不用自己跑任何程序</div>
+      </div>
+
+      <!-- ══════════ EC 名单关注 ══════════
+           用户要求：注册时问一次「可能出现在 EC 名单里的名字」，
+           以后每回出名单自动扫。这里也能改。 -->
+      <div class="setsep"></div>
+
+      <div class="setrow" id="setEcRow">
+        <div class="sethead">
+          <label>EC 名单里的名字</label>
+          <span class="setval" id="setValEc"></span>
+        </div>
+        <input class="setin" id="setEcNames" type="text" spellcheck="false"
+               placeholder="比如 San Zhang、Zhang San、张三">
+        <div class="setdesc">
+          每天出的 EC 名单会自动扫一遍，上面有你的名字就在顶栏提醒
+        </div>
+        <div class="bgimg" style="margin-top:9px">
+          <button id="setEcSave">保存</button>
+          <button id="setEcScan">立刻检查</button>
+        </div>
+        <div class="ec-note" id="setEcNote"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- ══════════ 「正在打开」提示（0.5.2 补充）══════════
+     点击跳转后立刻出现，把「已耗时 N 秒」实时写出来。
+     人看不到反应就会反复点 —— 这个卡片就是为了让等待可见。 -->
+<div id="openprog" aria-live="polite">
+  <div class="op-row">
+    <span class="op-spin"></span>
+    <span class="op-text">正在打开原网页…</span>
+    <span class="op-time" id="opTime">已耗时 0 秒</span>
+  </div>
+  <div class="op-sub" id="opSub"></div>
+</div>
+
+<!-- ══════════ 打开结果弹窗（失败 / 降级说明）══════════ -->
+<div id="opendlg" role="dialog" aria-modal="true">
+  <div class="odbox">
+    <div class="odhead">
+      <span class="odico" id="odIco"><svg class="oi"><use href="#i-alert"/></svg></span>
+      <span class="odtitle" id="odTitle">打不开原网页</span>
+      <button class="odx" id="odClose" title="关闭" aria-label="关闭">
+        <svg class="oi"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="odmsg" id="odMsg"></div>
+    <div class="odmeta" id="odMeta" hidden></div>
+    <div class="odacts">
+      <button class="odbtn" id="odRetry" hidden>重试</button>
+      <button class="odbtn primary" id="odOk">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ 搜索（0.5.2）══════════
+     结果区复用 GPA 页的折叠栏样式（.grow / .gdetail），
+     目的是「点开一条作业」的手感与 GPA 页展开科目完全一致。 -->
+<div class="clhost" id="searchpanel">
+  <div class="clwrap">
+    <div class="clh">
+      <span class="t">搜索作业与成绩</span>
+      <button class="clx" id="srClose" title="关闭" aria-label="关闭">
+        <svg class="oi"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="clbody srbody">
+      <div class="srbar">
+        <div class="srinput-wrap">
+          <svg class="oi sric"><use href="#i-search"/></svg>
+          <input class="srinput" id="srInput" type="search"
+                 placeholder="输入关键词，不区分大小写；多个词用空格分开"
+                 autocomplete="off" spellcheck="false">
+        </div>
+        <select class="srsel" id="srCourse" title="指定科目">
+          <option value="">全部科目</option>
+        </select>
+      </div>
+      <div class="srstat" id="srStat">
+        选定科目可直接查看该科全部作业；输入关键词则搜索全部相关项。
+        每次搜索都会重新读取成绩。
+      </div>
+      <div class="srres" id="srRes"></div>
     </div>
   </div>
 </div>
@@ -520,6 +1012,15 @@
         <span class="tm-dot"></span>
         <span class="tm-txt" id="tmStatus">还没同步过</span>
       </div>
+
+      <!--  EC 关注状态行（0.5.1：EC 并入 Teams 板块）——
+            内容每秒可能变，ecRefresh() 里先比对再写。
+            点这行 → 打开设置面板改关注名字。 -->
+      <div class="tm-ec" id="tmEc" title="点我设置 EC 关注名字"></div>
+
+      <!--  命中处的原文片段（0.5.2）—— 不用自己去翻 PDF、Ctrl+F。
+            没有命中时整块隐藏。 -->
+      <div class="ec-details" id="ecDetails" hidden></div>
 
       <div class="tm-acts">
         <button class="tm-btn" id="tmOpen" title="打开 Teams 登录">

@@ -63,16 +63,54 @@ RENEW_MARGIN = 3 * 86400          # 3 天
 #  状态文件
 # ══════════════════════════════════════════════════════════════════
 
+#  状态文件体检：读坏了必须**按最保守的方式**处理。
+#  形状：{"ok": True, "note": ""}
+STATE_HEALTH: dict = {"ok": True, "note": ""}
+
+
 def _read_state() -> dict:
+    """读自动登录状态文件。
+
+    ★ 读不出来时**不能当成「从没失败过」**：
+      这里存着「连续失败几次」，是防锁号退避的依据。
+      文件一坏就返回 {}，fails 归零 → 退避从最短的 10 分钟重新开始，
+      正是「账号连续 5 次失败会被锁」最怕的行为。
+      所以坏掉时把 STATE_HEALTH 标出来，由 _backoff_ok 走最长间隔。
+    """
+    global STATE_HEALTH
+    if not STATE_FILE.exists():
+        STATE_HEALTH = {"ok": True, "note": ""}
+        return {}
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+        d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("状态文件内容不是对象")
+        STATE_HEALTH = {"ok": True, "note": ""}
+        return d
+    except Exception as e:
+        STATE_HEALTH = {"ok": False,
+                        "note": f"自动登录状态文件读不出来：{type(e).__name__}"}
+        log.warning("自动登录状态文件损坏（%s）；本轮按最长退避处理，"
+                    "避免因为「看起来没失败过」而反复提交登录", e)
         return {}
 
 
 def _write_state(**kw) -> dict:
+    """写状态文件（原子写）。
+
+    ★ 状态文件已损坏时**拒绝覆盖**：
+      否则一次写入就会把文件变成「合法但全新」的状态 ——
+      「连续失败 5 次」的记录被抹掉，退避也回到最短间隔，
+      而且现场（坏文件）被销毁，事后无法判断到底发生过什么。
+      坏着的时候宁可什么都不写：退避走最长间隔，界面会提示需要重新登录。
+    """
+    global STATE_HEALTH
     with _lock:
         st = _read_state()
+        if not STATE_HEALTH.get("ok", True):
+            log.warning("自动登录状态文件损坏，本次不写入（先保住现场）：%s",
+                        STATE_HEALTH.get("note"))
+            return st
         st.update(kw)
         st["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
@@ -103,17 +141,30 @@ def _backoff_ok(key: str) -> tuple[bool, int]:
 
     连续失败次数越多，等得越久（指数退避）。
      这是「防止触发风控锁号」的关键 —— 绝不能短时间内反复提交。
+
+    ★ 状态文件坏了（STATE_HEALTH.ok 为假）时按**最长间隔**处理：
+      那种情况下我们并不知道已经失败过几次，而「猜 0 次」会让退避
+      退回最短的 10 分钟 —— 对一个可能已经被锁的账号反复提交，
+      正好会一直重置锁定计时器。宁可按 60 分钟保守等一轮。
     """
     st = _read_state()
-    fails = int(st.get(f"{key}_fails") or 0)
     last = _last_attempt(key)
+    max_gap = 60 * 60
+
+    if not STATE_HEALTH.get("ok", True):
+        waited = time.time() - last
+        if waited >= max_gap:
+            return True, 0
+        return False, int(max_gap - waited)
+
+    fails = int(st.get(f"{key}_fails") or 0)
 
     if fails == 0:
         gap = config.AUTO_LOGIN_MIN_GAP          # 10 分钟
     else:
         # 10 分钟 → 20 → 40 → 80 → 160 → 320 → 封顶 60 分钟
         gap = min(config.AUTO_LOGIN_MIN_GAP * (2 ** min(fails, 6)),
-                  60 * 60)
+                  max_gap)
 
     waited = time.time() - last
     if waited >= gap:
@@ -253,7 +304,7 @@ _SCHEDULE_FILL_JS = r"""
         const t = (all[k].type || '').toLowerCase();
         const im = (all[k].inputMode || '').toLowerCase();
         if (t === 'text' || t === 'tel' || t === 'email'
-| im === 'numeric' || im === 'tel' || im === 'email') {
+          || im === 'numeric' || im === 'tel' || im === 'email') {
           uEl = all[k]; break;
         }
       }
@@ -376,7 +427,10 @@ def renew_schedule(headless: bool = True,
     """
     key = "sch"
     if key in _running:
-        return True, "已有登录流程在进行"
+        #  ★ 这里**不能**返回 True。
+        #    返回 True 会让调用方以为「已经续期成功」，于是重抓一次、仍然 401，
+        #    而界面显示的是成功 —— 用户看到的就是「点了没反应」。
+        return False, "登录流程正在进行中，请稍候（不要重复点）"
     ok_gap, wait = _backoff_ok(key)
     if not ok_gap:
         m = wait // 60 + 1

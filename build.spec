@@ -142,11 +142,16 @@ hiddenimports = [
     "app.sp_download",
     #   今日新增（今天新出的成绩 / 新布置的作业）
     "app.today_new",
+    #   成绩目标模拟（0.5.2）——「想考到 X 分，剩下的得拿多少」
+    "app.goal",
+    #   数据清理（0.5.2）—— 历史库与 EC 目录定期瘦身
+    "app.cleanup",
+    #   无窗口执行外部命令（0.5.2）—— 不用它会弹 PowerShell 黑框
+    "app.proc",
     #   上面两个用到下面这些：CDP 驱动 Edge、并发、下载
     "app.cdp",
     "app.edge",
     "app.download",
-    "app.server",
     "app.schedule",
     #   打开外部程序（用系统默认程序打开文件/文件夹）
     "app.opener",
@@ -182,7 +187,14 @@ excludes = [
     #   （我们已改成纯 HTTP，这些都不需要了）
     "playwright", "selenium", "pyppeteer", "websockets",
     # 跟本程序无关的重型库
-    "tkinter.test", "test", "tests",
+    "test", "tests",
+    #  ★★ tkinter 全家桶（0.5.2 瘦身）★★
+    #   实测归档里有 7.57 MB / 926 条是 tcl/tk：tcl86t.dll、tk86t.dll、
+    #   _tcl_data（含几十种编码表）、tcl8 的各种 .tm 脚本。
+    #   本程序一行都没用过 —— pywebview 在 Windows 上走的是
+    #   pythonnet + WinForms，与 tkinter 无关。原来是漏排了。
+    "tkinter", "_tkinter", "tcl", "tk", "tkinterdnd2",
+    "idlelib", "turtledemo", "turtle", "lib2to3",
 ]
 
 
@@ -200,6 +212,20 @@ a = Analysis([str(ROOT / "widget.py")],
     cipher=block_cipher,
     noarchive=False,
 )
+
+#  ★★★ 千万不要剔掉 win-arm64 的 WebView2Loader.dll ★★★
+#
+#    曾经为了省 144 KB 把它排掉了，结果程序起不来：
+#
+#        FileNotFoundError: Cannot find win-arm64
+#          at webview/util.py:517 in interop_dll_path
+#
+#    pywebview 在 interop_dll_path() 里按架构目录解析原生加载器，
+#    目录不在就直接抛异常，webview.start() 根本没跑起来 ——
+#    窗口是个空白方块，日志停在「建窗参数」，前端永远等不到就绪。
+#
+#    教训：这类「看着是死重量」的原生依赖，删了要真机启动一次才算数。
+#    144 KB 换来一个打不开的程序，不值。
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

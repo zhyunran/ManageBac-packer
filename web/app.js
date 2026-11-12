@@ -5,6 +5,10 @@ const $ = s => document.querySelector(s);
 let DATA = null;
 let WARM = null;                       /* 预热状态（体现「打开即有内容」） */
 let DEFAULT_HOST = '';                 /* 学校网址（引导页预填 + 提示用） */
+/*  占位域名 —— 后端没配过学校时给的就是它。不是任何真学校，
+    绝不能拿它去发请求（以前预填进输入框，用户不改动直接提交，
+    打到假域名上报「无法连接」，网址框还折着，无处改）。 */
+const SETUP_PLACEHOLDER_HOST = 'your-school.managebac.cn';
 let HAS_CREDENTIALS = true;            /* 是否已填过账号（false → 空状态引导去填） */
 let scheduleDirty = false;             /* 时间推移导致状态变化（开始/结束上课） */
 let collapsed = JSON.parse(localStorage.getItem('mb.col') || '{}');
@@ -38,7 +42,7 @@ function liveTask(t){
 }
 
 /* 秒数 → 友好倒计时文案
-    刷新间隔改成 30 分钟后，显示 "1799s" 很怪，
+    刷新间隔较长，显示 "299s" 很怪，
      所以按量级自动换单位。 */
 function fmtCountdown(sec){
   sec = Math.max(0, Math.round(sec || 0));
@@ -76,41 +80,254 @@ function dueTag(d){
   return `<span class="tag dim">${d} 天后</span>`;
 }
 
-function openURL(u){
-  if(!u) return;
-  /* 窗口模式（pywebview）→ 调用 Python 用系统浏览器打开 */
-  if(window.pywebview?.api?.open_url){ window.pywebview.api.open_url(u); return; }
-  /* 网页模式 → 让本地看板服务代为打开（避免被浏览器拦截新窗口） */
-  if(location.protocol.startsWith('http')){
-    fetch('/api/open?url='+encodeURIComponent(u)).catch(()=>{ window.open(u,'_blank'); });
+/* ══════════════════════════════════════════════════════════════
+   打开原网页：进度提示 + 防重复 + 失败弹窗（0.5.2 补充）
+
+   【为什么要有这一套】
+     原来点下去之后界面没有任何反馈 —— 不知道在等、成功了、还是失败了。
+     人一旦看不到反应就会反复点：实测一次操作里同一个链接被打开了十几次，
+     Edge 被拖出一屏进程。更糟的是内部若卡住，调用干脆不返回，
+     界面上就是「点了三分钟什么都没有」。
+
+   现在：
+     · 点下去立刻出现进度卡，实时写「已耗时 N 秒」
+     · 上一次还没结束，再次点击直接说明「请稍候」，不会再起一次
+     · 失败 / 超时 → 弹出窗口写明原因，并可「重试」
+     · 降级到系统浏览器也弹窗说明（需要重新登录），不再只是一闪而过的 toast
+   ══════════════════════════════════════════════════════════════ */
+let OPEN_BUSY = false;        /* 是否已有一次打开在等结果 */
+let OPEN_T0 = 0;              /* 本次开始时刻 */
+let OPEN_TIMER = null;        /* 秒数刷新定时器 */
+let OPEN_GUARD = null;        /* 前端兜底超时 */
+let OPEN_RETRY_URL = '';      /* 「重试」要用的链接 */
+
+function opShow(url){
+  const el = $('#openprog');
+  if(!el) return;
+  const sub = $('#opSub');
+  if(sub) sub.textContent = url || '';
+  el.classList.add('show');
+  opTick();
+}
+
+function opTick(){
+  const t = $('#opTime');
+  if(!t) return;
+  const sec = Math.max(0, Math.floor((Date.now() - OPEN_T0) / 1000));
+  t.textContent = '已耗时 ' + sec + ' 秒';
+}
+
+function opHide(){
+  const el = $('#openprog');
+  if(el) el.classList.remove('show');
+  if(OPEN_TIMER){ clearInterval(OPEN_TIMER); OPEN_TIMER = null; }
+}
+
+/*  结果弹窗。kind: 'error'（打不开） / 'info'（打开了但有话说） */
+function opDialog(cfg){
+  const host = $('#opendlg');
+  if(!host) return;
+  const ico = $('#odIco'), title = $('#odTitle'), msg = $('#odMsg');
+  const meta = $('#odMeta'), retry = $('#odRetry');
+  if(ico){
+    ico.className = 'odico' + (cfg.kind === 'info' ? ' info' : '');
+    ico.innerHTML = icon(cfg.kind === 'info' ? 'i-external' : 'i-alert', 'sm');
+  }
+  if(title) title.textContent = cfg.title || '打不开原网页';
+  if(msg) msg.textContent = cfg.msg || '';
+  if(meta){
+    if(cfg.meta){ meta.textContent = cfg.meta; meta.hidden = false; }
+    else { meta.textContent = ''; meta.hidden = true; }
+  }
+  OPEN_RETRY_URL = cfg.retryUrl || '';
+  if(retry) retry.hidden = !OPEN_RETRY_URL;
+  host.classList.add('open');
+  setTimeout(()=>{ $('#odOk')?.focus(); }, 60);
+}
+
+function opCloseDialog(){
+  $('#opendlg')?.classList.remove('open');
+}
+
+/*  把后端返回的结果翻译成人能看懂的东西 */
+function opHandleResult(r, err, url){
+  if(err){
+    opDialog({kind:'error', title:'打不开原网页',
+      msg:'打开时出现错误：' + err, retryUrl:url});
     return;
   }
-  window.open(u,'_blank');
+  if(!r){
+    opDialog({kind:'error', title:'打不开原网页',
+      msg:'没有收到结果。可能是界面与后台之间的连接断了。', retryUrl:url});
+    return;
+  }
+  if(r.busy){
+    toast(r.error || '正在打开上一个链接，请稍候', 'err', '');
+    return;
+  }
+  if(r.ok){
+    if(r.fallback){
+      opDialog({kind:'info', title:'已在系统默认浏览器打开',
+        msg: r.note || '需要重新登录。',
+        meta: '组件自带的浏览器没能打开这个链接，因此改用了系统默认浏览器。'});
+    }else{
+      const s = (typeof r.elapsed === 'number')
+        ? '（' + r.elapsed.toFixed(1) + ' 秒）' : '';
+      toast('已打开' + s, 'ok', '');
+    }
+    return;
+  }
+  /* 失败：把「等了多久 / 为什么」都写出来 */
+  const metaBits = [];
+  if(typeof r.elapsed === 'number'){
+    metaBits.push('本次等待 ' + r.elapsed.toFixed(1) + ' 秒');
+  }
+  if(r.timeout) metaBits.push('后台操作在超时时间内没有返回');
+  opDialog({
+    kind:'error',
+    title: r.timeout ? '打开超时' : '打不开原网页',
+    msg: r.error || '未知原因。',
+    meta: metaBits.join(' · '),
+    retryUrl: url
+  });
+}
+
+function openURL(u){
+  if(!u) return;
+
+  /*  上一次还没结束：明确说明，而不是再起一次 ——
+      否则用户越是着急点，进程开得越多。 */
+  if(OPEN_BUSY){
+    toast('上一次打开还没结束，请稍候', 'err', '');
+    return;
+  }
+
+  /*  纯预览页（file://，没有桥）→ 直接开新窗口。
+     这种路径也要给反馈，否则同样是「点了没反应」。 */
+  if(!(hasBridge() && window.pywebview?.api?.open_url)){
+    window.open(u, '_blank');
+    toast('已在新窗口打开', 'ok', '');
+    return;
+  }
+
+  OPEN_BUSY = true;
+  OPEN_T0 = Date.now();
+  opShow(u);
+  OPEN_TIMER = setInterval(opTick, 250);
+
+  const finish = (r, err) => {
+    if(!OPEN_BUSY) return;                 /* 已经收过尾了 */
+    OPEN_BUSY = false;
+    if(OPEN_GUARD){ clearTimeout(OPEN_GUARD); OPEN_GUARD = null; }
+    opHide();
+    opHandleResult(r, err, u);
+  };
+
+  /*  两道保险：后端 25 秒硬超时；前端再兜 35 秒 ——
+      万一桥本身卡住（连返回都没有），界面也不会永远停在「正在打开」。 */
+  OPEN_GUARD = setTimeout(()=>{
+    finish({ok:false, timeout:true,
+            elapsed: (Date.now() - OPEN_T0) / 1000,
+            error:'等待超过 35 秒仍然没有响应。'}, null);
+  }, 35000);
+
+  try{
+    Promise.resolve(window.pywebview.api.open_url(u))
+      .then(r => finish(r, null))
+      .catch(e => finish(null, String(e)));
+  }catch(e){
+    finish(null, String(e));
+  }
+}
+
+function bindOpenDialog(){
+  if(bindOpenDialog._done) return;
+  bindOpenDialog._done = true;
+  $('#odClose')?.addEventListener('click', opCloseDialog);
+  $('#odOk')?.addEventListener('click', opCloseDialog);
+  $('#opendlg')?.addEventListener('click', e=>{
+    if(e.target && e.target.id === 'opendlg') opCloseDialog();
+  });
+  $('#odRetry')?.addEventListener('click', ()=>{
+    const u = OPEN_RETRY_URL;
+    opCloseDialog();
+    if(u) setTimeout(()=> openURL(u), 140);
+  });
+  document.addEventListener('keydown', e=>{
+    if(e.key === 'Escape') opCloseDialog();
+  });
 }
 
 /* ══════════ 统一数据/控制通道 ══════════
-   窗口模式：经 pywebview 的 api
-   网页模式：经本地 HTTP 接口 */
-const IS_WEB = location.protocol.startsWith('http');
-const IS_WIDGET = !IS_WEB;
+   桌面版：经 pywebview 的 api（js_api 桥）
+   纯预览：直接用浏览器打开 _preview.html（file://，没有桥）
+
+   ★★ 0.5.1 修的大坑：桌面版的页面也是 pywebview 内建服务器
+      分发的（http://127.0.0.1:42001），protocol 同样是 http ——
+      只按协议判断会把桌面版误当「网页版」，于是：
+        · setShape() 以为没窗口可调，小浮窗只改界面不缩窗口
+          （用户看到：内容缩了、窗口照旧、大片留白）
+        · DOMContentLoaded 里把最小化/最大化/关闭按钮藏了
+      唯一的铁证是窗口里有没有 pywebview 桥。桥是页面加载后才注入的
+      （解析期拿不到），所以必须是运行时函数 —— 见下面的 isWebMode()。 */
+
+/*  运行模式判定。
+ *
+ *  ★ 不能用 location.protocol 判断！桌面版也是 http：
+ *    pywebview 把本地页面改写成 http://127.0.0.1:42001/ 再交给 WebView
+ *    （见 pywebview 的 window.py / http.py），所以
+ *    `location.protocol.startsWith('http')` 在**生产环境恒为 true**。
+ *    以前 IS_WEB 就是这么算的，于是：
+ *      · IS_WIDGET 恒为 false（全文件零引用，纯死值）；
+ *      · 一旦桥注入失败，界面会切进「浏览器模式」，对着 /api/* 发请求 ——
+ *        那个兜底服务（app/server.py）已经删除，这些请求全部落空，
+ *        表现就是「窗口活着但没数据」，正是本项目最怕的形态。
+ *
+ *  现在唯一的判据是「窗口里有没有 pywebview 桥」：
+ *    桥是页面加载后才注入的，所以必须是运行时函数，不能在解析期定型。
+ *  另加一个「纯静态预览」判据（make_preview.py 生成的 _preview.html 用
+ *  file:// 打开，且不会有桥）。 */
+function isWebMode(){
+  if(hasBridge()) return false;              /* 有桥 = 桌面版，铁证 */
+  return location.protocol === 'file:';      /* file:// 且无桥 = 预览页 */
+}
+function hasBridge(){
+  return !!(window.pywebview && window.pywebview.api);
+}
+
+/*  窗口按钮组（最小化/最大化/关闭）的可见性跟着「是不是真网页」走。
+    桥注入得比 DOMContentLoaded 晚，所以：
+      · DOMContentLoaded 时先按当前所知摆一次
+      · pywebviewready 时再摆一次（桌面版到这一步才认得出自己）
+    两处 DOMContentLoaded 都调它，别再各写一份了。 */
+function syncWinbtnsVisibility(){
+  const wb = document.querySelector('.winbtns');
+  if(wb) wb.style.display = (isWebMode() && !hasBridge()) ? 'none' : '';
+}
+/*  ★ 事件挂在 window 上 —— pywebview 的 finish.js 是
+    ``window.dispatchEvent(...)``，挂在 document 上根本收不到（踩过）。 */
+window.addEventListener('pywebviewready', syncWinbtnsVisibility);
+/*  兜底：万一事件先于脚本解析就发出去了（理论上不会），
+    1.5 秒后再按「桥到底在不在」摆一次 —— 幂等，跑几次都没事。 */
+setTimeout(syncWinbtnsVisibility, 1500);
 
 function apiGetData(){
   if(window.pywebview?.api?.get_data) return window.pywebview.api.get_data();
-  if(IS_WEB) return fetch('/api/data').then(r=>r.json());
+  if(isWebMode()) return fetch('/api/data').then(r=>r.json());
   return Promise.resolve(null);
 }
 function apiRefresh(){
   if(window.pywebview?.api?.refresh) return window.pywebview.api.refresh();
-  if(IS_WEB) return fetch('/api/refresh').then(r=>r.json());
+  if(isWebMode()) return fetch('/api/refresh').then(r=>r.json());
 }
 function apiSetAuto(on){
   if(window.pywebview?.api?.set_auto_refresh) return window.pywebview.api.set_auto_refresh(on);
-  if(IS_WEB) return fetch('/api/auto?on='+(on?'1':'0')).then(r=>r.json());
+  if(isWebMode()) return fetch('/api/auto?on='+(on?'1':'0')).then(r=>r.json());
 }
 /* 预热状态：用于显示「开机已自动更新」徽章 */
 function apiWarmStatus(){
   if(window.pywebview?.api?.warmup_status) return window.pywebview.api.warmup_status();
-  if(IS_WEB) return fetch('/api/warmup').then(r=>r.json());
+  if(isWebMode()) return fetch('/api/warmup').then(r=>r.json());
   return Promise.resolve(null);
 }
 
@@ -125,10 +342,41 @@ function apiTestLogin(login, password, url){
     return window.pywebview.api.test_login(login, password, url);
   return Promise.resolve({ok:false, error:'当前模式不支持测试登录'});
 }
-function apiSaveSetup(login, password, url, suser, spw){
+function apiSaveSetup(login, password, url, suser, spw, ecNames){
   if(window.pywebview?.api?.save_setup)
-    return window.pywebview.api.save_setup(login, password, url, suser, spw);
+    return window.pywebview.api.save_setup(login, password, url, suser, spw,
+                                           ecNames || '');
   return Promise.resolve({ok:false, error:'当前模式不支持保存'});
+}
+/*  单独存课表账号（引导页第 2 页）。
+    ★ 不复用 save_setup —— 那时学校账号已经存好了，
+      再调一次等于把它重写一遍（值虽然一样，但没必要多写一次盘，
+      而且万一用户回头改了第一页又没重新提交就更麻烦）。 */
+function apiSaveSchedule(login, password){
+  if(window.pywebview?.api?.save_schedule)
+    return window.pywebview.api.save_schedule(login, password);
+  return Promise.resolve({ok:false, error:'当前模式不支持保存'});
+}
+
+/* ══════════ 开机自启 ══════════
+   装/卸/查。「装好即用」的最后一环：开机后它在后台抓好数据，
+   用户点开就有内容，不用等。 */
+let AUTOSTART_ON = false;
+
+function apiAutostartStatus(){
+  if(window.pywebview?.api?.autostart_status)
+    return window.pywebview.api.autostart_status();
+  return Promise.resolve({installed:false, supported:false});
+}
+function apiAutostartInstall(){
+  if(window.pywebview?.api?.autostart_install)
+    return window.pywebview.api.autostart_install();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+function apiAutostartUninstall(){
+  if(window.pywebview?.api?.autostart_uninstall)
+    return window.pywebview.api.autostart_uninstall();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
 }
 
 /* ══════════ 统计 ══════════ */
@@ -139,13 +387,568 @@ function apiSaveSetup(login, password, url, suser, spw){
      因为每次看分时想关注的课不一样，不想被上次的状态绑住）。 */
 let gpaOpen = {};              /* { 课程名: true } */
 
-/* 把一个百分制分数换算成 4.0 估算值（与后端 scraper._est 完全一致） */
+/*  百分制 → 4.0 换算表（与后端 gpa.PERCENT_BANDS 一致：
+    0.5.1 校准后 D 线是 65，65 以下一律 0.0）。
+
+    ★ 单一来源：GPA 页那张说明表也由它生成（见 gpaNote）。
+      0.5.1 时表格是手写的，算法改了表格没跟着改（还写着 63+/60+），
+      用户照着表格自己算，跟显示的对不上。共用一份常量就不会再漂。 */
+const GPA_BANDS = [
+  [93, 4.0], [90, 3.7], [87, 3.3], [83, 3.0], [80, 2.7], [77, 2.3],
+  [73, 2.0], [70, 1.7], [67, 1.3], [65, 1.0],
+];
+
 function estOf(p){
   if(p == null) return null;
-  const bands = [[93,4.0],[90,3.7],[87,3.3],[83,3.0],[80,2.7],[77,2.3],
-                 [73,2.0],[70,1.7],[67,1.3],[63,1.0],[60,0.7]];
-  for(const [lo,g] of bands) if(p >= lo) return g;
+  for(const [lo,g] of GPA_BANDS) if(p >= lo) return g;
   return 0.0;
+}
+
+/*  ══════════ 目标模拟（0.5.2）══════════
+    「这门课想考到 X 分，剩下的作业得拿多少」
+
+    类别权重和成绩都来自已经抓下来的数据，点一下就算，不再联网。
+    算不了的时候（权重没读全 / 一个类别都没出分）
+    直接说算不了 —— 不拿个假数字糊弄。
+ */
+function apiGoalSim(course, target){
+  if(window.pywebview?.api?.goal_sim)
+    return window.pywebview.api.goal_sim(course, target);
+  if(isWebMode())
+    return fetch('/api/goal_sim?course=' + encodeURIComponent(course)
+      + '&target=' + encodeURIComponent(target)).then(r=>r.json());
+  return Promise.resolve({ok:false, reason:'当前模式不支持'});
+}
+
+function goalSimHTML(r){
+  if(!r || !r.ok){
+    return `<span class="gsim-w">${esc((r && r.reason) || '算不了')}</span>`;
+  }
+  const t = (r.target != null) ? r.target.toFixed(1) : '?';
+  const head = `<div class="gsim-h">目标 <b>${esc(t)}</b> 分 · `
+    + `已达 <b>${(r.min || 0).toFixed(2)}</b>`
+    + `（上限 ${(r.max || 0).toFixed(2)}）</div>`;
+
+  let body = '';
+  if(r.status === 'met'){
+    body = `<div class="gsim-ok">已出分的部分就够目标了。</div>`;
+  }else if(r.status === 'fixed'){
+    body = `<div class="gsim-w">所有类别都已出分，成绩已经定了。</div>`;
+  }else if(r.status === 'unreachable'){
+    body = `<div class="gsim-w">剩下的全拿满分也只能到 `
+      + `${(r.max || 0).toFixed(2)} 分。</div>`;
+  }else if(r.status === 'possible'){
+    body = `<div class="gsim-goal">剩下的类别加权平均要拿到 `
+      + `<b>${(r.required || 0).toFixed(2)}</b> 分</div>`;
+  }else{
+    body = `<div class="gsim-w">${esc(r.reason || '')}</div>`;
+  }
+
+  let extra = '';
+  if(r.unknown && r.unknown.length){
+    extra = `<div class="gsim-u">还未出分的：`
+      + r.unknown.map(u=>`${esc(u.name)}
+          <span class="dim">(${esc(String(u.weight))}%)</span>`).join('、')
+      + `</div>`;
+  }
+  const fx = r.formula ? `<div class="gsim-f">${esc(r.formula)}</div>` : '';
+  const note = `<div class="gsim-n">已评分不代表该类别已结束；`
+    + `这里是本机估算，不是学校官方成绩。</div>`;
+  return head + body + extra + fx + note;
+}
+
+
+/* ══════════════════════════════════════════════════════════════
+   成绩历史走势（0.5.2）
+
+   ▸ 横轴单位固定为「日」，起止日期可选；可切成按周聚合
+   ▸ 纵轴 4.0 制 GPA
+   ▸ 可切到单科
+   ▸ 真实快照与回算段用不同线型 —— 回算用的是作业截止日期，
+     不是当时的真实记录，必须能一眼看出
+
+   【为什么不画成标准 K 线】
+     GPA 一天最多变一次，OHLC 四个值经常完全相同，
+     画出来是一片「一字板」，信息量低于折线。
+     这里用折线 + 变化点标记，纵轴与粒度同 K 线一致。
+   ══════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════
+   成绩走势（0.5.2）
+
+   ▸ 用 KLineChart v10 画**真正的蜡烛图**（Apache-2.0，见 web/vendor/）
+     参照 CampusDesk 的做法：OHLC + 均线 + 成交量 + 多时间粒度
+   ▸ 每根蜡烛的含义（与行情图一致）：
+        开 = 上一周期收盘（首根取周期内第一个值）
+        高 / 低 = 周期内极值
+        收 = 周期内最后一个值
+        量 = 该周期新增的成绩条数
+   ▸ 两种折算口径可切：
+        「分段折算」按公开未加权 4.0 表逐档换算（与 GPA 页一致）
+        「线性折算」用 分数÷100×4，曲线更平滑，但不是通行算法
+   ▸ 真实快照与回算段：回算那一段是近似值，
+     所以给一个「只看真实记录」开关，打开就只用有快照的点
+
+   【为什么改用蜡烛图】
+     起先是手绘的折线 SVG，观感与专业图表差距明显。
+     CampusDesk 用的是 KLineChart 库 —— 同一个库能直接得到
+     蜡烛、均线、十字光标、缩放的成熟效果，没必要自己重画。
+   ══════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════
+   成绩走势（0.5.2）
+
+   形态：**逐日 GPA 的折线，用 K 柱呈现**。
+     每根柱：开 = 前一日 GPA，收 = 当日 GPA，涨绿跌红。
+     柱体本身表达「今天比昨天变了多少」，不做行情终端那一套。
+
+   刻意去掉的东西（会让画面花眼）：
+     · 均线（MA5/MA10）
+     · 成交量副图
+     · 最高/最低影线 —— 只留柱体
+     · 十字光标上的价格标注、跟随光标的 OHLC 提示
+
+   保留的交互只有一个：
+     鼠标划到某根柱 → 弹卡片，写清「当天拿到哪几个成绩、开收各是多少、涨跌几 %」。
+
+   另有一个「折叠持平日」开关：GPA 没变的日子不占位置（默认关闭）。
+
+   【数据怎么来】
+     首次打开：后端按截止日期把全部成绩排好，逐日算出 GPA，一次性生成序列
+              并写入 data/gpa_history.json。
+     之后：签名（成绩条数 / 最后截止日 / 快照范围）不变就直接读缓存；
+           有新成绩则重算一次 —— 实测全量 16 毫秒、缓存命中 1 毫秒，
+           没有必要做更复杂的增量。
+   ══════════════════════════════════════════════════════════════ */
+let HIST = {
+  data: null, course: '', start: '', end: '',
+  fold: false,               /* 折叠没有成绩的日子 */
+  shape: 'candle',           /* candle = K 柱 | area = 折线 */
+  chart: null, key: '', view: [],
+};
+
+const HIST_PALETTE = { up: '#4f8a70', down: '#c47768', flat: '#9aa3a0' };
+
+function apiHistory(course, start, end, grain) {
+  if (window.pywebview?.api?.history_series)
+    return window.pywebview.api.history_series(course || '', start || '',
+                                               end || '', grain || 'day');
+  return Promise.resolve({ ok: false, error: '当前模式不支持', points: [] });
+}
+
+/*  逐日序列 → 柱体序列。
+    range 固定按「日」，所以 index 就是天数；折叠后间距依然均匀，
+    横轴日期由我们自己画（见 histAxis），不依赖库的时间轴。 */
+function histBars(points, fold) {
+  const rows = (points || [])
+    .map(p => ({ p: p, ts: Date.parse(p.date + 'T00:00:00') }))
+    .filter(r => Number.isFinite(r.ts))
+    .sort((a, b) => a.ts - b.ts);
+  const out = [];
+  let prev = null;
+  for (const r of rows) {
+    const close = Number(r.p.gpa);
+    if (!Number.isFinite(close)) continue;
+    const open = prev == null ? close : prev;
+    prev = close;
+    /*  ★ 只折叠「当天没有任何成绩」的日子 ★
+          现在的口径是「GPA 只由成绩算出来」，所以：
+            · 有成绩的日子 → GPA 可能变、也可能恰好抵消，都要留着
+            · 没成绩的日子 → GPA 数学上不可能变，折掉不影响信息
+          这样折叠掉的一定是「什么都没发生」的日子，
+          不会把「其实出了分」的那天藏起来。 */
+    const hasGrades = !!(r.p.grades && r.p.grades.length);
+    if (fold && out.length && !hasGrades) continue;
+    out.push({
+      p: r.p,
+      open: open,
+      close: close,
+      first: out.length === 0,     /* 首日没有「前一天」可比 */
+      changePct: out.length === 0 ? 0 : (open ? ((close - open) / open) * 100 : 0),
+    });
+  }
+  return out;
+}
+
+function histCardHTML() {
+  const d = HIST.data;
+  const names = (d && d.course_names) || [];
+  const nPts = (d && d.total) || 0;
+  const opts = ['<option value="">全部课程（总览）</option>']
+    .concat(names.map(n =>
+      `<option value="${esc(n)}"${n === HIST.course ? ' selected' : ''}>${esc(n)}</option>`))
+    .join('');
+
+  return `<div class="sec histsec"><div class="sechead">
+      <span class="t">${icon('i-chart','sm inl')}成绩走势</span>
+      <span class="cnt">${nPts ? nPts + ' 天' : '—'}</span>
+      <span class="flex"></span></div>
+    <div class="secinner">
+      <div class="histbar">
+        <label class="histlb">从<input type="date" id="histStart" value="${esc(HIST.start)}"></label>
+        <label class="histlb">到<input type="date" id="histEnd" value="${esc(HIST.end)}"></label>
+        <select class="histsel" id="histCourse">${opts}</select>
+        <button class="histrec ${HIST.fold ? 'on' : ''}" id="histFold"
+          title="打开后，当天没有新成绩的日子不占位置（有成绩的一天一定保留）">
+          <span class="dot"></span>折叠持平日</button>
+        <div class="histseg" id="histShape">
+          <button data-shape="candle" class="${HIST.shape === 'candle' ? 'on' : ''}">柱</button>
+          <button data-shape="area" class="${HIST.shape === 'area' ? 'on' : ''}">折线</button>
+        </div>
+      </div>
+      <div class="histchart" id="histWrap">
+        <div class="histcv" id="histChart"></div>
+        <div class="histaxis" id="histAxis"></div>
+        <div class="histlegend">
+          <span><i class="lg" style="background:${HIST_PALETTE.up}"></i>上升</span>
+          <span><i class="lg" style="background:${HIST_PALETTE.down}"></i>下降</span>
+          <span class="lghint">下沿 = 前一天，上沿 = 当天 · 悬停可看来源与当天成绩</span>
+        </div>
+        <!--  悬停卡片必须放在 .histchart 内部：
+              它按 left/top 定位，而 .histchart 是 position:relative ——
+              放在外面时它的定位原点是另一个元素，于是卡片飘到很远的地方。 -->
+        <div class="histtip" id="histTip" hidden></div>
+      </div>
+      ${d && d.note ? `<div class="histnote">${esc(d.note)}</div>` : ''}
+    </div></div>`;
+}
+
+function histDispose() {
+  if (HIST.chart) {
+    try { window.klinecharts.dispose(HIST.chart); } catch (_) {}
+    HIST.chart = null;
+    HIST.key = '';
+  }
+}
+
+/*  横轴日期我们自己画：这样折叠后仍然均匀，不会因为跳日而出现空隙 */
+function histAxisRender(bars) {
+  const el = $('#histAxis');
+  if (!el) return;
+  if (!bars.length) { el.innerHTML = ''; return; }
+  const picks = bars.length <= 4
+    ? bars.map((b, i) => i)
+    : [0, Math.floor((bars.length - 1) / 3),
+       Math.floor((bars.length - 1) * 2 / 3), bars.length - 1];
+  const uniq = [...new Set(picks)];
+  el.innerHTML = uniq.map(i => {
+    const left = bars.length === 1 ? 50 : (i / (bars.length - 1)) * 100;
+    const md = bars[i].p.date.slice(5);
+    let style = `left:${left}%`;
+    if (i === 0) style += ';transform:translateX(0)';
+    else if (i === uniq[uniq.length - 1]) style += ';transform:translateX(-100%)';
+    else style += ';transform:translateX(-50%)';
+    return `<span style="${style}">${esc(md)}</span>`;
+  }).join('');
+}
+
+function histMount() {
+  const box = $('#histChart');
+  if (!box) return;
+  const lib = window.klinecharts;
+  if (!lib || typeof lib.init !== 'function') {
+    box.innerHTML = `<div class="histempty">图表库没有加载。</div>`;
+    return;
+  }
+  const d = HIST.data || {};
+  const bars = histBars(d.points || [], HIST.fold);
+  HIST.view = bars;
+  histAxisRender(bars);
+
+  if (!bars.length) {
+    histDispose();
+    box.innerHTML = `<div class="histempty">这段时间没有可画的数据。</div>`;
+    return;
+  }
+
+  /*  用序号当时间戳：横轴由我们自己的 .histaxis 画，
+      这样「折叠」不会在图上留下空洞。 */
+  /*  钳制在 0~4：GPA 满分就是 4.0，任何超出的值都是算错了 */
+  const clamp4 = (v) => Math.max(0, Math.min(4, Number(v) || 0));
+  const rows = bars.map((b, i) => ({
+    timestamp: (i + 1) * 86400000,
+    /*  只留柱体：把高低收紧到开收之间，影线长度归零 */
+    open: clamp4(b.open),
+    high: Math.max(clamp4(b.open), clamp4(b.close)),
+    low: Math.min(clamp4(b.open), clamp4(b.close)),
+    close: clamp4(b.close),
+    volume: 0,
+  }));
+  const maxVal = rows.reduce((m, r) => Math.max(m, r.high), 0);
+
+  const key = JSON.stringify([rows.length, HIST.fold, HIST.shape,
+                              box.clientWidth, rows[0] && rows[0].close,
+                              rows.length && rows[rows.length - 1].close]);
+  if (HIST.chart && HIST.key === key) { HIST.chart.resize(); return; }
+  histDispose();
+  box.innerHTML = '';
+
+  const chart = lib.init(box, {
+    layout: {
+      barSpaceLimit: { min: 3, max: 26 },
+      /*  ★ 纵轴不能超过 4.0 ★
+          GPA 满分就是 4.0，但库默认在上方留 22% 空白，
+          数据顶到 4.0 时算出来的刻度会出现 4.02 这种不存在的分数。
+          所以贴近满分时把上方留白压成 0，让轴顶正好落在 4.00。 */
+      yAxis: {
+        scrollZoomEnabled: false,
+        gap: { top: maxVal >= 3.999 ? 0 : 0.18, bottom: 0.16 },
+      },
+    },
+    zoomAnchor: 'last_bar',
+    locale: 'zh-CN',
+  });
+  if (!chart) { box.innerHTML = `<div class="histempty">图表初始化失败。</div>`; return; }
+  HIST.chart = chart;
+  HIST.key = key;
+
+  chart.setZoomEnabled(false);
+  chart.setSymbol({ ticker: 'GPA', pricePrecision: 2, volumePrecision: 0 });
+  chart.setPeriod({ type: 'day', span: 1 });
+  const isArea = HIST.shape === 'area';
+  chart.setStyles({
+    candle: {
+      /*  柱：实心蜡烛（只留柱体）；折线：面积图 */
+      type: isArea ? 'area' : 'candle_solid',
+      /*  面积图样式（v10 用 area，旧版用 areaStyle，两个都给上） */
+      area: {
+        lineColor: '#4a7ec8', lineSize: 2, smooth: true,
+        backgroundColor: 'rgba(74,126,200,.12)',
+      },
+      areaStyle: {
+        lineColor: '#4a7ec8', lineSize: 2, smooth: true,
+        backgroundColor: 'rgba(74,126,200,.12)',
+      },
+      bar: {
+        upColor: HIST_PALETTE.up, downColor: HIST_PALETTE.down,
+        noChangeColor: HIST_PALETTE.flat,
+        upBorderColor: HIST_PALETTE.up, downBorderColor: HIST_PALETTE.down,
+        noChangeBorderColor: HIST_PALETTE.flat,
+        upWickColor: HIST_PALETTE.up, downWickColor: HIST_PALETTE.down,
+        noChangeWickColor: HIST_PALETTE.flat,
+      },
+      /*  去掉最高/最低标注与最后一根的价格线 —— 只留柱子 */
+      priceMark: { high: { show: false }, low: { show: false },
+                   last: { show: false } },
+      /*  去掉跟随光标的 OHLC 提示 */
+      tooltip: { showRule: 'none' },
+    },
+    indicator: { tooltip: { showRule: 'none' } },
+    /*  去掉十字光标（不再用鼠标位置显示 GPA） */
+    crosshair: { show: false },
+    /*  时间轴文字由我们自己画 */
+    xAxis: { tickText: { show: false }, tickLine: { show: false } },
+    grid: {
+      show: true,
+      horizontal: { show: true, color: 'rgba(150,150,150,.18)', size: 1,
+                    style: 'dashed', dashedValue: [2, 3] },
+      vertical: { show: false },
+    },
+  });
+
+  /*  ★ 柱子必须铺满整个宽度 ★
+      原来 barSpace 上限写死 26，柱子一少（比如折叠后剩 17 根）总宽就只有
+      440px，而图宽约 1150px —— klinecharts 默认把数据**右对齐**，
+      左侧于是空出一大块，看起来像「开头那段数据没了」。
+      现在按可用宽度反算 barSpace，并把右侧空白距离设为 0。 */
+  const plotW = Math.max(120, box.clientWidth - 58);   /* 减去右侧刻度宽度 */
+  /*  ★ 柱宽封顶，剩余空间全部留在右边 → 整体靠左 ★
+
+      两种难看的情况都要避开：
+        · 柱子多时按宽度算会太细 → 下限 3px 保底
+        · 柱子少时按宽度算会太宽（折叠后就剩十几根，能到 70px）→ 上限 26px
+      封顶之后总宽不够铺满，就把**剩余空间全推到右侧**，
+      于是数据从左边开始画 —— 时间序列本来就该从左往右读。 */
+  const barSpace = Math.max(3, Math.min(26, plotW / Math.max(1, rows.length)));
+  chart.setBarSpace(barSpace);
+  const remainRight = Math.max(0, plotW - rows.length * barSpace);
+  try { chart.setOffsetRightDistance(remainRight); } catch (_) {}
+  try { chart.setMaxOffsetRightDistance(plotW); } catch (_) {}
+  try { chart.setMaxOffsetLeftDistance(0); } catch (_) {}
+  chart.setDataLoader({
+    getBars: params => params.callback(
+      params.type === 'init' ? rows : [], { backward: false, forward: false }),
+  });
+  chart.resize();
+  histBindTip(box, chart);
+  histBindWheel();
+}
+
+/*  悬停卡片：划到哪根柱，就说清那天的成绩与开收涨跌 */
+function histBindTip(box, chart) {
+  const tip = $('#histTip');
+  if (!tip) return;
+  box.onmousemove = (e) => {
+    const r = box.getBoundingClientRect();
+    let idx = -1;
+    try {
+      const res = chart.convertFromPixel(
+        { x: e.clientX - r.left, y: e.clientY - r.top }, { paneId: 'candle_pane' });
+      idx = res && typeof res.dataIndex === 'number' ? res.dataIndex : -1;
+    } catch (_) { idx = -1; }
+    const b = HIST.view[idx];
+    if (!b) { tip.hidden = true; return; }
+
+    const up = b.close > b.open + 1e-9;
+    const down = b.close < b.open - 1e-9;
+    const col = up ? HIST_PALETTE.up : (down ? HIST_PALETTE.down : HIST_PALETTE.flat);
+    const arrow = up ? '▲' : (down ? '▼' : '—');
+    const pct = Math.abs(b.changePct).toFixed(2);
+    const gs = b.p.grades || [];
+    const total = b.p.grades_total || gs.length;
+
+    /*  两段来源不同，卡片上必须标清楚：
+          记录 = 当天界面显示的数字；推算 = 由成绩倒推的近似值 */
+    const isRec = b.p.source === 'record';
+    const srcTag = isRec
+      ? '<span class="htt-src rec">记录</span>'
+      : '<span class="htt-src est">推算</span>';
+
+    /*  首日没有「前一天」，写 0.00% 会让人以为「拿了成绩却没变化」 */
+    let h = b.first
+      ? `<div class="htt-top">
+          <span class="htt-date">${esc(b.p.date)}</span>${srcTag}
+          <span class="htt-pct" style="color:var(--muted)">首日</span>
+        </div>
+        <div class="htt-oc">收 <b style="color:${col}">${b.close.toFixed(2)}</b>
+          <span class="htt-arw" style="opacity:.6">· 起点</span></div>`
+      : `<div class="htt-top" style="color:${col}">
+          <span class="htt-date">${esc(b.p.date)}</span>${srcTag}
+          <span class="htt-pct">${arrow} ${pct}%</span>
+        </div>
+        <div class="htt-oc">开 <b>${b.open.toFixed(2)}</b>
+          <span class="htt-arw">→</span> 收 <b style="color:${col}">${b.close.toFixed(2)}</b></div>`;
+
+    if (gs.length) {
+      h += `<div class="htt-gs">当天获得 ${total} 个成绩</div><ul class="htt-list">`;
+      for (const g of gs) {
+        h += `<li><span class="hg-n">${esc(g.name || '')}</span>`
+          + `<span class="hg-s">${esc(g.score || '')}</span>`
+          + `<span class="hg-c">${esc((g.course || '').slice(0, 16))}</span></li>`;
+      }
+      if (total > gs.length) h += `<li class="htt-more">…还有 ${total - gs.length} 个</li>`;
+      h += `</ul>`;
+    } else if (isRec) {
+      /*  记录段：数值来自当天界面显示，与「有没有出分」没有必然对应 */
+      h += `<div class="htt-none">当天没有新成绩；数值取当日实际记录</div>`;
+    } else {
+      /*  推算段：没有成绩，推算值不可能变 */
+      h += `<div class="htt-none">当天没有新成绩，推算值不变</div>`;
+    }
+
+    tip.innerHTML = h;
+    tip.hidden = false;
+    /*  贴着光标，靠右就翻到左边 */
+    const tw = tip.offsetWidth || 240;
+    let x = e.clientX - r.left + 14;
+    if (x + tw > r.width - 8) x = Math.max(4, e.clientX - r.left - tw - 14);
+    tip.style.left = x + 'px';
+    tip.style.top = Math.max(4, e.clientY - r.top + 12) + 'px';
+  };
+  box.onmouseleave = () => { tip.hidden = true; };
+}
+
+/*  ★ 图表内的滚轮必须滚页面，不能被图表吃掉 ★
+
+    klinecharts 在容器上挂了 `wheel`（`{passive:false}` + preventDefault），
+    鼠标停在图上就滚不动页面 —— 图比窗口还高，体验很差。
+
+    【为什么以前那条拦截没生效】
+      原来拦在 `#histWrap` 的捕获阶段，判据是
+          Math.abs(deltaY) >= Math.abs(deltaX)
+      触控板两指滚动时 deltaX / deltaY 经常接近，这条判据会漏判 ——
+      漏了就等于没拦，事件照样落到图表上被 preventDefault。
+
+    【现在的做法】
+      在 **document** 上以捕获阶段拦：它比任何元素都早收到事件，
+      target 落在图表内的**纯滚动**（未按 Ctrl/Shift/Alt）一律 stopPropagation。
+      **不** preventDefault —— 页面默认滚动照常发生。
+      按住 Ctrl（缩放）/ Shift（横向）时才放行，留给图表自己处理。
+
+    ★ 用 document 而不是 #histWrap：图表重绘会换掉 #histWrap 的克隆，
+      绑在元素上的监听容易漏；绑在 document 上只绑一次，永久有效。 */
+function histBindWheel() {
+  if (window.__histWheelBound) return;
+  window.__histWheelBound = true;
+  document.addEventListener('wheel', (e) => {
+    const wrap = document.getElementById('histWrap');
+    if (!wrap || !e.target || !wrap.contains(e.target)) return;
+    //  Ctrl/⌘ = 缩放网页；Shift = 横向；这些不该被我们吞掉
+    if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+    e.stopPropagation();          /* 图表收不到，就不会 preventDefault */
+  }, { capture: true, passive: false });
+}
+
+function loadHistory() {
+  apiHistory(HIST.course, HIST.start, HIST.end, 'day').then(d => {
+    /*  只用分段口径（4.0 档位）。曾经还有个「线性」口径，
+        两种折算画出来肉眼几乎一样、还让人以为是切换坏了，已经去掉。 */
+    HIST.data = d || { points: [], course_names: [] };
+    const host = $('#page-gpa');
+    const box = host ? host.querySelector('.histsec') : null;
+    if (box && box.parentNode) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = histCardHTML();
+      box.parentNode.replaceChild(tmp.firstElementChild, box);
+    }
+    histDispose();
+    bindHistory();
+    setTimeout(histMount, 30);
+  }).catch(() => {});
+}
+
+function bindHistory() {
+  const host = $('#page-gpa');
+  if (!host) return;
+  const s = host.querySelector('#histStart');
+  const e = host.querySelector('#histEnd');
+  const c = host.querySelector('#histCourse');
+  if (s && !s.dataset.b) {
+    s.dataset.b = '1';
+    s.addEventListener('change', () => { HIST.start = s.value; loadHistory(); });
+  }
+  if (e && !e.dataset.b) {
+    e.dataset.b = '1';
+    e.addEventListener('change', () => { HIST.end = e.value; loadHistory(); });
+  }
+  if (c && !c.dataset.b) {
+    c.dataset.b = '1';
+    c.addEventListener('change', () => { HIST.course = c.value; loadHistory(); });
+  }
+  const fd = host.querySelector('#histFold');
+  if (fd && !fd.dataset.b) {
+    fd.dataset.b = '1';
+    fd.addEventListener('click', () => {
+      HIST.fold = !HIST.fold;
+      fd.classList.toggle('on', HIST.fold);
+      histMount();
+    });
+  }
+  const sm = host.querySelector('#histShape');
+  if (sm && !sm.dataset.b) {
+    sm.dataset.b = '1';
+    sm.querySelectorAll('[data-shape]').forEach(b => {
+      b.addEventListener('click', () => {
+        if (HIST.shape === b.dataset.shape) return;
+        HIST.shape = b.dataset.shape;
+        sm.querySelectorAll('[data-shape]').forEach(x =>
+          x.classList.toggle('on', x === b));
+        histMount();
+      });
+    });
+  }
+  window.addEventListener('resize', () => {
+    if (HIST.chart) { try { HIST.chart.resize(); } catch (_) {} }
+  }, { passive: true });
+}
+
+function ensureHistCard() {
+  const host = $('#page-gpa');
+  if (!host) return;
+  if (host.querySelector('.histsec')) { bindHistory(); return; }
+  const inner = host.querySelector('.secinner') || host;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = histCardHTML();
+  inner.parentNode.insertBefore(tmp.firstElementChild, inner);
+  bindHistory();
 }
 
 function renderGpaPage(){
@@ -165,6 +968,8 @@ function renderGpaPage(){
 
   const off = s.gpa_official;          /* {value, scale, label} 或 null */
   const est = s.gpa_estimated;         /* 数字或 null */
+  const wEst = s.gpa_estimated_weighted;  /* 加权参考（AP/IB/HL +1.0，Honors/SL +0.5） */
+  const lEst = s.gpa_estimated_linear;    /* 等比参考（÷100×4，仅供对照） */
   const mp  = s.mean_percent;
   const n   = s.gpa_estimated_count || 0;
 
@@ -177,6 +982,10 @@ function renderGpaPage(){
   const useEst = (est != null) ? est
                : (_pcts.length
                   ? Math.round(_pcts.reduce((a,p)=>a+estOf(p),0)/_pcts.length*100)/100
+                  : null);
+  const useLEst = (lEst != null) ? lEst
+               : (_pcts.length
+                  ? Math.round(_pcts.reduce((a,p)=>a+Math.min(Math.max(p/25,0),4),0)/_pcts.length*100)/100
                   : null);
 
   /* —— 主卡：优先展示官方值 —— */
@@ -202,6 +1011,10 @@ function renderGpaPage(){
       <div><b>${useMp!=null?useMp.toFixed(1)+'%':'—'}</b>平均分</div>
       <div><b>${useN}</b>计入门数</div>
       <div><b>${courses.length}</b>课程总数</div>
+      ${wEst!=null?`<div title="难度加分参考：课程名带 AP/IB/HL +1.0，Honors/SL +0.5；学校不一定这么算">
+        <b>${wEst.toFixed(2)}</b>加权参考</div>`:''}
+      ${useLEst!=null?`<div title="等比参考：每门 分数÷100×4 再平均。不是学校通行算法，中低分会偏高，仅供对照">
+        <b>${useLEst.toFixed(2)}</b>等比参考</div>`:''}
     </div>
   </div>`;
 
@@ -272,6 +1085,16 @@ function renderGpaPage(){
           <span class="cv" style="color:${cc}">${ct.percent.toFixed(1)}%</span>
         </div>`;
       }
+      /*  目标模拟（0.5.2）——“想考到 X 分，剩下的得拿多少”。
+          只有读到类别权重时才显示入口（否则算了也是空的）。 */
+      h += `<div class="gbody" id="gbody-${esc(key)}">
+        <div class="gbodyrow">
+          <input class="gin" type="number" min="0" max="100" step="0.5"
+            id="gtg-${esc(key)}" placeholder="想考到多少分？">
+          <button class="gbtn" data-gsim="${esc(key)}">算一下</button>
+        </div>
+        <div class="gsim" id="gsim-${esc(key)}"></div>
+      </div>`;
     }
 
     /* 最近几次成绩 */
@@ -307,6 +1130,9 @@ function renderGpaPage(){
 
   host.innerHTML = h;
   bindGpaPage();
+  /*  成绩走势卡（0.5.2）：插在最上面，数据异步补上 */
+  ensureHistCard();
+  loadHistory();
 }
 
 /* 绑定 GPA 页的交互（展开 / 跳转） */
@@ -324,16 +1150,13 @@ function gpaNote(hasOff){
       <p>
         ${hasOff
           ? '来自学校页面的正式标注，以学校成绩单为准。'
-          : '本机估算：每门课的总评按 90/80/70/60 换算成 4.0，再等权平均。不是学校口径。'}
+          : '本机估算：每门课的总评按公开的未加权 4.0 标准表逐档换算，再等权平均。不是学校口径。'}
       </p>
       <p class="gnote-dim">未计入：学分、AP/IB 加权、重修、未出总评的课程。</p>
       <div class="gscale">
-        <span><b>93+</b> → 4.0</span><span><b>90+</b> → 3.7</span>
-        <span><b>87+</b> → 3.3</span><span><b>83+</b> → 3.0</span>
-        <span><b>80+</b> → 2.7</span><span><b>77+</b> → 2.3</span>
-        <span><b>73+</b> → 2.0</span><span><b>70+</b> → 1.7</span>
-        <span><b>67+</b> → 1.3</span><span><b>63+</b> → 1.0</span>
-        <span><b>60+</b> → 0.7</span><span><b>&lt;60</b> → 0</span>
+        ${GPA_BANDS.map(([lo,g]) =>
+          `<span><b>${lo}+</b> → ${g.toFixed(1)}</span>`).join('')}
+        <span><b>&lt;${GPA_BANDS[GPA_BANDS.length-1][0]}</b> → 0</span>
       </div>
     </div>
   </div>`;
@@ -382,6 +1205,37 @@ function bindGpaPage(){
     });
   });
 
+  /*  目标模拟（0.5.2）—— 「算一下」按钮与回车
+      ★ 数据完全取自已抓到的类别权重，不额外联网。 */
+  host.querySelectorAll('[data-gsim]').forEach(b=>{
+    if(b.dataset.gsimbound) return;
+    b.dataset.gsimbound = '1';
+    const run = async (e)=>{
+      e.stopPropagation();
+      const key = b.dataset.gsim;
+      const inp = document.getElementById('gtg-' + key);
+      const box = document.getElementById('gsim-' + key);
+      if(!inp || !box) return;
+      const v = parseFloat(inp.value);
+      if(!Number.isFinite(v)){
+        box.innerHTML = `<span class="gsim-w">先填个目标分。</span>`;
+        return;
+      }
+      box.innerHTML = `<span class="gsim-w">算着呢……</span>`;
+      try{
+        const r = await apiGoalSim(key, v);
+        box.innerHTML = goalSimHTML(r);
+      }catch(err){
+        box.innerHTML = `<span class="gsim-w">算不了：${esc(String(err))}</span>`;
+      }
+    };
+    b.addEventListener('click', run);
+    const inp = document.getElementById('gtg-' + b.dataset.gsim);
+    if(inp) inp.addEventListener('keydown', e=>{
+      if(e.key === 'Enter'){ e.preventDefault(); run(e); }
+    });
+  });
+
   /* 「GPA 怎么来的」折叠：跟课程明细同一套量高动画 */
   const gh = host.querySelector('[data-gwhy]');
   const gb = host.querySelector('[data-gwhybody]');
@@ -406,74 +1260,6 @@ function bindGpaPage(){
 }
 
 /* 单门课程一行（含可展开的明细） */
-function gpaRow(c){
-  const p = c.overall_percent;
-  const lv = c.overall_level || '';
-  const col = p != null ? pctColor(p) : lvlColor(lv);
-  const key = c.name || '';
-  const isOpen = !!gpaOpen[key];
-  const estV = estOf(p);
-  const cats = (c.categories || []).filter(x => x.percent != null);
-  const graded = (c.tasks || [])
-    .filter(t => t.graded && t.score && t.score !== 'N/A').slice(0, 4);
-
-  let h = `<div class="grow${isOpen?' open':''}" data-grow="${esc(key)}"
-    style="--c:${col}" title="点击查看明细">
-    <div class="gname">${esc(c.name || '未命名课程')}
-      ${c.teacher ? `<i>${esc(c.teacher)}</i>` : ''}</div>
-    ${lv ? `<span class="glv" style="--c:${col}">${esc(lv)}</span>`
-         : `<span class="glv na">—</span>`}
-    ${p != null
-      ? `<span class="gpct" style="--c:${col}">${p.toFixed(1)}%</span>`
-      : `<span class="gno">—</span>`}
-    <span class="garw">▶</span>
-  </div>
-  <div class="gdetail" data-gdet="${esc(key)}"><div class="gdin">`;
-
-  if(estV != null){
-    h += `<div class="gdtitle">${icon('i-award','sm inl')}单科估算</div>
-      <div style="font-size:11.3px;color:var(--muted);margin-bottom:12px">
-        按 ${p.toFixed(1)}% 换算约 <b style="color:var(--text)">${estV.toFixed(2)}</b> / 4.0
-        <span style="color:var(--dim)">（本机换算，非学校口径）</span></div>`;
-  }
-
-  if(cats.length){
-    h += `<div class="gdtitle">${icon('i-list','sm inl')}分类占比</div>`;
-    for(const ct of cats.slice(0, 6)){
-      const w = Math.max(3, Math.min(100, ct.percent));
-      const cc = pctColor(ct.percent);
-      h += `<div class="gcat" style="color:${cc}">
-        <span class="cn">${esc(ct.name || '未命名分类')}${
-          ct.weight ? `<span style="color:var(--dim)"> · 权重 ${esc(String(ct.weight))}%</span>` : ''}</span>
-        <span class="cbar"><i style="width:${w}%"></i></span>
-        <span class="cv" style="color:${cc}">${ct.percent.toFixed(1)}%</span>
-      </div>`;
-    }
-  }
-
-  if(graded.length){
-    h += `<div class="gdtitle" style="margin-top:13px">
-      ${icon('i-note','sm inl')}最近成绩</div>`;
-    for(const t of graded){
-      const tc = t.percent != null ? pctColor(t.percent) : 'var(--text)';
-      h += `<div class="gitem">
-        <span class="gt">${esc(t.title || '')}</span>
-        <span class="gs" style="color:${tc}">${esc(t.score)}</span>
-      </div>`;
-    }
-  }
-
-  if(!cats.length && !graded.length){
-    h += `<div class="gempty">这门课还没有可以展开的明细。</div>`;
-  }
-
-  h += `<button class="fretry" style="margin-top:12px"
-      data-gopen="${esc(c.url || '')}">
-    ${icon('i-external','sm')}在 ManageBac 中打开</button>`;
-
-  return h + `</div></div>`;
-}
-
 function renderStats(tasks){
   const t = tasks, s = DATA.summary||{};
   const todo = t.filter(x=>!x.completed);
@@ -555,12 +1341,17 @@ function taskCards(list, opts){
         d<=3?'var(--orange)': d<=7?'var(--yellow)':'var(--green)';
     const cid = t.class_id || '', tid = t.class_id ? (t.url.match(/core_tasks\/(\d+)/)||[])[1] : '';
 
-    /* 已完成标签：手动标记的单独说明，避免和「已提交」混淆 */
+    /*  状态标签（我已完成 / 已提交 / 已评分）——
+        ★ 它**不放**在底部的 .tags 里，而是单独渲染到卡片右上角。
+        原因：底部标签行动态增减（截止日 / 分类 / 类型 / 分数…），
+        状态标签混在里面会被挤来挤去，长标题时还容易和
+        「未提交」「截止 xxx」撞在一起，看着很乱。
+        它是个**状态**，不是「标签之一」—— 放右上角最合适。 */
     const doneTag = t.manual
-      ? `<span class="tag ok" title="你自己标记的完成，只在本机生效">${icon('i-check','sm')}我已完成</span>`
-      : (t.submitted ? `<span class="tag ok">${icon('i-check','sm')}已提交</span>`
-         : (t.graded ? `<span class="tag ok">${icon('i-check','sm')}已评分</span>`
-            : `<span class="tag ok">${icon('i-check','sm')}已完成</span>`));
+      ? `<span class="st" title="你自己标记的完成，只在本机生效">${icon('i-check','sm')}我已完成</span>`
+      : (t.submitted ? `<span class="st">${icon('i-check','sm')}已提交</span>`
+         : (t.graded ? `<span class="st">${icon('i-check','sm')}已评分</span>`
+            : `<span class="st">${icon('i-check','sm')}已完成</span>`));
 
     /* 按钮：未完成 → 显示「我已完成」（受 showMark 控制）
              已完成且是手动标记 → 显示「撤销」（永远显示） */
@@ -579,14 +1370,17 @@ function taskCards(list, opts){
        —— 避免每个卡片都挂一个用不上的 ⤓ */
     const hasDl = !!t.has_attachment && !!tid;
 
-    return `<div class="card${t.manual?' manual-marked':''}" style="--c:${col}" data-url="${esc(t.url)}">
-      ${hasDl?`<button class="dlbtn" title="下载本任务附件"
-        data-dl="${esc(cid)}|${esc(tid)}|${esc(t.title)}">${icon('i-download','sm')}</button>`:''}
-      ${mkBtn}
+    return `<div class="card${t.manual?' manual-marked':''}${t.completed?' isdone':''}" style="--c:${col}" data-url="${esc(t.url)}">
+      <div class="cardacts">
+        ${t.completed ? doneTag : ''}
+        ${hasDl?`<button class="dlbtn" title="下载本任务附件"
+          data-dl="${esc(cid)}|${esc(tid)}|${esc(t.title)}">${icon('i-download','sm')}</button>`:''}
+        ${mkBtn}
+      </div>
       ${t.course?`<div class="cname"><span class="dot"></span>${esc(t.course)}</div>`:''}
       <div class="h">${esc(t.title)}</div>
       <div class="tags">
-        ${t.completed ? doneTag : dueTag(d)}
+        ${t.completed ? '' : dueTag(d)}
         ${t.due_date?`<span class="tag dim">截止 ${esc(t.due_date)}</span>`:''}
         ${t.category?`<span class="tag cat">${esc(t.category)}</span>`:''}
         ${t.kind?`<span class="tag">${esc(t.kind)}</span>`:''}
@@ -695,93 +1489,11 @@ function courseBlock(c, idx){
         <button class="fbtn" id="df-${esc(c.class_id)}"
           data-dlall="${esc(c.class_id)}|${esc(c.name)}">${icon('i-download','sm')}全部下载</button>
       </div>
-      <div class="filesbox" id="fbox-${esc(c.class_id)}"></div>
     </div>
   </div>`;
 }
 
 /* ══════════ 图表 ══════════ */
-function chartCourses(){
-  const cs = (DATA.courses||[]).filter(c=>c.overall_percent!=null);
-  if(!cs.length) return `<div class="empty">暂无成绩数据</div>`;
-  const rowH=25, W=100, H=cs.length*rowH+6;
-  const bars = cs.map((c,i)=>{
-    const y=i*rowH+3, w=Math.max(2,(c.overall_percent/100)*W);
-    const idx = (DATA.courses||[]).indexOf(c);
-    return `<text x="0" y="${y+8}" fill="#8a8171" font-size="8">${esc(c.name.slice(0,19))}</text>
-      <rect x="0" y="${y+11}" width="${W}" height="5" rx="2.5" fill="#ede5d6"/>
-      <rect x="0" y="${y+11}" width="${w}" height="5" rx="2.5" fill="${colorOf(idx)}">
-        <animate attributeName="width" from="0" to="${w}" dur=".6s" fill="freeze"/>
-      </rect>
-      <text x="${W+2}" y="${y+16}" fill="${pctColor(c.overall_percent)}"
-        font-size="8.5" font-weight="700">${c.overall_percent.toFixed(1)}%</text>
-      <text x="${W+2}" y="${y+8}" fill="${c.overall_level?lvlColor(c.overall_level):'#a89e8b'}"
-        font-size="8" font-weight="700">${esc(c.overall_level||'')}</text>`;
-  }).join('');
-  return `<div class="cbox">
-    <div class="ct">各科总评（网页原始数据）</div>
-    <svg viewBox="-1 0 ${W+24} ${H}" width="100%" height="${H*1.4}"
-      style="overflow:visible">${bars}</svg>
-  </div>`;
-}
-
-function chartCatAvg(){
-  /* 所有课程的分类平均分横向对比 */
-  const map = new Map();
-  for(const c of (DATA.courses||[])){
-    for(const cat of (c.categories||[])){
-      if(cat.name.toLowerCase()==='overall' || cat.percent==null) continue;
-      if(!map.has(cat.name)) map.set(cat.name, []);
-      map.get(cat.name).push(cat.percent);
-    }
-  }
-  const rows = [...map.entries()]
-    .map(([k,v])=>({name:k, avg:v.reduce((a,b)=>a+b,0)/v.length, n:v.length}))
-    .sort((a,b)=>b.avg-a.avg);
-  if(!rows.length) return '';
-  const rowH=21, W=100, H=rows.length*rowH+6;
-  const bars = rows.map((r,i)=>{
-    const y=i*rowH+3, w=Math.max(2,(r.avg/100)*W);
-    return `<text x="0" y="${y+9}" fill="#8a8171" font-size="8">${esc(r.name.slice(0,17))}</text>
-      <rect x="0" y="${y+12}" width="${W}" height="4.5" rx="2.2" fill="#ede5d6"/>
-      <rect x="0" y="${y+12}" width="${w}" height="4.5" rx="2.2" fill="${pctColor(r.avg)}">
-        <animate attributeName="width" from="0" to="${w}" dur=".6s" fill="freeze"/>
-      </rect>
-      <text x="${W+2}" y="${y+16}" fill="${pctColor(r.avg)}" font-size="8"
-        font-weight="700">${r.avg.toFixed(1)}%</text>`;
-  }).join('');
-  return `<div class="cbox">
-    <div class="ct">各分类平均分汇总</div>
-    <svg viewBox="-1 0 ${W+24} ${H}" width="100%" height="${H*1.4}"
-      style="overflow:overflow">${bars}</svg>
-  </div>`;
-}
-
-function chartDue(tasks){
-  const t = (tasks||[]).filter(x=>x.days_left!=null && x.days_left>=-1);
-  if(!t.length) return '';
-  const buckets=[0,1,2,3,4,5,6,7];
-  const cnt = buckets.map(b=>t.filter(x=> b===7 ? x.days_left>=7 : x.days_left===b).length);
-  const mx = Math.max(1,...cnt), W=248, H=58;
-  const bw = W/buckets.length;
-  const bars = buckets.map((b,i)=>{
-    const h=Math.max(2,(cnt[i]/mx)*38), x=i*bw+3, y=42-h;
-    const col = b===0?'#f87171': b<=2?'#fb923c': b<=4?'#fbbf24':'#34d399';
-    return `<rect x="${x}" y="${y}" width="${bw-6}" height="${h}" rx="3" fill="${col}">
-        <animate attributeName="height" from="0" to="${h}" dur=".5s" fill="freeze"/>
-        <animate attributeName="y" from="42" to="${y}" dur=".5s" fill="freeze"/>
-      </rect>
-      ${cnt[i]?`<text x="${x+(bw-6)/2}" y="${y-3}" text-anchor="middle"
-        fill="#8a8171" font-size="7.5">${cnt[i]}</text>`:''}
-      <text x="${x+(bw-6)/2}" y="53" text-anchor="middle" fill="#a89e8b" font-size="7">
-        ${b===7?'7+':b===0?'今天':b+'天'}</text>`;
-  }).join('');
-  return `<div class="cbox">
-    <div class="ct">任务截止分布</div>
-    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H*1.15}">${bars}</svg>
-  </div>`;
-}
-
 /* ══════════ 课表页 ══════════ */
 function hm(iso){
   /* 取时分。兼容两种来源：
@@ -998,12 +1710,19 @@ function applyLook(o){
 
   /* ② 透明度：按比例缩放三个层级
       不透明度越高 → alpha 越大；限制在 0.45~1.0，
-       太低会导致文字看不清（背景透过来太花）。 */
+       太低会导致文字看不清（背景透过来太花）。
+
+      ★ 用 --tintRGB 而不是写死「255,253,248」——
+        换配色（比如浅绿系 / 深色）时玻璃底要跟着变，
+        写死的话卡片永远是米白的，一眼看出没配套。
+        --tintRGB 由 applyTheme() 写入。 */
+  const tint = (getComputedStyle(rt).getPropertyValue('--tintRGB')
+                || '255,253,248').trim() || '255,253,248';
   const k = Math.max(0.45, Math.min(1, o.alpha / 100));
   const f = v => Math.max(0.45, Math.min(1, v * k / (ALPHA_BASE / 100)));
-  rt.style.setProperty('--glass',   `rgba(255,253,248,${f(0.72).toFixed(3)})`);
-  rt.style.setProperty('--glass-2', `rgba(255,253,248,${f(0.55).toFixed(3)})`);
-  rt.style.setProperty('--glass-3', `rgba(255,253,248,${f(0.86).toFixed(3)})`);
+  rt.style.setProperty('--glass',   `rgba(${tint},${f(0.72).toFixed(3)})`);
+  rt.style.setProperty('--glass-2', `rgba(${tint},${f(0.55).toFixed(3)})`);
+  rt.style.setProperty('--glass-3', `rgba(${tint},${f(0.86).toFixed(3)})`);
 
   /* ③ 毛玻璃
       关掉时要把背景变成**不透明实色** —— 只去掉 blur 会留一个
@@ -1012,13 +1731,211 @@ function applyLook(o){
     rt.style.setProperty('--glassBlur', 'saturate(1.7) blur(22px)');
   }else{
     rt.style.setProperty('--glassBlur', 'none');
-    rt.style.setProperty('--glass',   'rgba(255,253,248,0.985)');
-    rt.style.setProperty('--glass-2', 'rgba(255,253,248,0.97)');
-    rt.style.setProperty('--glass-3', 'rgba(255,253,248,1)');
+    rt.style.setProperty('--glass',   `rgba(${tint},0.985)`);
+    rt.style.setProperty('--glass-2', `rgba(${tint},0.97)`);
+    rt.style.setProperty('--glass-3', `rgba(${tint},1)`);
   }
 }
 
 let LOOK = null;
+
+
+/* ══════════ 浏览器选择（0.5.2）══════════
+   之前写死 Edge，且只能手改 data/browser.json —— 一般用户根本不知道有这个文件。
+   现在设置面板里直接选：自动 / Edge / Chrome / Brave / Chromium，
+   并且可以打开「复用日常浏览器的登录」，省掉重新登录。 */
+
+let BROWSER_CUR = 'auto';
+let BROWSER_REUSE = false;
+
+function apiBrowserGet(){
+  if(window.pywebview?.api?.browser_get)
+    return window.pywebview.api.browser_get();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+function apiBrowserSet(browser, reuse){
+  if(window.pywebview?.api?.browser_set)
+    return window.pywebview.api.browser_set(browser, !!reuse);
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+
+
+/* ══════════ 诊断报告（0.5.2）══════════
+   崩溃时后端会自动写一份报告（app/crashlog.py）。
+   这里给用户两个入口：手动生成一份、打开报告文件夹。
+   报告内容可以直接贴进 GitHub issue，自带系统环境与出错位置。 */
+
+function apiCrashStatus(){
+  if(window.pywebview?.api?.crash_status)
+    return window.pywebview.api.crash_status();
+  return Promise.resolve({ok:false});
+}
+function apiCrashMake(){
+  if(window.pywebview?.api?.crash_make)
+    return window.pywebview.api.crash_make();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+function apiCrashOpen(){
+  if(window.pywebview?.api?.crash_open)
+    return window.pywebview.api.crash_open();
+  return Promise.resolve({ok:false});
+}
+
+function loadCrashSettings(){
+  const row = $('#setCrashRow');
+  if(!row) return;
+  if(!(window.pywebview?.api?.crash_status)){ row.hidden = true; return; }
+  row.hidden = false;
+
+  const paint = (st)=>{
+    const val = $('#setCrashVal');
+    const desc = $('#setCrashDesc');
+    if(val){
+      val.textContent = (st && st.latest_name)
+        ? st.latest_name : '还没有报告';
+    }
+    if(desc){
+      if(st && st.previous_crash){
+        desc.textContent = '上次运行是异常退出，报告已保存' +
+          (st.previous_at ? '（' + st.previous_at + '）' : '');
+      }else{
+        desc.textContent = '程序异常退出时会自动保存一份报告' +
+          '（已去掉账号密码等敏感信息）';
+      }
+    }
+  };
+
+  apiCrashStatus().then(paint).catch(()=>{});
+
+  const mk = $('#setCrashMake');
+  if(mk && !mk.dataset.b){
+    mk.dataset.b = '1';
+    mk.addEventListener('click', ()=>{
+      mk.disabled = true;
+      const old = mk.textContent;
+      mk.textContent = '正在生成…';
+      apiCrashMake().then(r=>{
+        mk.disabled = false;
+        mk.textContent = old;
+        if(r && r.ok){
+          toast('已生成：' + r.name);
+          loadCrashSettings();
+        }else{
+          toast('生成失败：' + ((r && r.error) || '未知原因'), 'err');
+        }
+      }).catch(()=>{
+        mk.disabled = false;
+        mk.textContent = old;
+        toast('生成失败', 'err');
+      });
+    });
+  }
+
+  const op = $('#setCrashOpen');
+  if(op && !op.dataset.b){
+    op.dataset.b = '1';
+    op.addEventListener('click', ()=>{
+      apiCrashOpen().then(r=>{
+        if(!r || !r.ok) toast('打不开文件夹', 'err');
+      }).catch(()=>toast('打不开文件夹', 'err'));
+    });
+  }
+}
+
+
+function loadBrowserSettings(){
+  const row = $('#setBrowserRow');
+  if(!row) return;
+  apiBrowserGet().then(st=>{
+    if(!st || !st.ok){ row.hidden = true; return; }
+    const inst = st.installed || [];
+    if(!inst.length){ row.hidden = true; return; }
+    row.hidden = false;
+
+    BROWSER_CUR = st.browser || 'auto';
+    BROWSER_REUSE = !!st.reuse;
+
+    const items = [{key:'auto', name:'自动'}]
+      .concat(inst.map(x=>({key:x.key, name:x.name})));
+    const pick = $('#setBrowserPick');
+    if(pick){
+      pick.innerHTML = items.map(it=>
+        '<button data-bk="' + esc(it.key) + '"' +
+        (it.key === BROWSER_CUR ? ' class="on"' : '') + '>' +
+        esc(it.name) + '</button>').join('');
+      pick.querySelectorAll('[data-bk]').forEach(btn=>{
+        btn.addEventListener('click', ()=>{
+          const k = btn.getAttribute('data-bk') || 'auto';
+          apiBrowserSet(k, BROWSER_REUSE).then(r=>{
+            if(r && r.ok){
+              BROWSER_CUR = k;
+              toast('已切换浏览器：' + (k === 'auto' ? '自动' : k));
+              loadBrowserSettings();
+            }else{
+              toast('保存失败：' + ((r && r.error) || '未知原因'), 'err');
+            }
+          }).catch(()=>toast('保存失败', 'err'));
+        });
+      });
+    }
+
+    const val = $('#setBrowserVal');
+    if(val){
+      if(BROWSER_CUR === 'auto'){
+        val.textContent = '自动' + (st.active ? '（当前 ' + st.active + '）' : '');
+      }else{
+        const hit = items.find(i=>i.key === BROWSER_CUR);
+        val.textContent = hit ? hit.name : BROWSER_CUR;
+      }
+    }
+    const desc = $('#setBrowserDesc');
+    if(desc){
+      desc.textContent = st.active_path
+        ? ('当前使用：' + st.active + ' · ' + st.active_path)
+        : '没检测到可用的 Chromium 浏览器（Edge / Chrome / Brave / Chromium 装一个即可）';
+    }
+
+    const rw = $('#setReuse');
+    if(rw){
+      rw.classList.toggle('on', BROWSER_REUSE);
+      const rd = $('#setReuseDesc');
+      if(rd){
+        if(BROWSER_REUSE && st.reuse_note){
+          /*  后端会告诉我们「这次能不能真复用」——
+              浏览器开着的时候只能退回独立 profile，
+              这件事必须让用户看见，否则他会以为开关没生效 */
+          rd.textContent = st.reuse_note;
+        }else{
+          rd.textContent = BROWSER_REUSE
+            ? '直接用你平时那个浏览器里的登录态（那个浏览器要先退出）'
+            : '开启后直接用你平时那个浏览器里的登录态，不用再登一次';
+        }
+      }
+      rw.onclick = ()=>{
+        BROWSER_REUSE = !BROWSER_REUSE;
+        apiBrowserSet(BROWSER_CUR, BROWSER_REUSE).then(r=>{
+          if(r && r.ok){
+            rw.classList.toggle('on', BROWSER_REUSE);
+            if(rd){
+              rd.textContent = BROWSER_REUSE
+                ? '直接用你平时那个浏览器里的登录态（那个浏览器要先退出）'
+                : '开启后直接用你平时那个浏览器里的登录态，不用再登一次';
+            }
+            toast(BROWSER_REUSE ? '会复用日常浏览器的登录态'
+                                : '已改为使用独立数据目录');
+          }else{
+            BROWSER_REUSE = !BROWSER_REUSE;      /* 失败就回退 */
+            toast('保存失败：' + ((r && r.error) || '未知原因'), 'err');
+          }
+        }).catch(()=>{
+          BROWSER_REUSE = !BROWSER_REUSE;
+          toast('保存失败', 'err');
+        });
+      };
+    }
+  }).catch(()=>{ row.hidden = true; });
+}
+
 
 function openSettings(){
   LOOK = LOOK || loadLook();
@@ -1035,11 +1952,313 @@ function openSettings(){
   if(bl) bl.classList.toggle('on', !!LOOK.blur);
   setLookLabels();
 
+  /*  开机自启的真实状态在系统里，不在 localStorage ——
+      异步问一次后端，问到之前先按上次已知状态显示。 */
+  const au = $('#setAuto');
+  if(au){
+    au.classList.toggle('on', AUTOSTART_ON);
+    apiAutostartStatus().then(st=>{
+      if(!st || !st.supported){
+        /* 网页版 / 非 Windows：这项没意义，整行藏掉 */
+        const row = $('#setAutoRow');
+        if(row) row.hidden = true;
+        return;
+      }
+      AUTOSTART_ON = !!st.installed;
+      au.classList.toggle('on', AUTOSTART_ON);
+      const desc = $('#setAutoDesc');
+      if(desc){
+        desc.textContent = AUTOSTART_ON
+          ? '开机会在后台抓好数据，打开即用'
+          : '已关闭。打开小组件时才会去取数据';
+      }
+    }).catch(()=>{});
+  }
+
+  /*  浏览器选择：桌面版才有意义 */
+  try{ loadBrowserSettings(); }catch(e){}
+  /*  诊断报告入口 */
+  try{ loadCrashSettings(); }catch(e){}
+
   host.classList.add('open');
 }
 
 function closeSettings(){
   $('#setpanel')?.classList.remove('open');
+}
+
+/* ══════════════════════════════════════════════════════════════
+   搜索（0.5.2）
+
+   【为什么搜索结果要强制刷新成绩】
+     老师登完分还会改分。搜索这个动作的意思就是「这条作业现在到底多少分」，
+     拿上一次抓取的缓存回答，等于给出一个已经被改掉的旧分数。
+     所以每次搜索都让后端按需重抓：指定科目只重抓那一门（2–3 秒），
+     没指定就重抓全部（10–15 秒）。
+     连续输入时改用 force=false 复用已有数据 —— 否则每敲一个字母
+     就往站点打一轮请求，很容易触发限速。
+
+   【排版为什么像 GPA 页】
+     结果行直接复用 .grow / .gdetail，与 GPA 页展开科目是同一套样式、
+     同一段 max-height 动画，展开手感一致。
+   ══════════════════════════════════════════════════════════════ */
+let srBusy = false;        /* 同一时刻只跑一个搜索请求 */
+let srPending = null;      /* 忙碌期间攒下的最新一次请求 */
+let srTimer = null;        /* 输入防抖 */
+let srLastRefresh = 0;     /* 上次真的重抓过的时间戳 */
+
+function apiSearch(query, course, force){
+  if(window.pywebview?.api?.search)
+    return window.pywebview.api.search(query || '', course || '', !!force);
+  return Promise.resolve({ok:false, error:'当前模式不支持搜索'});
+}
+
+function openSearch(){
+  const host = $('#searchpanel');
+  if(!host) return;
+  fillSearchCourses();
+  host.classList.add('open');
+  const inp = $('#srInput');
+  if(inp){ inp.focus(); inp.select(); }
+  runSearch(true);            /* 打开即强制刷新一次 */
+}
+
+function closeSearch(){ $('#searchpanel')?.classList.remove('open'); }
+
+function fillSearchCourses(){
+  const sel = $('#srCourse');
+  if(!sel) return;
+  const cur = sel.value;
+  const names = ((DATA && DATA.courses) || [])
+    .map(c => c && c.name).filter(Boolean);
+  sel.innerHTML = ['<option value="">全部科目</option>']
+    .concat(names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`))
+    .join('');
+  sel.value = names.indexOf(cur) >= 0 ? cur : '';
+}
+
+function runSearch(force){
+  if(srBusy){ srPending = !!force; return; }   /* 串行化：别并发打站点 */
+  srBusy = true;
+  const query = ($('#srInput')?.value || '').trim();
+  const course = ($('#srCourse')?.value || '').trim();
+  const stat = $('#srStat');
+  if(stat && force){
+    stat.innerHTML = `${icon('i-refresh','sm inl')} 正在重新读取`
+      + `${course ? '该科目' : '全部课程'}的成绩……`;
+  }
+  apiSearch(query, course, force).then(r=>{
+    srBusy = false;
+    if(force) srLastRefresh = Date.now();
+    if(!r || !r.ok){ renderSearchFail(r); }
+    else { renderSearchResults(r); }
+    if(srPending !== null){
+      const f = srPending; srPending = null;
+      runSearch(f);
+    }
+  }).catch(e=>{
+    srBusy = false;
+    renderSearchFail({error:String(e)});
+    if(srPending !== null){ const f = srPending; srPending = null; runSearch(f); }
+  });
+}
+
+function renderSearchFail(r){
+  const stat = $('#srStat'), res = $('#srRes');
+  const msg = (r && r.error) ? esc(r.error) : '未知原因';
+  if(stat) stat.innerHTML = `<span class="warn">搜索没有完成：${msg}</span>`;
+  if(res) res.innerHTML = '';
+}
+
+/* 分组标题上的小圆点颜色：取该组已出分任务的平均分 */
+function srGroupColor(g){
+  const ps = (g.tasks || []).map(t => t.percent).filter(v => v != null);
+  if(!ps.length) return 'var(--blue)';
+  return pctColor(ps.reduce((a,b)=>a+b,0) / ps.length);
+}
+
+/* 折叠行标题下面那行小字：分类 · 类型 · 截止 */
+function srSubTitle(t){
+  const bits = [];
+  if(t.category) bits.push(t.category);
+  if(t.kind && t.kind !== t.category) bits.push(t.kind);
+  if(t.due_date) bits.push('截止 ' + t.due_date);
+  return bits.join(' · ');
+}
+
+/* 展开后的「全部信息」 */
+function srDetailHTML(t){
+  const p = t.percent;
+  const cc = p != null ? pctColor(p) : 'var(--text)';
+  let h = '';
+  if(t.score){
+    h += `<div class="srscore" style="color:${cc}">${esc(t.score)}`
+      + (p != null ? `<small>${p.toFixed(1)}%</small>` : '') + `</div>`;
+  }else if(t.graded){
+    h += `<div class="srscore" style="color:var(--dim)">已评分</div>`;
+  }else{
+    h += `<div class="srscore" style="color:var(--dim)">尚未出分</div>`;
+  }
+  const kv = [];
+  if(t.course) kv.push(['课程', t.course]);
+  if(t.category) kv.push(['分类', t.category]);
+  if(t.kind) kv.push(['类型', t.kind]);
+  if(t.due_date) kv.push(['截止', t.due_date + (t.due_text ? '（' + t.due_text + '）' : '')]);
+  if(t.publish_date) kv.push(['布置', t.publish_date]);
+  if(t.status) kv.push(['提交', t.status]);
+  if(t.has_attachment) kv.push(['附件', '有']);
+  if(kv.length){
+    h += `<div class="srmeta">`
+      + kv.map(kv1 => `<span class="kv">${esc(kv1[0])} <b>${esc(kv1[1])}</b></span>`).join('')
+      + `</div>`;
+  }
+  if(t.description){
+    const d = String(t.description).trim();
+    if(d){
+      h += `<div class="srdesc">${esc(d.slice(0, 420))}`
+        + (d.length > 420 ? '…' : '') + `</div>`;
+    }
+  }
+  if(t.url){
+    h += `<button class="fretry" data-sropen="${esc(t.url)}">`
+      + `${icon('i-external','sm')}在 ManageBac 中打开</button>`;
+  }
+  return h;
+}
+
+function renderSearchResults(r){
+  const stat = $('#srStat'), res = $('#srRes');
+  const now = new Date();
+  const hhmmss = [now.getHours(), now.getMinutes(), now.getSeconds()]
+    .map(n => String(n).padStart(2,'0')).join(':');
+  const rf = r.refresh || {};
+  const bits = [`命中 <b>${r.total || 0}</b> 条 · <b>${r.courses_total || 0}</b> 门课程`];
+  if(!rf.skipped){
+    if(rf.ok === false){
+      bits.push(`<span class="warn">成绩未能刷新：${esc(rf.error || '未知原因')}</span>`);
+    }else{
+      bits.push(`成绩已重新读取（${((rf.took_ms || 0) / 1000).toFixed(1)} 秒）`);
+    }
+  }
+  bits.push(`检索于 ${hhmmss}`);
+  let html = bits.join(' · ');
+  if(rf.cooldown){
+    html += `<br><span class="warn">站点限速中，约 ${rf.cooldown} 秒内可能读不全。</span>`;
+  }
+  const chg = rf.changed || [];
+  if(chg.length){
+    const items = chg.slice(0,6).map(x =>
+      `${esc(x.course)} · ${esc(x.title)} → <b>${esc(x.score || '—')}</b>`);
+    html += `<div class="srchg"><b>刚读取到 ${chg.length} 条分数有变化的记录</b><br>`
+      + items.join('<br>') + (chg.length > 6 ? '<br>…' : '') + `</div>`;
+  }
+  if(stat) stat.innerHTML = html;
+  if(!res) return;
+
+  if(!r.total){
+    res.innerHTML = `<div class="srnone">没有找到匹配的作业。<br>`
+      + `<b>可以换个关键词，或把科目切到「全部科目」。</b></div>`;
+    return;
+  }
+
+  let h = '';
+  let gi = 0;
+  for(const g of (r.groups || [])){
+    const col = srGroupColor(g);
+    h += `<div class="srgroup">`;
+    h += `<div class="srgh" style="--c:${col}"><span class="cdot"></span>`
+      + `${esc(g.course || '未命名课程')}`
+      + `<span class="srgn">${g.count || (g.tasks || []).length} 项</span></div>`;
+    for(const t of (g.tasks || [])){
+      const k = 'sr' + (gi++);
+      const p = t.percent;
+      const lv = t.level || '';
+      const cc = p != null ? pctColor(p) : lvlColor(lv);
+      const sub = srSubTitle(t);
+      h += `<div class="grow" data-srow="${k}" style="--c:${cc}" title="点击展开全部信息">`
+        + `<div class="gname">${esc(t.title || '未命名')}`
+        + (sub ? `<i>${esc(sub)}</i>` : '') + `</div>`
+        + (lv ? `<span class="glv" style="--c:${cc}">${esc(lv)}</span>`
+              : `<span class="glv na">—</span>`)
+        + (p != null ? `<span class="gpct" style="--c:${cc}">${p.toFixed(1)}%</span>`
+                     : `<span class="gno">—</span>`)
+        + `<span class="garw">▶</span>`
+        + `</div>`
+        + `<div class="gdetail" data-sdet="${k}"><div class="gdin">`
+        + srDetailHTML(t) + `</div></div>`;
+    }
+    h += `</div>`;
+  }
+  res.innerHTML = h;
+  bindSearchRows();
+}
+
+function bindSearchRows(){
+  const host = $('#srRes');
+  if(!host) return;
+  /*  展开动画与 GPA 页完全一致：
+      max-height 必须量**真实高度**，写死一个大数字会让动画
+      「前 90% 时间看不出变化、最后突然开完」。 */
+  host.querySelectorAll('[data-srow]').forEach(row=>{
+    row.addEventListener('click', e=>{
+      e.stopPropagation();
+      const k = row.dataset.srow;
+      const det = host.querySelector('[data-sdet="' + k + '"]');
+      if(!det) return;
+      const willOpen = !det.classList.contains('open');
+      row.classList.toggle('open', willOpen);
+      det.classList.toggle('open', willOpen);
+      if(willOpen){
+        det.style.maxHeight = det.scrollHeight + 'px';
+        setTimeout(()=>{
+          if(det.classList.contains('open')) det.style.maxHeight = 'none';
+        }, 430);
+      }else{
+        det.style.maxHeight = det.scrollHeight + 'px';
+        void det.offsetHeight;
+        det.style.maxHeight = '';
+      }
+    });
+  });
+  host.querySelectorAll('[data-sropen]').forEach(btn=>{
+    btn.addEventListener('click', e=>{
+      e.stopPropagation();
+      openURL(btn.dataset.sropen);
+    });
+  });
+}
+
+function bindSearch(){
+  /*  幂等：页面里有两个 DOMContentLoaded 监听器都会调到这里 */
+  if(bindSearch._done) return;
+  bindSearch._done = true;
+
+  $('#btnSearch')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    if($('#searchpanel')?.classList.contains('open')) closeSearch();
+    else openSearch();
+  });
+  $('#srClose')?.addEventListener('click', closeSearch);
+  $('#searchpanel')?.addEventListener('click', e=>{
+    if(e.target && e.target.id === 'searchpanel') closeSearch();
+  });
+
+  const inp = $('#srInput');
+  if(inp){
+    inp.addEventListener('input', ()=>{
+      clearTimeout(srTimer);
+      srTimer = setTimeout(()=>{
+        /*  距上次强制刷新超过 15 秒才再抓一次，否则用已有数据本地筛 */
+        runSearch(Date.now() - srLastRefresh > 15000);
+      }, 420);
+    });
+    inp.addEventListener('keydown', e=>{
+      if(e.key === 'Enter'){ clearTimeout(srTimer); runSearch(true); }
+      if(e.key === 'Escape'){ closeSearch(); }
+    });
+  }
+  /*  换科目 = 换一门课的成绩，必须重抓 */
+  $('#srCourse')?.addEventListener('change', ()=> runSearch(true));
 }
 
 function setLookLabels(){
@@ -1052,6 +2271,13 @@ function setLookLabels(){
 }
 
 function bindSettings(){
+  /*  幂等：只绑一次。
+      页面里有两个 DOMContentLoaded 监听器都会调到这里，
+      重复绑定会让部分逻辑互相干扰（重建 DOM 会丢监听器）。
+      踩过的坑：表现为「点了没反应」且不报错。 */
+  if(bindSettings._done) return;
+  bindSettings._done = true;
+
   /* 圆角：三档 */
   document.querySelectorAll('#setR span').forEach(el=>{
     if(el.dataset.sbound) return;
@@ -1087,6 +2313,39 @@ function bindSettings(){
       LOOK.blur = !LOOK.blur;
       bl.classList.toggle('on', LOOK.blur);
       applyLook(LOOK); saveLook(LOOK);
+    });
+  }
+
+  /* 开机自动更新开关 —— 这项不存 localStorage，
+     真实状态在系统里（启动文件夹有没有那个快捷方式），
+     所以每次点都要问一遍后端。 */
+  const au = $('#setAuto');
+  if(au && !au.dataset.sbound){
+    au.dataset.sbound = '1';
+    au.addEventListener('click', async e=>{
+      e.stopPropagation();
+      const desc = $('#setAutoDesc');
+      au.disabled = true;
+      const want = !AUTOSTART_ON;
+      try{
+        const r = want ? await apiAutostartInstall() : await apiAutostartUninstall();
+        if(r && r.ok){
+          AUTOSTART_ON = want;
+          au.classList.toggle('on', want);
+          if(desc) desc.textContent = want
+            ? '开机会在后台抓好数据，打开即用'
+            : '已关闭。打开小组件时才会去取数据';
+          toast(want ? '已开启开机自动更新' : '已关闭开机自动更新', 'ok', '');
+        }else{
+          if(desc) desc.textContent = '没能改成功：'
+            + ((r && r.error) || '未知原因');
+          toast('没能改成功', 'err', '');
+        }
+      }catch(err){
+        if(desc) desc.textContent = '没能改成功：' + err;
+      }finally{
+        au.disabled = false;
+      }
     });
   }
 
@@ -1135,6 +2394,9 @@ function bindSettings(){
 
 let TM_ITEMS = [];
 let TM_KEY = '';
+/*  Teams 的状态快照（有没有同步过、多少条）。
+    标签栏的徽章要用它区分「没同步过」和「同步过但没消息」。 */
+let TM_STATUS_CACHE = {};
 
 function tmEsc(s){
   return String(s == null ? '' : s)
@@ -1151,10 +2413,31 @@ function tmHilite(text, kw){
   }catch(e){ return safe; }
 }
 
+/* ══════════ 反应徽章 ══════════
+   后端把 Teams 的反应读成了 [{emoji:'👍',n:3}, ...]
+   （以前是一句「3 个赞表情符号。 3」混在正文里，莫名其妙）。
+
+   抽成函数是因为**两处**都要渲染：弹窗视图和整页视图。
+   而且回复里也有一层 —— 写成内联模板会套到三层，
+   又难读又容易漏个反引号。
+
+   small=true 用在回复里（那里空间窄，整体缩一号）。 */
+function tmReactions(list, small){
+  const arr = list || [];
+  if(!arr.length) return '';
+  const cls = small ? 'tm-reas sm' : 'tm-reas';
+  const one = r => `<span class="tm-rea"><i>${tmEsc(String(r.emoji||''))}</i
+    ><b>${tmEsc(String(r.n == null ? 1 : r.n))}</b></span>`;
+  return `<div class="${cls}">${arr.map(one).join('')}</div>`;
+}
+
 function tmSetStatus(html, ok){
   const bar = $('#tmBar'), txt = $('#tmStatus');
   if(bar) bar.classList.toggle('on', !!ok);
   if(txt) txt.innerHTML = html;
+  /*  ★ 整页那一版的状态栏也要跟着 —— 两个视图共用同一份数据，
+      只更新弹窗的话，切到整页会看到过时的「还没同步过」。 */
+  tmPageStatus(html, ok);
 }
 
 function tmRender(){
@@ -1211,6 +2494,7 @@ function tmRender(){
           <span class="tm-d">${tmEsc((it.timeLabel||'').slice(0,18))}</span>
         </div>
         ${txt ? `<div class="tm-p">${tmHilite(txt, kw)}</div>` : ''}
+        ${tmReactions(it.reactions)}
         <div class="tm-m">
           ${isEc ? '<span class="tm-tag">EC</span>' : ''}
           ${it.author ? `<span class="tm-tag">${tmHilite(it.author, kw)}</span>` : ''}
@@ -1237,34 +2521,702 @@ function tmRender(){
 }
 
 async function tmLoad(keepStatus){
-  let st = {}, items = [];
+  let st = {}, items = [], stats = {};
   try{
     st = await apiTeamsStatus();
-    const r = await apiEcList('', '');
+    /*  全量抓取的结果优先 —— 它覆盖所有团队的所有频道。
+        旧的那份（单频道）只在没抓过全量时兜底。 */
+    const r = await apiTmAll('', '', '');
     items = (r && r.items) || [];
+    stats = await apiTmStats();
   }catch(e){}
 
   TM_ITEMS = items;
+  TM_STATUS_CACHE = st || {};
+  TM_STATS = stats || {};
+  TMP_STATUS_AT = (stats && stats.at) || '';
 
   /*  keepStatus=true 时只刷新列表，不动状态栏 ——
       否则刚同步完的结果会被「上次同步 …」立刻盖掉。 */
   if(!keepStatus){
-    if(st && st.ready){
+    const nT = (stats && stats.nTeams) || 0;
+    const nC = (stats && stats.nChannels) || 0;
+    const at = ((stats && stats.at) || '').slice(5, 16);
+    if(items.length){
+      tmSetStatus(
+        `已收 <b>${nT}</b> 个团队 · <b>${nC}</b> 个频道 · ` +
+        `<b>${items.length}</b> 条消息` +
+        (at ? ` · ${tmEsc(at)}` : ''), true);
+    }else if(st && st.ready){
       tmSetStatus(
         `上次同步 <b>${tmEsc((st.updated||'').slice(5,16))}</b>` +
-        ` · EC <b>${st.ec_count}</b> 条 · 其他 <b>${st.post_count}</b> 条` +
-        ` · 附件 <b>${st.attach_count}</b>`, true);
+        ` · EC <b>${st.ec_count}</b> 条 · 其他 <b>${st.post_count}</b> 条`, true);
     }else{
       tmSetStatus(st && st.note ? tmEsc(st.note) : '还没同步过');
     }
   }
   tmRender();
+  tmRenderPage();      /*  顶级标签页那一版也要跟着刷 ——
+                          两个视图共用 TM_ITEMS，但布局与交互不同 */
+
+  /* 顺手把标签栏的计数刷一下（徽章的更新在 render 里，
+     但那条路径依赖 DATA 刷新，这里直接补一次） */
+  try{
+    const btm = $('#badge-tm');
+    if(btm && items.length){
+      btm.textContent = items.length > 99 ? '99+' : items.length;
+      btm.title = `已收 ${items.length} 条消息`;
+    }
+  }catch(e){}
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   Teams 整页（顶级标签）
+
+   与弹窗版的区别：
+     · 整页布局，信息密度更高（弹窗只有 430px 宽）
+     · 多一排「频道」筛选胶囊 —— 能只看某个会话
+     · 状态栏与按钮固定在顶部，滚动时不动
+     · 消息按「频道 → 日期」两级分组（弹窗版只按日期）
+
+   为什么要有整页：Teams 里的消息不止 EC 一类 ——
+   作业通知、老师反馈、班级群消息都在里面。
+   弹窗的定位是「快速查 EC」，整页才是「看全部消息」。
+
+   ★ 「同步」与「全部收一遍」的区别：
+       同步       = 只读当前打开的频道（快，几秒）
+       全部收一遍 = 遍历所有团队的所有频道（慢，约 3 分钟），
+                    但一次就把整个 Teams 收全，之后不用再管
+   ══════════════════════════════════════════════════════════════════ */
+
+let TM_CH = '';          /* 频道筛选：空 = 全部 */
+let TM_TEAM = '';        /* 团队筛选：空 = 全部团队（两级导航的第一级） */
+let TMP_STATUS_AT = '';  /* 这批缓存是什么时候抓的（用来提示「太旧了」） */
+let TM_PAGE_KEY = '';    /* 整页的搜索词（与弹窗各自独立） */
+let TM_STATS = {};       /* 全量抓取的概览（团队/频道/条数/时间） */
+let TM_CRAWL_TIMER = null;
+
+/*  ★ 停止正在进行的 Teams 抓取 ★
+   深度归档最长要跑 90 分钟，以前点下去就停不下来，
+   只能等它自己结束或者杀掉程序。后端提供了取消标志，
+   这里给它一个按钮入口（运行中再点一次原按钮即可）。 */
+function apiTmCrawlCancel(){
+  if(window.pywebview?.api?.tm_crawl_cancel)
+    return window.pywebview.api.tm_crawl_cancel();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+
+/* 把所有频道整理出来（去重、排序、带条数）。
+   同一个频道名可能在多个团队里出现，所以用「团队 / 频道」做键，
+   但显示上只写频道名（够认了）。 */
+/* 团队清单（团队名 → 消息数），按条数降序 —— 两级导航的第一级 */
+function tmTeams(){
+  const m = {};
+  (TM_ITEMS || []).forEach(it=>{
+    const t = (it.team || '').trim() || '未标注团队';
+    m[t] = (m[t] || 0) + 1;
+  });
+  return Object.entries(m).sort((a,b)=> b[1] - a[1]);
+}
+
+function tmChannels(){
+  const m = {};
+  (TM_ITEMS || []).forEach(it=>{
+    const c = (it.channel || '').trim() || '未标注频道';
+    const t = (it.team || '').trim();
+    const key = t ? `${t} / ${c}` : c;
+    m[key] = (m[key] || 0) + 1;
+  });
+  return Object.entries(m).sort((a,b)=> b[1] - a[1]);
+}
+
+/* 频道胶囊上显示的短名（团队太多时只留频道名，省地方） */
+function tmChanShort(key){
+  const p = key.split(' / ');
+  return p.length > 1 ? p[1] : key;
+}
+
+function tmRenderPage(){
+  /*  容器就是网页里那个 #page-tm（顶级标签的页面容器）。
+      没写成单独的内层 div，是因为 switchTab 按 .page 的索引切页，
+      多包一层反而要改切换逻辑。 */
+  const box = document.getElementById('page-tm');
+  if(!box) return;
+
+  const kw = TM_PAGE_KEY.trim();
+  const ch = TM_CH;
+
+  let items = (TM_ITEMS || []).slice();
+
+  /* 团队筛选（两级导航的第一级） */
+  if(TM_TEAM){
+    items = items.filter(it => ((it.team || '').trim() || '未标注团队') === TM_TEAM);
+  }
+
+  /* 频道筛选（键是「团队 / 频道」） */
+  if(ch){
+    items = items.filter(it=>{
+      const c = (it.channel||'').trim() || '未标注频道';
+      const t = (it.team||'').trim();
+      return (t ? `${t} / ${c}` : c) === ch;
+    });
+  }
+
+  /* 搜索：覆盖标题 / 正文 / PDF 文字 / 频道 / 人名 / 附件名 / **回复正文** / 日期
+     ★ 多词按「同时命中」处理（空格、逗号、顿号、分号都算分隔）——
+       这和 Teams 自己的搜索一致：搜 "林里 鸭子" 期望两个词都在同一条消息里，
+       而不是消息里真的连着写下这四个字符。 */
+  const terms = kw ? kw.toLowerCase().split(/[\s,，、;；]+/).filter(Boolean) : [];
+  if(terms.length){
+    items = items.filter(it => {
+      const atts = (it.attachments || []).map(a => a.name || '').join(' ');
+      const reps = (it.replies || []).map(r =>
+        (r.author || '') + ' ' + (r.text || '')).join(' ');
+      const blob = ((it.title||'') + ' ' + (it.text||'') + ' ' +
+                    (it.file_text||'') + ' ' + (it.file_note||'') + ' ' +
+                    (it.channel||'') + ' ' + (it.author||'') + ' ' +
+                    (it.date||'') + ' ' + atts + ' ' + reps).toLowerCase();
+      return terms.every(t => blob.indexOf(t) >= 0);
+    });
+  }
+
+  /*  频道胶囊跟着团队走：选了中国队就只列它的频道，
+      否则十几个团队的频道混在一起，跟 Teams 里看到的结构对不上。 */
+  const chans = tmChannels().filter(([key]) =>
+    !TM_TEAM || key.indexOf(TM_TEAM + ' / ') === 0);
+
+  /* ── 缓存新鲜度：超过 3 天没更新就明确提示 ──
+     ★ 为什么必须有：搜索只能搜到**已经抓下来**的东西。
+       缓存停在 40 天前时，新消息怎么搜都不会出现，
+       但界面不说明的话，用户只会觉得「搜索坏了」。 */
+  let stale = '';
+  const at = (TMP_STATUS_AT || '').trim();
+  if(at){
+    const m = at.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if(m){
+      const then = new Date(+m[1], +m[2]-1, +m[3]);
+      const days = Math.floor((Date.now() - then.getTime()) / 86400000);
+      if(days >= 3){
+        stale = `<div class="tpg-stale">
+          ${icon('i-refresh','sm')}
+          <span>缓存是 <b>${days} 天前</b> 的（${tmEsc(at.slice(0,10))}）。
+          搜索只能搜到<b>已经抓下来</b>的消息：点「全部收一遍」更新最近的，
+          想搜更早的历史就点「深度归档」补全。</span>
+        </div>`;
+      }
+    }
+  }
+
+  /* ── 顶部：动作按钮 + 状态 ── */
+  let h = `<div class="tpg-top">
+    <div class="tpg-acts">
+      <button class="tpg-btn" id="tpgOpen">
+        ${icon('i-external','sm')}<span>打开 Teams</span></button>
+      <button class="tpg-btn primary" id="tpgFetch" title="遍历所有团队的所有频道，一次收全">
+        ${icon('i-download','sm')}<span>全部收一遍</span></button>
+      <button class="tpg-btn" id="tpgDeep"
+              title="补全历史：一直滚到每个频道最早的消息。第一次会很慢（可能一小时），之后日常用「全部收一遍」即可">
+        ${icon('i-hourglass','sm')}<span>深度归档</span></button>
+      <button class="tpg-btn" id="tpgSync" title="只读当前打开的频道（快）">
+        ${icon('i-refresh','sm')}<span>同步</span></button>
+      <button class="tpg-btn" id="tpgDL">
+        ${icon('i-folder','sm')}<span>取附件</span></button>
+    </div>
+    <div class="tpg-status" id="tpgStatus">${TMP_STATUS || '还没同步过'}</div>
+  </div>${stale}`;
+
+  /* ── 团队（第一级）── */
+  const teams = tmTeams();
+  if(teams.length){
+    h += `<div class="tpg-teams">
+      <button class="tpg-team ${!TM_TEAM?'on':''}" data-tm="">
+        <span>全部团队</span><i>${(TM_ITEMS||[]).length}</i></button>`;
+    teams.forEach(([name, n])=>{
+      h += `<button class="tpg-team ${TM_TEAM===name?'on':''}"
+              data-tm="${tmEsc(name)}" title="${tmEsc(name)}">
+        <span>${tmEsc(name)}</span><i>${n}</i></button>`;
+    });
+    h += `</div>`;
+  }
+
+  /* ── 频道筛选（第二级）── */
+  if(chans.length){
+    h += `<div class="tpg-chans">
+      <button class="tpg-ch ${!ch?'on':''}" data-ch="">
+        <span>全部</span><i>${(TM_ITEMS||[]).length}</i></button>`;
+    chans.forEach(([key, n])=>{
+      const short = tmChanShort(key);
+      h += `<button class="tpg-ch ${ch===key?'on':''}"
+              data-ch="${tmEsc(key)}" title="${tmEsc(key)}">
+        <span>${tmEsc(short)}</span><i>${n}</i></button>`;
+    });
+    h += `</div>`;
+  }
+
+  /* ── 搜索框 ── */
+  h += `<div class="tpg-search">
+    <input id="tpgKw" type="text" placeholder="搜消息内容、人名、频道名"
+           value="${tmEsc(TM_PAGE_KEY)}">
+  </div>`;
+
+  /* ── 列表 ── */
+  if(!items.length){
+    h += (kw || ch)
+      ? `<div class="tm-empty">没有匹配的内容</div>`
+      : `<div class="tm-empty">
+           <span class="oi">${icon('i-teams','xxl')}</span>
+           <b>还没收过</b><br>
+           先点「打开 Teams」登录一次，<br>
+           再点「全部收一遍」——它会把所有团队、所有频道都读下来。<br>
+           <span class="tpg-tip">之后消息都在这里看，不用再进 Teams 网页。</span>
+         </div>`;
+  }else{
+    /*  三级分组：团队 → 频道 → 日期。
+        全部收一遍之后消息横跨 7 个团队，只按频道分会撞名
+        （很多团队都有「常规」），所以先按团队隔开。 */
+    const byTeam = {};
+    items.forEach(it=>{
+      const t = (it.team||'').trim() || '未标注团队';
+      (byTeam[t] = byTeam[t] || []).push(it);
+    });
+
+    const teamOrder = Object.keys(byTeam)
+      .sort((a,b)=> byTeam[b].length - byTeam[a].length);
+
+    teamOrder.forEach(t=>{
+      const teamList = byTeam[t];
+      /*  单团队视图下不用再写团队名（省一行） */
+      if(teamOrder.length > 1){
+        h += `<div class="tpg-teamhead">
+          ${icon('i-teams','sm')}<span>${tmEsc(t)}</span>
+          <i>${teamList.length}</i></div>`;
+      }
+
+      const byChan = {};
+      teamList.forEach(it=>{
+        const c = (it.channel||'').trim() || '未标注频道';
+        (byChan[c] = byChan[c] || []).push(it);
+      });
+
+      Object.keys(byChan)
+        .sort((a,b)=> byChan[b].length - byChan[a].length)
+        .forEach(c=>{
+          const list = byChan[c];
+          h += `<div class="tpg-chhead">
+            ${icon('i-list','sm')}<span>${tmEsc(c)}</span>
+            <i>${list.length}</i></div>`;
+
+          const byDate = {};
+          list.forEach(it=>{
+            const d = it.date || '未标注日期';
+            (byDate[d] = byDate[d] || []).push(it);
+          });
+          Object.keys(byDate).sort().reverse().forEach(d=>{
+            h += `<div class="tm-sec">${tmEsc(d)}
+              <span class="tm-n">${byDate[d].length}</span></div>`;
+            byDate[d].forEach((it, i)=>{
+              const isEc = it.kind === 'ec';
+              const isHw = it.kind === 'homework';
+              const txt = (it.text || '').slice(0, 1200);
+              const atts = it.attachments || [];
+              const hasFile = !!(it.file_text || '').trim();
+              const reps = it.replies || [];
+
+              h += `<div class="tm-item" data-tp="${tmEsc(t)}|${tmEsc(c)}|${tmEsc(d)}|${i}">
+                <div class="tm-h">
+                  <span class="tm-t">${tmHilite(it.title || '消息', kw)}</span>
+                  <span class="tm-d">${tmEsc((it.timeLabel||'').slice(0,18))}</span>
+                </div>
+                ${txt ? `<div class="tm-p">${tmHilite(txt, kw)}</div>` : ''}
+                ${tmReactions(it.reactions)}
+                ${reps.length ? `<div class="tm-reps">
+                  ${reps.slice(0, 6).map(r=>`
+                    <div class="tm-rep">
+                      <b>${tmHilite(r.author||'', kw)}</b>
+                      <span class="tm-rt">${tmEsc((r.time||'').slice(0,14))}</span>
+                      <div>${tmHilite((r.text||'').slice(0, 500), kw)}</div>
+                      ${tmReactions(r.reactions, true)}
+                    </div>`).join('')}
+                  ${reps.length > 6 ? `<div class="tm-rmore">还有 ${reps.length - 6} 条回复</div>` : ''}
+                </div>` : ''}
+                <div class="tm-m">
+                  ${isEc ? '<span class="tm-tag ec">EC</span>' : ''}
+                  ${isHw ? '<span class="tm-tag hw">作业</span>' : ''}
+                  ${it.author ? `<span class="tm-tag">${tmHilite(it.author, kw)}</span>` : ''}
+                  ${reps.length ? `<span class="tm-tag">${reps.length} 回复</span>` : ''}
+                  ${atts.length ? `<span class="tm-tag att">附件 ${atts.length}</span>` : ''}
+                  ${hasFile ? '<span class="tm-tag pdf">已读 PDF</span>' : ''}
+                </div>
+                ${atts.length ? `<div class="tm-atts">${atts.map(a=>
+                  `<button class="tm-att" data-u="${tmEsc(a.url||'')}" data-n="${tmEsc(a.name||'')}"
+                     title="点击下载到「桌面/ManageBac 资料/Teams 附件」">
+                     ${icon('i-download','sm')}<span>${tmEsc((a.name||'附件').slice(0,72))}</span>
+                   </button>`).join('')}</div>` : ''}
+                ${hasFile ? `<div class="tm-file">
+                  ${it.file_note ? `<span class="tm-note">${tmEsc(it.file_note)}</span>` : ''}
+                  ${tmHilite(it.file_text.slice(0, 8000), kw)}
+                </div>` : ''}
+              </div>`;
+            });
+          });
+        });
+    });
+  }
+
+  box.innerHTML = h;
+
+  /* ── 绑定 ── */
+  box.querySelectorAll('.tm-item').forEach(el=>{
+    el.addEventListener('click', e=>{
+      const att = e.target.closest && e.target.closest('.tm-att');
+      if(att){
+        /*  点附件是「下载」，不是「展开这条消息」 */
+        e.stopPropagation();
+        tmDownloadAtt(att);
+        return;
+      }
+      if(e.target.tagName === 'MARK') return;
+      el.classList.toggle('open');
+    });
+  });
+
+  box.querySelectorAll('.tpg-team').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      TM_TEAM = el.dataset.tm || '';
+      /*  换了团队，原来的频道筛选一定失效（键里带团队名），清掉 */
+      TM_CH = '';
+      tmRenderPage();
+    });
+  });
+
+  box.querySelectorAll('.tpg-ch').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      TM_CH = el.dataset.ch || '';
+      tmRenderPage();
+    });
+  });
+
+  const kwi = $('#tpgKw');
+  if(kwi){
+    kwi.addEventListener('input', ()=>{
+      TM_PAGE_KEY = kwi.value;
+      /*  打字时不要每次重建 DOM（会让光标跳），抖一下再刷。
+          但重刷会重建输入框 → 光标丢失，所以这里只重绘列表部分。
+          简单办法：记下光标位置，重绘后还原。 */
+      const pos = kwi.selectionStart;
+      clearTimeout(tmRenderPage._t);
+      tmRenderPage._t = setTimeout(()=>{
+        tmRenderPage();
+        const k2 = $('#tpgKw');
+        if(k2){ k2.focus(); try{ k2.setSelectionRange(pos, pos); }catch(e){} }
+      }, 260);
+    });
+  }
+
+  const bind = (id, fn) => {
+    const b = $('#' + id);
+    if(!b || b.dataset.bound) return;
+    b.dataset.bound = '1';
+    b.addEventListener('click', fn);
+  };
+  bind('tpgOpen', ()=> tmPageAction('open'));
+  bind('tpgFetch', ()=> tmFetchAll());
+  bind('tpgDeep', ()=> tmDeepArchive());
+  bind('tpgSync', ()=> tmPageAction('sync', 8));
+  bind('tpgDL',   ()=> tmPageAction('dl'));
+}
+
+/* ════════════════════════════════════════════════════════════════
+   「全部收一遍」—— 遍历所有团队的所有频道
+
+   与「同步」的区别：
+     同步       = 只读当前在 Teams 里打开的那个频道
+     全部收一遍 = 自己进每个团队、收集频道 ID，再逐个频道取数
+                  （用的是频道深度链接，所以不需要你去点）
+
+   17 个频道实测约 280 秒。放在后端线程里跑，前端每 2 秒问一次进度。
+   ════════════════════════════════════════════════════════════════ */
+/*  ════════════════════════════════════════════════════════════════
+   点附件即下载
+
+   目标是「所有的『收』都在小组件里完成」——
+   看到附件就能拿到手，不用再去 Teams 里翻。
+
+   落到「桌面 / ManageBac 资料 / Teams 附件 / 原文件名」。
+   后端 download_one 会先带会话 Cookie 直连，
+   失败再退回浏览器内 fetch（SharePoint 常常只认后者）。
+   ════════════════════════════════════════════════════════════════ */
+async function tmDownloadAtt(btn){
+  const url = btn.dataset.u || '';
+  const name = btn.dataset.n || '';
+  if(!url){ tmPageStatus('这条附件没有可下载的链接', false); return; }
+  if(btn.dataset.busy) return;          /* 同一个按钮不重复点 */
+  btn.dataset.busy = '1';
+  const old = btn.innerHTML;
+  btn.innerHTML = '<span class="tm-att-run">下载中…</span>';
+  try{
+    /*  ★ 变量名不能叫 r：api 面检查器会把「含 pywebview+api 的赋值目标」
+        当成 api 别名，文件里别处的 r.json() 就会被误判成后端方法。 */
+    const dlr = window.pywebview?.api?.teams_download
+      ? await window.pywebview.api.teams_download(url, name)
+      : {ok:false, error:'当前模式不支持'};
+    if(dlr && dlr.ok){
+      btn.innerHTML = `<span class="tm-att-ok">已下载 ${tmEsc(dlr.name || '')}</span>`;
+      tmPageStatus(`已下载：${dlr.path || ''}`, true);
+    }else{
+      btn.innerHTML = old;
+      tmPageStatus(`下载失败：${(dlr && dlr.error) || '未知原因'}`, false);
+    }
+  }catch(e){
+    btn.innerHTML = old;
+    tmPageStatus('下载失败：' + e, false);
+  }finally{
+    delete btn.dataset.busy;
+  }
+}
+
+/*  ════════════════════════════════════════════════════════════════
+    深度归档 —— 补全历史消息
+
+    【为什么需要它】
+      「全部收一遍」是**增量**的：每个频道一滚到「整屏都是抓过的消息」
+      就停。日常很省时间，但它意味着本地只攒「程序运行时出现过的新消息」。
+      老消息永远不会进来 —— 于是搜索搜不到它们。
+
+      实测：101 大群里有一条 9 月的「征集林里鸭子…」，
+      搜「林里」搜不到 —— 不是搜索坏了，是它从没被抓过。
+
+    【代价】
+      每个频道滚到最早，第一次可能跑一小时。
+      抓完仍然 merge，只增不减；之后日常用「全部收一遍」就行。
+    ════════════════════════════════════════════════════════════════ */
+async function tmDeepArchive(){
+  if(tmDeepArchive._busy){
+    //  ★ 已经在归档 → 这次点击就是「停止」★
+    try{
+      await apiTmCrawlCancel();
+      tmPageStatus('正在停止…已抓到的消息会保留', true);
+    }catch(e){}
+    return;
+  }
+  if(!confirm(
+      '深度归档会把每个频道的消息一直滚到最早，补全历史。\n\n' +
+      '第一次可能要跑一小时左右，期间可以正常用电脑。\n' +
+      '抓完只增不减，不会丢数据。\n\n确定现在开始吗？')){
+    return;
+  }
+  tmDeepArchive._busy = true;
+
+  const btn = $('#tpgDeep');
+  const old = btn ? btn.innerHTML : '';
+  if(btn){
+    btn.classList.add('busy');
+    btn.innerHTML = icon('i-hourglass','sm') + '<span>归档中…点此停止</span>';
+    btn.title = '再点一次即可停止（已抓到的消息会保留）';
+  }
+  tmPageStatus('深度归档开始：将逐个频道滚到最早，请耐心等待…', true);
+
+  try{ await apiTeamsOpen(); }catch(e){}
+
+  let done = false;
+
+  /*  同 tmFetchAll：轮询要在阻塞调用之前挂上，否则全程无进度 */
+  clearInterval(TM_CRAWL_TIMER);
+  const t0 = Date.now();
+  TM_CRAWL_TIMER = setInterval(async ()=>{
+    if(done) return;
+    try{
+      const s = await apiTmCrawlStatus();
+      const el = Math.floor((Date.now() - t0) / 1000);
+      const spent = el >= 60 ? `${Math.floor(el/60)} 分 ${el%60} 秒`
+                             : `${el} 秒`;
+      const msg = (s && s.message) ? tmEsc(s.message) : '正在归档…';
+      tmPageStatus(`${msg}　<span class="tpg-elapsed">已用 ${spent}</span>`, true);
+      if(s && !s.running){ clearInterval(TM_CRAWL_TIMER); done = true; }
+    }catch(e){}
+  }, 2000);
+
+  const res = await apiTmCrawl(30, true);
+  clearInterval(TM_CRAWL_TIMER);
+  done = true;
+
+  if(btn){ btn.classList.remove('busy'); btn.innerHTML = old; }
+  tmDeepArchive._busy = false;
+
+  if(res && res.ok){
+    const nP = res.nPosts || 0;
+    const head = res.cancelled ? '深度归档已停止' : '深度归档完成';
+    tmPageStatus(
+      `${head}：${res.nTeams || 0} 个团队 · ${res.nChannels || 0} 个频道 · ` +
+      `<b>${nP}</b> 条消息（含历史）` +
+      (res.cancelled ? '　<span class="tpg-elapsed">已抓到的都已保存</span>' : ''),
+      true);
+    await tmLoad(true);
+  }else{
+    tmPageStatus(`深度归档失败：${(res && res.reason) || '未知原因'}`, false);
+  }
+}
+
+async function tmFetchAll(){
+  if(tmFetchAll._busy) return;
+  tmFetchAll._busy = true;
+
+  const btn = $('#tpgFetch');
+  const setBtn = (txt, spin)=>{
+    if(!btn) return;
+    btn.classList.toggle('busy', !!spin);
+    btn.innerHTML = icon(spin ? 'i-refresh' : 'i-download', 'sm') +
+                    `<span>${txt}</span>`;
+  };
+
+  setBtn('收集中…', true);
+  ['tpgOpen','tpgSync','tpgDL'].forEach(id=>{
+    const b = $('#'+id); if(b) b.disabled = true;
+  });
+  tmPageStatus('正在整理团队与频道…', true);
+
+  /*  先确保 Teams 窗口是开着的（没开的话后端会自己拉起来） */
+  try{ await apiTeamsOpen(); }catch(e){}
+
+  let done = false;
+
+  /*  ★★ 轮询必须在 await 之前挂上 ★★
+      apiTmCrawl 是**阻塞**调用（后端 join 抓取线程），
+      实测 17 个频道要 5~10 分钟。把 setInterval 写在它后面，
+      等于整个抓取过程一个进度都看不到 ——
+      状态栏一直停在「正在整理团队与频道…」，用户只会觉得「点了没反应」。
+      顺带显示已耗时，让人确定它没死。 */
+  clearInterval(TM_CRAWL_TIMER);
+  const t0 = Date.now();
+  TM_CRAWL_TIMER = setInterval(async ()=>{
+    if(done) return;
+    try{
+      const s = await apiTmCrawlStatus();
+      const el = Math.floor((Date.now() - t0) / 1000);
+      const spent = el >= 60 ? `${Math.floor(el/60)} 分 ${el%60} 秒`
+                             : `${el} 秒`;
+      const msg = (s && s.message) ? tmEsc(s.message) : '正在整理团队与频道…';
+      tmPageStatus(`${msg}　<span class="tpg-elapsed">已用 ${spent}</span>`, true);
+      if(s && !s.running){
+        clearInterval(TM_CRAWL_TIMER);
+        done = true;
+      }
+    }catch(e){}
+  }, 2000);
+
+  const res = await apiTmCrawl(10);
+  clearInterval(TM_CRAWL_TIMER);
+  done = true;
+
+  setBtn('全部收一遍', false);
+  ['tpgOpen','tpgSync','tpgDL'].forEach(id=>{
+    const b = $('#'+id); if(b) b.disabled = false;
+  });
+  tmFetchAll._busy = false;
+
+  if(res && res.ok){
+    const nP = res.nPosts || 0;
+    const nR = res.nReplies || 0;
+    const nT = res.nTeams || 0;
+    const nC = res.nChannels || 0;
+    tmPageStatus(
+      `收好了 —— <b>${nT}</b> 个团队 · <b>${nC}</b> 个频道 · ` +
+      `<b>${nP}</b> 条消息 · <b>${nR}</b> 条回复` +
+      (res.partial ? '（到时间上限，下次接着收）' : ''), true);
+    await tmLoad(true);
+  }else{
+    tmPageStatus('没收成：' + tmEsc((res && res.reason) || '未知原因'));
+  }
+}
+
+/* 整页状态栏（与弹窗的状态分开存，互不覆盖） */
+let TMP_STATUS = '';
+
+function tmPageStatus(html, ok){
+  TMP_STATUS = html;
+  const el = $('#tpgStatus');
+  if(el){
+    el.innerHTML = html;
+    el.classList.toggle('on', !!ok);
+  }
+}
+
+/* 整页上的四个动作（复用弹窗那套 API） */
+async function tmPageAction(what, rounds){
+  if(tmPageAction._busy) return;
+  const btns = ['tpgOpen','tpgFetch','tpgSync','tpgDL'].map(id=>$('#'+id));
+  const disable = (v) => btns.forEach(b=>{ if(b) b.disabled = v; });
+
+  if(what === 'open'){
+    tmPageStatus('正在打开 Teams 窗口…');
+    disable(true);
+    try{
+      const r = await apiTeamsOpen();
+      tmPageStatus(r && r.ok
+        ? '窗口已打开。在里面登录并点开一个会话，然后回来点「同步」。'
+        : '打开失败：' + ((r && r.error) || '未知原因'));
+    }catch(e){ tmPageStatus('打开失败：' + e); }
+    finally{ disable(false); }
+    return;
+  }
+
+  if(what === 'dl'){
+    tmPageStatus('正在下载附件并读取 PDF…');
+    disable(true);
+    try{
+      const r = await apiTeamsDownload();
+      if(r && r.ok){
+        tmPageStatus(`已下载 <b>${r.downloaded}</b> / ${r.total} 个附件 · `
+          + `读到文字 <b>${r.text_extracted}</b> 份`, true);
+        toast('附件处理完成', 'ok', '');
+      }else{
+        tmPageStatus('未完成：' + ((r && r.reason) || '未知原因'));
+      }
+      await tmLoad(true);
+    }catch(e){ tmPageStatus('出错：' + e); }
+    finally{ disable(false); }
+    return;
+  }
+
+  /* 同步 */
+  tmPageAction._busy = true;
+  disable(true);
+  tmPageStatus(rounds > 10
+    ? '正在往更深处翻并读取……可能要一两分钟'
+    : '正在往回翻并读取页面……大约 15~40 秒');
+
+  try{
+    const r = await apiTeamsSync(rounds);
+    if(r && r.ok){
+      const roundsTxt = r.scroll_rounds
+        ? ` · 往回翻 <b>${r.scroll_rounds}</b> 轮`
+          + (r.scroll_grew ? `（<b>${r.scroll_grew}</b> 轮有新内容）`
+                           : '（没有更早的）')
+        : '';
+      tmPageStatus(
+        `读了 <b>${r.scanned||0}</b> 条 · `
+        + `EC <b>${r.ec||0}</b> · 其他 <b>${r.posts||0}</b> · `
+        + `附件 <b>${r.attachments||0}</b>` + roundsTxt
+        + (r.at_top ? ' · <b>已到最早</b>' : ''), true);
+      toast('Teams 同步完成', 'ok', '');
+    }else{
+      const why = (r && r.reason) || '未知原因';
+      tmPageStatus('未完成：' + why);
+      /*  busy = 互斥闸提示「另一个 Teams 操作在跑」，不是出错 */
+      if(!(r && r.busy)) toast('同步未完成', 'err', '');
+    }
+    await tmLoad(true);
+  }catch(e){
+    tmPageStatus('出错：' + e);
+  }finally{
+    tmPageAction._busy = false;
+    disable(false);
+  }
 }
 
 function openTeams(){
   const host = $('#teampanel');
-  if(host) host.classList.add('open');
-  tmLoad();
+  if(host) host.classList.add('open');  tmLoad();
 }
 
 function closeTeams(){
@@ -1272,6 +3224,13 @@ function closeTeams(){
 }
 
 function bindTeams(){
+  /*  幂等：只绑一次。
+      页面里有两个 DOMContentLoaded 监听器都会调到这里，
+      重复绑定会让部分逻辑互相干扰（重建 DOM 会丢监听器）。
+      踩过的坑：表现为「点了没反应」且不报错。 */
+  if(bindTeams._done) return;
+  bindTeams._done = true;
+
   const btn = $('#btnTeams');
 
   btn?.addEventListener('click', e=>{
@@ -1329,8 +3288,11 @@ function bindTeams(){
           (r.at_top ? ' · <b>已到最早</b>' : ''), true);
         toast('Teams 同步完成', 'ok', '');
       }else{
-        tmSetStatus('未完成：' + ((r && r.reason) || '未知原因'));
-        toast('同步未完成：' + ((r && r.reason) || ''), 'err', '');
+        const why = (r && r.reason) || '未知原因';
+        tmSetStatus('未完成：' + why);
+        /*  busy 是互斥闸在说话（「另一个 Teams 操作正在跑」）——
+            那是「稍后再试」，不是出错，不弹红 toast 吓人 */
+        if(!(r && r.busy)) toast('同步未完成：' + why, 'err', '');
       }
       await tmLoad(true);   /* 只刷新列表，保住刚同步出来的状态文字 */
       tmRender();
@@ -1354,29 +3316,65 @@ function bindTeams(){
     doSync(25, $('#tmMore'));
   });
 
-  /* 下载 EC 附件 + 提取 PDF 文字 */
+  /* 下载 EC 名单 PDF + 提取文字 + 扫名字 */
   $('#tmDL')?.addEventListener('click', async e=>{
     e.stopPropagation();
     const b = $('#tmDL');
     if(b?.classList.contains('busy')) return;
     b?.classList.add('busy');
-    tmSetStatus('正在下载附件并读取 PDF……');
+    tmSetStatus('正在取 EC 名单 PDF……');
+
+    /*  这一趟要开浏览器 + 逐份下载，可能几十秒。
+        所以起一个轮询，把后端进度显示出来 ——
+        不然用户会以为卡死了。 */
+    let tick = null;
+    const apiProg = window.pywebview?.api?.ec_download_status;
+    if(apiProg){
+      tick = setInterval(async ()=>{
+        try{
+          const st = await apiProg();
+          if(st && st.running && st.message) tmSetStatus(st.message);
+        }catch(_){}
+      }, 1500);
+    }
 
     try{
       const r = await apiTeamsDownload();
       if(r && r.ok){
-        tmSetStatus(
-          `已下载 <b>${r.downloaded}</b> / ${r.total} 个附件 · ` +
-          `读到文字 <b>${r.text_extracted}</b> 份`, true);
-        toast('附件处理完成', 'ok', '');
+        const parts = [];
+        if(r.extracted) parts.push(`读到 <b>${r.extracted}</b> 份名单`);
+        if(r.downloaded) parts.push(`新下载 <b>${r.downloaded}</b> 份`);
+        tmSetStatus(parts.length ? parts.join(' · ') : '没有新的名单',
+                    true);
+
+        /*  命中就报出来 —— 这是用户填名字的**唯一目的** */
+        const w = r.watch || {};
+        if(w.alert && w.found && w.found.length){
+          toast('EC 名单上有你：' + w.found.join('、'), 'warn', '');
+        }else if(r.note){
+          toast('EC 名单', 'info', r.note);
+        }else if(r.extracted){
+          toast('名单里没有你', 'ok', '');
+        }
+
+        /*  有需要手动过 MFA 的，单独说清（别混在 toast 里一笔带过）*/
+        if(r.need_login && r.need_login.length){
+          tmSetStatus(
+            `另有 <b>${r.need_login.length}</b> 份在站点文档库里，`
+            + `需要先完成一次 Microsoft 二次验证（MFA）。`
+            + `<br><span class="dim">${r.need_login.map(esc).join('、')}`
+            + `</span>`, true);
+        }
       }else{
-        tmSetStatus('未完成：' + ((r && r.reason) || '未知原因'));
+        tmSetStatus('未完成：' + ((r && (r.note || r.reason)) || '未知原因'));
       }
       await tmLoad(true);   /* 只刷新列表，保住刚处理完的状态文字 */
       tmRender();
+      ecRefresh();          /* 顺手刷一下顶栏红点 */
     }catch(err){
       tmSetStatus('出错：' + err);
     }finally{
+      if(tick) clearInterval(tick);
       b?.classList.remove('busy');
     }
   });
@@ -1795,6 +3793,13 @@ function clSave(){
 }
 
 function bindCustomPanel(){
+  /*  幂等：只绑一次。
+      页面里有两个 DOMContentLoaded 监听器都会调到这里，
+      重复绑定会让部分逻辑互相干扰（重建 DOM 会丢监听器）。
+      踩过的坑：表现为「点了没反应」且不报错。 */
+  if(bindCustomPanel._done) return;
+  bindCustomPanel._done = true;
+
   /* 按钮是动态渲染的（每次重绘课表都会重建），
      所以用**事件委托**挂在 document 上，而不是直接绑按钮。 */
   document.addEventListener('click', e => {
@@ -1831,9 +3836,74 @@ function bindCustomPanel(){
 /* ══════════ 折叠区块外壳 ══════════
     这个函数在拆文件时丢过一次（原 index.html 里就被截断了），
      从备份恢复。它是所有折叠区块（待办/测验/作业/课表分组）的容器。 */
+/* ══════════ 阅读状态（0.5.2）══════════
+
+   render() 在数据变化时会重建整块 DOM（#page-grade / #page-sch …）。
+   数据每 5 分钟自动刷新一次，用户可能正好在滚动或折叠某个区块 ——
+   重建后回到顶部、折叠全开，很难受。
+
+   这里在重建**前**把三件事记下来，重建后放回去：
+     ① 滚动位置：用**锚点元素**（第一个底边 > 0 的 [data-anchor]）
+        及其 top —— 内容高度变了也能对得准，比只记 scrollTop 强
+     ② 展开状态：[data-tg] 折叠区的开合（本项目存在 collapsed 里，
+        本来就不丢，这里只是保证重建后类名对得上）
+     ③ 局部滚动：[data-keep-scroll] 容器各自的 scrollTop
+
+   ★ 不做选区/光标恢复 —— 本界面没有「边看边编辑长文本」的场景，
+     而表单输入框都是独立浮层（不受重建影响）。
+ */
+function saveReading(host){
+  if(!host) return null;
+  try{
+    const scroller = document.getElementById('viewport') || document.documentElement;
+    const st = { top: scroller.scrollTop, anchors: [], inner: [] };
+    /*  锚点：第一个还在视口下方的带标记元素，记下它离视口顶多远。
+        重建后按同样的距离把它放回原处。 */
+    const marks = host.querySelectorAll('[data-anchor]');
+    for(const el of marks){
+      const r = el.getBoundingClientRect();
+      if(r.bottom > 0){
+        st.anchors.push({ key: el.getAttribute('data-anchor'), off: r.top });
+        break;
+      }
+    }
+    host.querySelectorAll('[data-keep-scroll]').forEach((el, i)=>{
+      st.inner.push({ i, top: el.scrollTop });
+    });
+    return st;
+  }catch(e){ return null; }
+}
+
+function restoreReading(host, st){
+  if(!host || !st) return;
+  try{
+    /* ① 局部滚动 */
+    if(st.inner && st.inner.length){
+      const boxes = host.querySelectorAll('[data-keep-scroll]');
+      st.inner.forEach(x=>{
+        const el = boxes[x.i];
+        if(el) el.scrollTop = x.top;
+      });
+    }
+    /* ② 滚动位置：优先用锚点对位 */
+    const scroller = document.getElementById('viewport') || document.documentElement;
+    if(st.anchors && st.anchors.length){
+      const a = st.anchors[0];
+      const el = host.querySelector(`[data-anchor="${CSS.escape(a.key)}"]`);
+      if(el){
+        const off = el.getBoundingClientRect().top;
+        scroller.scrollTop += (off - a.off);
+        return;
+      }
+    }
+    /* 拿不到锚点就退回直接赋原值 */
+    scroller.scrollTop = st.top;
+  }catch(e){}
+}
+
 function section(id, title, countHtml, inner, extra=''){
   const isC = collapsed[id];
-  return `<div class="sec ${isC?'collapsed':''}">
+  return `<div class="sec ${isC?'collapsed':''}" data-anchor="sec-${id}">
     <div class="sechead" data-tg="${id}">
       <span class="arw">▼</span>
       <span class="t">${title}</span>
@@ -1919,10 +3989,14 @@ function fillDay(dayLessons, periods){
 
   /* 按节次名索引已有的课（"P3" → lesson） */
   const byP = {};
-  const noP = [];                     /* 没写节次的课（晚自习等） */
+  const noP = [];                     /* 不在节次表里的课 */
   for(const l of dayLessons){
     const key = (l.period || '').trim().toUpperCase();
-    if(key && my.some(x => x.period.toUpperCase() === key)){
+    /*  ★ 自编课一律走「按时间落位」那条路（见下），
+        不直接塞进 byP。原因：按时刻填的自编课也会带一个
+        反推出来的节次名，若按名字归位，它就会和该节的真课
+        并在一起、顺序不受控制。按时间算才能保证插在正确位置。 */
+    if(key && !l.custom && my.some(x => x.period.toUpperCase() === key)){
       /* 同一节次可能有多门（冲突），用数组存 */
       (byP[key] = byP[key] || []).push(l);
     }else{
@@ -1944,14 +4018,21 @@ function fillDay(dayLessons, periods){
   my.forEach((pd, i)=>{ slotOf[pd.period.toUpperCase()] = i; });
 
   for(const l of noP){
-    const t = hm2min(l.start);
+    /*  时间来源：手填的 start/end，或（按节次填的）该节次的时间。
+        customForDay 已经补过一遍，这里再兜一次底，
+        保证「按时间落位」总有时间可算。 */
+    let st = l.start, en = l.end;
+    if(hm2min(st) == null){
+      const pt = periodTimes(l.period);
+      if(pt){ st = pt.start; en = en || pt.end; }
+    }
+    const t = hm2min(st);
     if(t == null){ tail.push(l); continue; }
 
-    /* ① 重叠过半 → 就是那一节 */
-    const hit = bestPeriodByOverlap(l.start, l.end, my);
+    /* ① 整段与某一节重叠过半 → 就是那一节，和该节排在一起 */
+    const hit = bestPeriodByOverlap(st, en, my);
     if(hit){
       const key = String(hit.period || '').toUpperCase();
-      if(!l.period) l.period = hit.period;      /* 标上节次名，数据更一致 */
       (byP[key] = byP[key] || []).push(l);
       continue;
     }
@@ -2012,23 +4093,46 @@ function completeSchedule(lessons, periods){
   const byDay = {};
   for(const l of lessons) (byDay[l.day] = byDay[l.day] || []).push(l);
 
-  /* 自编课也按天塞进去。
-      范围只到「抓取数据覆盖的最后一天 + 0」，不要往前铺三周 ——
-       否则「每周一上操」会在后续课程区刷出 3 个周一，很吵。
-       抓取范围本身是「昨天 ~ 未来 14 天」，跟着它走就够了。 */
   const allDays = new Set(Object.keys(byDay));
   const dayKeys = [...allDays].sort();
   const lastReal = dayKeys.length ? dayKeys[dayKeys.length - 1] : '';
 
+  const isoOf = (dt) => `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+  const todayIso = isoOf(new Date());
+
+  /*  ══════════ 范围门 ══════════
+      加这个门的本意：不要让「每周一上操」铺到抓取范围之外，
+      否则后续课程区会刷出一堆重复的周一，很吵。
+
+      ★ 但它不该把自编课全挡掉 —— 曾出过的问题：
+        抓取数据只到昨天时（数据还没刷新 / 预览环境），
+        「今天」的课全被 continue 跳过，用户加的自编课根本不出现。
+        所以门只在「抓取数据确实覆盖到今天或以后」时才生效。 */
+  const gateOn = lastReal && lastReal >= todayIso;
+
+  /* ① 滚动窗口：-1 ~ +15 天（装得下每周重复的自编课） */
   for(let d = -1; d <= 15; d++){
     const dt = new Date(); dt.setDate(dt.getDate() + d);
-    const iso = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
-    /* 超出抓取范围就不展开（除非那天本来就有课） */
-    if(lastReal && iso > lastReal && !allDays.has(iso)) continue;
+    const iso = isoOf(dt);
+    if(gateOn && iso > lastReal && !allDays.has(iso)) continue;
     const extra = customForDay(iso);
     if(extra.length){
       byDay[iso] = (byDay[iso] || []).concat(extra);
       allDays.add(iso);
+    }
+  }
+
+  /*  ② 单次课（指定了具体日期）不受窗口限制 ——
+        用户明确填了「某月某日有这节课」，就该在那天出现，
+        不管它是不是落在抓取范围内。 */
+  for(const c of customLessons()){
+    if(!c || !c.once || !c.day) continue;
+    if(allDays.has(c.day)) continue;          /* ① 已经收过了 */
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(c.day)) continue;
+    const extra = customForDay(c.day);
+    if(extra.length){
+      byDay[c.day] = (byDay[c.day] || []).concat(extra);
+      allDays.add(c.day);
     }
   }
 
@@ -2215,30 +4319,42 @@ function switchTab(i, animate){
       if(first){ FSTATE.cid = first; filesLoad('', false); }
     }
   }
+
+  /*  进入「Teams」栏 → 渲染并刷新一次
+      （数据可能刚收过，或是首次进来还没有） */
+  if(i === 4){
+    tmRenderPage();      /* ★ 函数名是 tmRenderPage —— 早先写的
+                            renderTeamsPage 从来没定义过，
+                            导致切到 Teams 页什么都不渲染 */
+    tmLoad();
+  }
 }
 
 /* ══════════ 下载 ══════════ */
 function apiDownloadTask(cid, tid, title){
+  watchDownload();
   if(window.pywebview?.api?.download_task)
     return window.pywebview.api.download_task(cid, tid, title);
-  if(IS_WEB)
+  if(isWebMode())
     return fetch(`/api/download_task?cid=${encodeURIComponent(cid)}`
       +`&tid=${encodeURIComponent(tid)}&title=${encodeURIComponent(title)}`)
       .then(r=>r.json()).then(d=>{ showDownloadResult(d, title); return d; });
 }
 function apiDownloadFiles(cid, name){
+  watchDownload();
   if(window.pywebview?.api?.download_files)
     return window.pywebview.api.download_files(cid, name);
-  if(IS_WEB)
+  if(isWebMode())
     return fetch(`/api/download_files?cid=${encodeURIComponent(cid)}`
       +`&name=${encodeURIComponent(name)}`).then(r=>r.json())
       .then(d=>{ showDownloadResult(d, name); return d; });
 }
 /* 单个附件直链下载（任务详情面板用） */
 function apiDownloadFile(url, filename, subdir){
+  watchDownload();
   if(window.pywebview?.api?.download_file)
     return window.pywebview.api.download_file(url, filename, subdir || '');
-  if(IS_WEB)
+  if(isWebMode())
     return fetch('/api/download_file?url=' + encodeURIComponent(url)
       + '&name=' + encodeURIComponent(filename))
       .then(r=>r.json()).then(d=>{ showDownloadResult(d, filename); return d; });
@@ -2247,7 +4363,7 @@ function apiDownloadFile(url, filename, subdir){
 function apiOpenFolder(path){
   if(window.pywebview?.api?.open_folder)
     return window.pywebview.api.open_folder(path);
-  if(IS_WEB) return fetch('/api/open_folder?path='+encodeURIComponent(path));
+  if(isWebMode()) return fetch('/api/open_folder?path='+encodeURIComponent(path));
 }
 
 /* 窗口模式：Python 下载完成后回调这里 */
@@ -2291,6 +4407,129 @@ function toast(text, kind, folder){
   }
   clearTimeout(toastTimer);
   toastTimer = setTimeout(()=>{ el.className = ''; }, 5200);
+}
+
+/* ══════════ 下载进度 ══════════
+
+   为什么要有这一块
+   ----------------
+   所有下载接口都是「起一个后台线程就立刻返回」，所以界面**拿不到任何过程信息**，
+   只弹一个 toast 就消失了。用户以为没成功，就再点一次 —— 于是同一个文件被
+   下了两遍。实测桌面里出现了 `Biology.pdf` 与 `Biology (1).pdf`，
+   **SHA256 完全相同、各 213 MB**，白白多下 203 MB。
+
+   现在这里每 400ms 问一次后端，显示出：
+       文件名 · 百分比 · 已下载 · 速度 · 剩余时间
+   总大小未知时（响应没有 Content-Length）不显示百分比和剩余时间，
+   改用不定长流动条 —— 宁可不显示，也不显示一个瞎跳的假倒计时。
+
+   渲染用「补零宽度」的等宽数字，免得速度数字跳动时整行左右抖。 */
+
+let _dlPollTimer = null;
+let _dlSeenRunning = false;
+let _dlPollStart = 0;
+
+function fmtBytes(n){
+  n = Number(n) || 0;
+  if(n < 1024) return Math.round(n) + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while(n >= 1024 && i < u.length - 1);
+  return n.toFixed(1) + ' ' + u[i];
+}
+
+function fmtEta(sec){
+  sec = Math.max(0, Number(sec) || 0);
+  if(sec < 60) return Math.round(sec) + ' 秒';
+  if(sec < 3600) return Math.floor(sec / 60) + ' 分 ' + Math.round(sec % 60) + ' 秒';
+  return Math.floor(sec / 3600) + ' 小时 ' + Math.round((sec % 3600) / 60) + ' 分';
+}
+
+function dlEl(){
+  let el = document.getElementById('dlprog');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'dlprog';
+    el.innerHTML =
+      '<div class="dp-head">'
+      + '<span class="dp-idx" id="dlIdx"></span>'
+      + '<span class="dp-name" id="dlName">正在准备下载…</span></div>'
+      + '<div class="dp-bar"><div class="dp-fill" id="dlFill"></div></div>'
+      + '<div class="dp-meta"><span id="dlLeft"></span>'
+      + '<span id="dlRight"></span></div>';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function dlShow(){ dlEl().classList.add('show'); }
+function dlHide(){
+  const el = document.getElementById('dlprog');
+  if(el) el.classList.remove('show');
+}
+
+function apiDownloadProgress(){
+  if(window.pywebview?.api?.download_progress)
+    return window.pywebview.api.download_progress();
+  return Promise.resolve(null);
+}
+
+function renderDownloadProgress(s){
+  const el = dlEl();
+  const total = s.total || 0, idx = s.index || 0;
+
+  const idxEl = document.getElementById('dlIdx');
+  if(idxEl) idxEl.textContent = total > 1 ? '(' + idx + '/' + total + ')' : '';
+  const nameEl = document.getElementById('dlName');
+  if(nameEl) nameEl.textContent = s.name || '正在准备…';
+
+  const pct = (s.percent == null) ? null : Number(s.percent);
+  el.classList.toggle('indet', pct == null);
+  const fill = document.getElementById('dlFill');
+  if(fill && pct != null){
+    fill.style.width = Math.max(1, Math.min(100, pct)) + '%';
+  }
+
+  const left = document.getElementById('dlLeft');
+  const right = document.getElementById('dlRight');
+
+  const a = [];
+  if(pct != null) a.push(pct.toFixed(0) + '%');
+  a.push('已下载 ' + fmtBytes(s.done));
+  if(left) left.textContent = a.join(' · ');
+
+  const b = [];
+  if(s.speed > 0) b.push(fmtBytes(s.speed) + '/s');
+  if(s.eta) b.push('剩余 ' + fmtEta(s.eta));
+  if(right) right.textContent = b.join(' · ');
+}
+
+function stopDownloadWatch(){
+  if(_dlPollTimer){ clearInterval(_dlPollTimer); _dlPollTimer = null; }
+}
+
+/* 任何下载动作开始时调用一次，进度卡就会出现。 */
+function watchDownload(){
+  _dlSeenRunning = false;
+  _dlPollStart = Date.now();
+  dlShow();
+  if(_dlPollTimer) return;
+  _dlPollTimer = setInterval(async ()=>{
+    let s = null;
+    try{ s = await apiDownloadProgress(); }catch(_){}
+    if(!s || !s.running){
+      /* 还没见过 running：可能后端还没开始（或文件太小已经结束），
+         给 3.5 秒宽限再收起来，避免一闪而过。 */
+      if(!_dlSeenRunning && (Date.now() - _dlPollStart) < 3500) return;
+      const seen = _dlSeenRunning;
+      stopDownloadWatch();
+      /* 真下载过就多停 0.9 秒，让人看清最后的 100% */
+      setTimeout(dlHide, seen ? 900 : 0);
+      return;
+    }
+    _dlSeenRunning = true;
+    renderDownloadProgress(s);
+  }, 400);
 }
 
 /* ══════════ 晚报 ══════════
@@ -2380,19 +4619,67 @@ function dgSection(iconName, title, n, list, kind, emptyText){
 }
 
 /* 渲染整份晚报 */
+/* 晚报历史按日期从旧到新排序（后端已排好，这里再兜一次） */
+function dgHistorySorted(d){
+  const list = ((d && d.history) || [])
+    .filter(x => x && x.date)
+    .slice();
+  list.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  return list;
+}
+
+/* 期数导航条：上一期 / 下一期 / 回到最新。
+   所有按钮统一用 data-dgdate，由 bindDigest 里的一个处理器接管。 */
+function dgNavHTML(d, curDate){
+  const hist = dgHistorySorted(d);
+  const latest = d.latest_date
+    || (hist.length ? hist[hist.length - 1].date : '');
+  const cur = curDate || (d && d.date) || '';
+  const i = hist.findIndex(x => x.date === cur);
+  const prev = i > 0 ? hist[i - 1] : null;
+  const next = (i >= 0 && i < hist.length - 1) ? hist[i + 1] : null;
+  const isPast = !!latest && cur !== latest;
+
+  let h = `<div class="dg-nav">`;
+  h += `<button class="dgnav-btn" data-dgdate="${prev ? esc(prev.date) : ''}"
+    ${prev ? '' : 'disabled'} title="${prev ? esc(prev.date) + ' ' + esc(prev.weekday || '') : '没有更早的一期'}">
+    ${icon('i-back','sm')}<span>上一期</span></button>`;
+  h += `<span class="dgnav-cur">${esc(cur)}`
+     + (isPast ? `<span class="past">往期</span>` : '')
+     + `</span>`;
+  h += `<button class="dgnav-btn" data-dgdate="${next ? esc(next.date) : ''}"
+    ${next ? '' : 'disabled'} title="${next ? esc(next.date) + ' ' + esc(next.weekday || '') : '这已经是最新一期'}">
+    <span>下一期</span>${icon('i-chevright','sm')}</button>`;
+  if(isPast){
+    h += `<button class="dgnav-btn latest" data-dgdate="${esc(latest)}"
+      title="回到 ${esc(latest)}">${icon('i-mail','sm')}<span>回到最新</span></button>`;
+  }
+  h += `</div>`;
+  return h;
+}
+
 function digestRender(d, curDate){
   const c = d.counts || {};
   const g = d.gpa || {};
 
+  const isPast = d.is_latest === false;
+
   let h = `<div class="dg-head">
     <span class="oi" style="color:var(--blue)">${''}</span>
     <div style="flex:1;min-width:0">
-      <div class="t">${icon('i-mail','sm inl')}今日晚报</div>
+      <div class="t">${icon('i-mail','sm inl')}${isPast ? '往期晚报' : '今日晚报'}</div>
       <div class="d">${esc(d.date||'')} ${esc(d.weekday||'')} · 生成于 ${esc(d.generated||'')}</div>
     </div>
     <button class="dg-x" id="dgClose" title="关闭">${icon('i-x','sm')}</button>
   </div>
   <div class="dg-body">`;
+
+  /* ── 期数导航（常驻）──
+     【为什么放最上面且不依赖 history 之外的任何条件】
+       「往期晚报」那一行按钮原来只在 history 够长时才渲染，
+       而按日期取某一期时后端不带 history —— 点进去就整块消失，
+       既回不到最新也换不到别的日期。导航因此必须**独立存在**。 */
+  h += dgNavHTML(d, curDate);
 
   /* ── 总 GPA（简单平均） ── */
   h += `<div class="dg-hero">
@@ -2451,7 +4738,7 @@ function digestRender(d, curDate){
     </div></div>`;
 
   /* ── 历史期数（可翻看） ── */
-  const hist = (d.history||[]).filter(x=>x.date);
+  const hist = dgHistorySorted(d);
   if(hist.length > 1){
     h += `<div class="dg-hist">
       <div class="hh">往期晚报</div>
@@ -2518,20 +4805,43 @@ function bindDigest(curDate){
     });
   });
 
-  /* 翻看往期 */
+  /*  翻期：导航条（上一期 / 下一期 / 回到最新）与「往期晚报」
+      按钮行走的是同一个处理器 —— 它们都带 data-dgdate。
+      禁用的按钮 data-dgdate 为空，下面直接跳过。 */
   host.querySelectorAll('[data-dgdate]').forEach(b=>{
-    b.addEventListener('click', ()=>{
-      const d = b.dataset.dgdate;
-      if(d === curDate) return;
-      apiDigestByDate(d).then(res=>{
-        if(res && res.ok !== false){
-          res.history = res.history || [];
-          const wrap = $('#digwrap');
-          if(wrap) wrap.innerHTML = digestRender(res, d);
-          bindDigest(d);
-        }
-      }).catch(()=>{});
+    if(b.dataset.dgbound) return;
+    b.dataset.dgbound = '1';
+    b.addEventListener('click', e=>{
+      e.stopPropagation();
+      const want = b.dataset.dgdate;
+      if(!want) return;
+      if(want === curDate) return;          /* 点的就是当前这一期 */
+      if(b.dataset.dgload === '1') return;  /* 防连点：一次只切一期 */
+      b.dataset.dgload = '1';
+      dgOpenDate(want);
     });
+  });
+}
+
+/* 切到某一期。失败要说出来 —— 以前失败是静默的，
+   用户只会看到「点了没反应」。 */
+function dgOpenDate(date){
+  if(!date) return;
+  apiDigestByDate(date).then(res=>{
+    if(!res || res.ok === false){
+      toast((res && res.error) || '这一期打不开', 'err', '');
+      return;
+    }
+    const wrap = $('#digwrap');
+    if(!wrap) return;
+    wrap.innerHTML = digestRender(res, date);
+    bindDigest(date);
+    /*  切期后回到顶部：否则会停在上一期的滚动位置，
+        看起来像「内容没变」。 */
+    const body = wrap.querySelector('.dg-body');
+    if(body) body.scrollTop = 0;
+  }).catch(e=>{
+    toast('这一期打不开：' + String(e), 'err', '');
   });
 }
 
@@ -2809,16 +5119,6 @@ function doImport(path){
     });
 }
 
-function refreshDataPanel(){
-  apiBackupStatus().then(st=>{
-    const wrap = $('#datawrap');
-    if(wrap && $('#datapanel')?.classList.contains('open')){
-      wrap.innerHTML = dataRender(st);
-      bindData();
-    }
-  }).catch(()=>{});
-}
-
 function closeData(){
   const host = $('#datapanel');
   if(host) host.classList.remove('open');
@@ -2855,6 +5155,26 @@ function openData(){
 }
 
 /* ══════════ 空状态（避免界面空白） ══════════ */
+
+/*  把「最近一次尝试」与「最近一次有内容」两个时间摆出来。
+    这两个时间不一样时，用户才看得出「现在看的是旧数据」。 */
+function attemptLine(){
+  const at = DATA.last_attempt_at || '';
+  const ok = DATA.last_attempt_ok !== false;
+  const err = DATA.last_attempt_error || '';
+  const up = DATA.updated || '';
+  if(!at) return '';
+  const hm = s => (s || '').slice(11, 16) || (s || '').slice(0, 16);
+  if(ok){
+    return up ? `本次读取：${esc(hm(at))}` : '';
+  }
+  let line = `本次读取未成功`;
+  if(at) line += `（${esc(hm(at))}）`;
+  if(err) line += `：${esc(err)}`;
+  if(up) line += `  ·  当前显示的是 ${esc(up)} 的数据`;
+  return line;
+}
+
 function emptyState(){
   const st = DATA.status || '';
   let iconName = 'i-inbox', title = '暂无数据', desc = '', btn = '';
@@ -2871,20 +5191,39 @@ function emptyState(){
     iconName = 'i-key';
     title = '登录状态已过期';
     desc = DATA.message
-| '程序正在自动重新登录，稍等一会儿就好。';
+      || '程序正在自动重新登录，稍等一会儿就好。';
     btn = `<button class="es-btn" data-relogin="1">
       ${icon('i-refresh','sm')}立即重新登录</button>`;
-  }else if(st === 'error'){
+  }else if(st === 'unread'){
+    /*  本次没读到。与「本来就没内容」分开说 ——
+        不然用户看到「没有待办」不知道能不能信。 */
     iconName = 'i-alert';
-    title = '读取失败';
-    desc = DATA.message || '请检查网络，然后点右上角刷新重试。';
+    title = '本次没读取成功';
+    desc = attemptLine() || DATA.message || '稍后会自动重试。';
     btn = `<button class="es-btn" data-relogin="1">
-      ${icon('i-refresh','sm')}重试</button>`;
+      ${icon('i-refresh','sm')}立即重试</button>`;
+  }else if(st === 'partial'){
+    /*  少数课程没读到、其余已更新。以前后端会发这个态，但这里没有分支，
+        于是它落进最后那条兜底 —— 用户只看到「点右上角刷新试试」，
+        看不出「有些课没取到」这件事。 */
+    iconName = 'i-alert';
+    title = '部分课程没读到';
+    desc = DATA.message || '注意：有课程未取到，其余已更新。';
+    btn = `<button class="es-btn" data-relogin="1">
+      ${icon('i-refresh','sm')}重新读取</button>`;
+  }else if(st === 'empty'){
+    iconName = 'i-checkcircle';
+    title = '本次读取成功：没有内容';
+    desc = DATA.message
+      || '这不是出错 —— 课程都读到了，只是没有待办。';
   }else if(st === 'running'){
     iconName = 'i-hourglass';
     title = '正在读取数据……';
     desc = '正在登录并读取所有课程，约 20 秒。';
   }else{
+    /*  兜底。后端目前产生的态是
+        idle / running / ok / empty / partial / unread / need_login 七种，
+        都已在上面分流；走到这里说明出现了没预料到的态。 */
     desc = '点右上角刷新试试。';
   }
 
@@ -2974,9 +5313,11 @@ let lastCdText = '';
 function tickCountdown(){
   const el = document.querySelector('#page-sch .cdval');
   if(!el) return;
-  /* 课表页不可见时跳过（省 CPU） */
-  const pg = document.querySelector('#page-sch');
-  if(pg && pg.offsetParent === null) return;
+  /*  课表页不可见时跳过（省 CPU）。
+      ⚠ 判定用 curTab 而不是 offsetParent —— 页面是并排横移的，
+      `.page.off` 只改 opacity/scale，offsetParent 永远不为 null，
+      用它会白算一遍（之前的判断从来没生效过）。 */
+  if(curTab !== 1) return;
   if(!DATA) return;
 
   const lessons = (DATA.schedule||{}).lessons || [];
@@ -3006,6 +5347,7 @@ function tickCountdown(){
 let lastSig = '';
 let lastEmptySig = '';      /* 空状态的签名（避免每秒重建） */
 let lastStatsSig = '';      /* 统计卡的签名 */
+let lastFilesSig = '';      /* 资料页的课程列表签名（只在课程变动时重建） */
 
 function render(){
   if(!DATA) return;
@@ -3023,21 +5365,60 @@ function render(){
   const msg = $('#msg');
   const cd = DATA.next_refresh_in;
   let mtext = DATA.message || '';
+  /*  状态条是用户首先看到的地方。
+      本次没读到（unread）时，把「什么时候试过、看的是什么时候的数据」
+      排在前面 —— 否则「数据没变」看起来像程序卡了。 */
+  if(DATA.status === 'unread' && DATA.updated){
+    const at = (DATA.last_attempt_at || '').slice(11, 16);
+    mtext = (at ? `${at} 读取未成功 · ` : '') + DATA.message
+          + `  ·  显示 ${DATA.updated} 的数据`;
+  }
   if(DATA.auto_refresh){
     const auto = cd>0 ? `· ${fmtCountdown(cd)}后自动刷新` : '· 正在刷新…';
     mtext = mtext ? `${mtext}  ${auto}` : auto;
   }
   const mcls = mtext
     ? 'show ' + (DATA.status==='need_login'||DATA.status==='running'
-        ? 'warn' : DATA.status==='error' ? 'err' : '')
+        ? 'warn' : (DATA.status==='unread'||DATA.status==='partial') ? 'err' : '')
     : '';
-  if(msg.textContent !== mtext) msg.textContent = mtext;
+  /*  ★ 状态文字单独放在一个 <span> 里 ——
+      因为 #msg 里还多了一个「立即刷新」按钮。
+      直接写 msg.textContent 会把那个按钮**一起抹掉**
+      （textContent 赋值 = 清空所有子节点）。
+      这是个很容易犯的错，之前「改按钮时把里面 SVG 抹掉」也是同源问题。 */
+  let tx = msg.querySelector('.tx');
+  if(!tx){
+    tx = document.createElement('span');
+    tx.className = 'tx';
+    msg.insertBefore(tx, msg.firstChild);
+  }
+  if(tx.textContent !== mtext) tx.textContent = mtext;
   if(msg.className !== mcls) msg.className = mcls;
+
+  /*  ── 重试键：失败时才出现，成功自动隐藏 ──
+      用户要求：「直到刷新成功再隐藏」。
+      ★ 这里只切换 busy 类，**不隐藏** ——
+        刷新过程中状态会变成 running（不再是 err/warn），
+        按钮自然就藏起来了。所以不用在这里手动控制显隐，
+        交给上面那条 CSS 规则（#msg.err / #msg.warn）即可。 */
+  const rt = msg.querySelector('#msgRetry');
+  if(rt){
+    const busy = DATA.status === 'running';
+    if(rt.classList.contains('busy') !== busy){
+      rt.classList.toggle('busy', busy);
+    }
+  }
 
   const updTxt = DATA.updated || '未更新';
   const updEl = $('#upd');
   if(updEl.textContent !== updTxt) updEl.textContent = updTxt;
-  $('#btnRefresh').classList.toggle('spin', DATA.status==='running');
+  /*  ★ 用 getElementById 拿元素再判空 ——
+      这个按钮已经从标题栏挪到设置面板，
+      而设置面板在文件更后面，`$('#btnRefresh')` 可能拿到 null。
+      直接调 .classList 会整个脚本崩掉（页面白屏）。 */
+  const _rf = document.getElementById('btnRefresh') ||
+              document.getElementById('opRefresh');
+  if(_rf) _rf.classList.toggle('spin', DATA.status==='running');
 
   /* 数据来源徽章（开机预热的成果）
       必须走 renderWarmBadge —— 它内部比对文字签名，
@@ -3054,17 +5435,23 @@ function render(){
     if(dot.textContent !== dtxt) dot.textContent = dtxt;
     if(dot.className !== dcls) dot.className = dcls;
     dot.title = DATA.auto_refresh
-      ? `每 ${(DATA.interval_text || '30 分钟')}自动刷新，还剩 ${fmtCountdown(cd)}`
+      ? `每 ${(DATA.interval_text || '5 分钟')}自动刷新，还剩 ${fmtCountdown(cd)}`
       : '自动刷新已暂停';
   }
-  const ba = $('#btnAuto');
+  /*  自动刷新开关状态 —— 0.5.1 起开关本体在设置面板（opAuto），
+      标题栏只留 #live 倒计时。老 id 留着兜底，拿不到就跳过。 */
+  const ba = document.getElementById('opAuto') ||
+             document.getElementById('btnAuto');
   if(ba){
     /*  不能整个刷 textContent —— 那样会把里面的 <svg> 图标抹掉。
-       只需要换 <use> 的 href 即可。 */
+       换 <use> 的 href、再按变化更新文字即可。 */
     const u = ba.querySelector('use');
     if(u) u.setAttribute('href', DATA.auto_refresh ? '#i-pause' : '#i-play');
     ba.classList.toggle('paused', !DATA.auto_refresh);
-    ba.title = DATA.auto_refresh ? '暂停自动刷新' : '开启自动刷新';
+    const _atxt = DATA.auto_refresh ? '暂停自动刷新' : '开启自动刷新';
+    const _asp = ba.querySelector('span');
+    if(_asp && _asp.textContent !== _atxt) _asp.textContent = _atxt;
+    if(ba.title !== _atxt) ba.title = _atxt;
   }
 
   if(!tasks.length && !courses.length){
@@ -3131,10 +5518,76 @@ function render(){
   const pendingAll = [...overdue, ...today, ...soon, ...later];
 
   /* 只在「数据分组」变化时重建 DOM，避免打断用户滚动/折叠 */
+  /*  ══════════ ★ 签名必须包含成绩（0.5.2 修）══════════
+   *
+   *  【原来为什么坏】
+   *    签名里只有 URL 和剩余天数，**没有成绩**：
+   *
+   *        pendingAll.map(t => t.url + '|' + t.days_left)
+   *
+   *    于是老师给分之后：
+   *      · 任务 URL 没变
+   *      · 剩余天数没变（同一天里看的话）
+   *      → 签名完全相同 → 下面 `if(sig === lastSig) return;`
+   *        直接跳过整页重绘
+   *      → 卡片上的成绩标签、GPA 页的数字**全都停在旧值**
+   *
+   *    用户看到的就是「新获得了成绩，但 GPA 和 tag 没更新」。
+   *
+   *  【修法】
+   *    把「会影响显示」的字段都算进去：成绩、等级、百分比、已评分、
+   *    分类、完成状态。改过成绩就一定会触发重绘。
+   *
+   *  ★ 只加真正影响显示的字段，不要把整个对象 stringify ——
+   *    那会让签名每次都变，每 5 分钟自动刷新都重绘一遍，
+   *    打断用户正在看的折叠/滚动状态（这个坑在 0.5.1 踩过：
+   *    主签名一变就重建，把用户正浏览的资料页打回去了）。
+   */
+  const gradeKey = t =>
+    [t.score, t.level, t.percent, t.graded ? 1 : 0, t.category,
+     t.completed ? 1 : 0, t.submitted ? 1 : 0].join('~');
+
+  /*  「今日新获得」台账的指纹。
+   *
+   *  只取「会影响显示」的字段：条目标题 + 成绩 + 数量。
+   *  ★ 不要整个 JSON.stringify —— 台账里有 days_left 这种每天都变的，
+   *    那样签名每次都会不同，界面每 5 分钟无条件重绘，
+   *    把用户正在看的折叠/滚动状态打断。
+   */
+  const _tnKey = tn => {
+    if(!tn) return '';
+    const g = (tn.grades || []).map(x =>
+      [x.title, x.score, x.level, x.percent].join('~'));
+    const k = (tn.tasks || []).map(x => [x.title, x.due_date].join('~'));
+    return [g.length, k.length, g.join(';'), k.join(';')].join('|');
+  };
+
   const sig = JSON.stringify([
-    pendingAll.map(t=>t.url + '|' + t.days_left), done.length,
+    pendingAll.map(t => t.url + '|' + t.days_left + '|' + gradeKey(t)),
+    done.map(t => t.url + '|' + gradeKey(t)),
+    done.length,
     DATA.updated, DATA.status, collapsed, openCourses,
-    (DATA.schedule||{}).updated, scheduleDirty
+    (DATA.schedule||{}).updated, scheduleDirty,
+    /*  课程总评：GPA 页与「课程与成绩」区块直接读它，
+        改了总评也必须重绘。 */
+    courses.map(c => c.class_id + ':' + (c.overall_percent ?? '')
+                    + '/' + (c.overall_level ?? '')).join(','),
+    /*  分类成绩（Task Category Averages）—— GPA 页表格用 */
+    courses.map(c => (c.categories||[])
+              .map(x => (x.name||'') + ':' + (x.percent ?? '')
+                        + '/' + (x.graded ? 1 : 0)).join(';')).join('|'),
+    /*  ★ 「今日新获得」台账（0.5.2 修）
+     *
+     *  这一块读的是 DATA.today_new，**不是** DATA.tasks ——
+     *  两者是独立的数据源。老师给分之后：
+     *    · DATA.tasks 更新了（上面 gradeKey 能感知）
+     *    · 但「今日新获得」显示的是台账里那条 ——
+     *      以前台账只在「第一次出分」时记一次，改分不更新，
+     *      于是这块永远显示第一次那个分数。
+     *  后端修了（today_new._grade_changed），这里也要把它纳入签名，
+     *  否则台账更新了界面照样不重绘。
+     */
+    _tnKey(DATA.today_new),
   ]);
   if(sig === lastSig) return;
   lastSig = sig;
@@ -3142,6 +5595,10 @@ function render(){
 
   /* ── 第 1 页：课程成绩（待办 / 测验 / 作业分类） ── */
   let h = '';
+
+  /*  重建前先把阅读状态存下来（滚动位置 / 局部滚动），
+      重建后放回。理由见 saveReading 的说明。 */
+  const _readPG = saveReading($('#page-grade'));
 
   const quizList = pendingAll.filter(isQuiz);
   const hwList = pendingAll.filter(t => !isQuiz(t) && isHomework(t));
@@ -3161,6 +5618,11 @@ function render(){
     urgent ? `<span class="warn">${urgent} 项紧急</span>`
            : `<span class="cnt">${pendingAll.length}</span>`,
     taskCards(pendingAll, {showMark}) || '<div class="empty">全部完成</div>');
+
+  /*  ── 今日新获得（用户要求：紧随待办之后）──
+       数据来自 DATA.today_new（后端按天累积的台账）。
+       空的时候 todayNewBlock() 返回空串，界面上完全不出现。 */
+  h += todayNewBlock();
 
   /*  Quiz 独立列表 */
   if(quizList.length){
@@ -3196,17 +5658,29 @@ function render(){
     taskCards(done, {showMark}));
 
   $('#page-grade').innerHTML = h;
+  restoreReading($('#page-grade'), _readPG);
 
   /* ── 第 2 页：今日课表 ── */
+  const _readSCH = saveReading($('#page-sch'));
   $('#page-sch').innerHTML = schedulePage();
+  restoreReading($('#page-sch'), _readSCH);
 
-  /* ── 第 3 页：资料（实时浏览 ManageBac Files） ── */
+  /* ── 第 3 页：资料（实时浏览 ManageBac Files） ──
+
+     ★ 只在「课程列表变了」时才重建这一页。
+       以前主签名一变就重建（某个任务的剩余天数从 3 变 2 也算），
+       而资料页的内容完全由 FSTATE + 用户操作驱动，
+       跟任务列表没关系 —— 重建只会把用户正浏览的文件夹打回去。 */
+  const filesSig = courses.map(c=>c.class_id).join(',');
   if(FSTATE.cid){
-    /* 数据变了 → 重绘（保留当前所在文件夹） */
-    $('#page-files').innerHTML = filesPage();
-    bindFiles();
+    if(filesSig !== lastFilesSig){
+      lastFilesSig = filesSig;
+      $('#page-files').innerHTML = filesPage();
+      bindFiles();
+    }
   }else{
     /* 首次进入：选第一门课并拉取 */
+    lastFilesSig = filesSig;
     const first = (courses[0]?.class_id) || '';
     if(first){
       FSTATE.cid = first;
@@ -3221,6 +5695,20 @@ function render(){
   /* 页签计数 */
   const bt = $('#badge-tasks'), bs = $('#badge-sch');
   if(bt) bt.textContent = todo.length;
+  /*  Teams 徽章：显示已同步的消息条数。
+      没同步过（还没连 Teams）就显示 —，不显示 0 ——
+      0 会让人以为「同步过了但没消息」。 */
+  const btm = $('#badge-tm');
+  if(btm && Array.isArray(TM_ITEMS)){
+    if(TM_ITEMS.length){
+      btm.textContent = TM_ITEMS.length > 99 ? '99+' : TM_ITEMS.length;
+      btm.title = `已同步 ${TM_ITEMS.length} 条消息`;
+    }else{
+      const st = TM_STATUS_CACHE || {};
+      btm.textContent = st.ready ? '0' : '—';
+      btm.title = st.ready ? '同步过，但没有消息' : '还没同步过 Teams';
+    }
+  }
   if(bs){
     const sch = DATA.schedule||{};
     if(sch.ready){
@@ -3234,10 +5722,25 @@ function render(){
       bs.textContent = '—';
     }
   }
+  /*  GPA 页签：显示「有总评的课程数」。
+      0.5.1 之前忘了写这个徽章，一直是个破折号。 */
+  const bg = $('#badge-gpa');
+  if(bg){
+    const nGpa = courses.filter(c => c.overall_percent != null).length;
+    bg.textContent = nGpa || '—';
+    bg.title = nGpa ? `${nGpa} 门课有总评` : '还没有出总评的课程';
+  }
+
+  /*  GPA 页是切进去时才渲染的；数据刷新后如果正停在这一页，
+      重绘一次，免得看到上一轮的数字。 */
+  if(curTab === 2) renderGpaPage();
 
   bind();
   /*  空状态里的「修复」按钮也要绑定（它们不在 bind() 的扫描范围内） */
   bindRelogin(document);
+  /*  刚长出来的卡片还没贴液态玻璃的类（.lq / .lq-eff）。
+      lqMark / lqFlow 本身幂等，已贴过的不重复。 */
+  try{ lqFlow(document.body); }catch(e){}
 }
 
 /* ══════════ 「我已完成，不再提示」 ══════════
@@ -3246,16 +5749,27 @@ function render(){
     只存本机，不会写入 ManageBac，不影响学校系统。 */
 
 /* 找到本地缓存的任务对象（用于取 title / course） */
+/* 在 DATA 里按 URL 反查任务。
+ *
+ *  ★ 要比对「去掉 # 片段」之后的 URL：
+ *    ManageBac 的同一个任务在不同页面可能带不同的锚点，
+ *    只做全等比较会漏掉，于是 dpPreferListGrade 拿不到最新成绩。
+ *    （0.5.2 修成绩不更新时发现的）
+ */
 function findTaskByUrl(url){
   const all = [...(DATA?.tasks||[])];
   (DATA?.courses||[]).forEach(c => (c.tasks||[]).forEach(t => all.push(t)));
-  return all.find(t => t.url === url) || null;
+  const norm = u => String(u || '').split('#')[0];
+  const target = norm(url);
+  return all.find(t => t.url === url)            /* 先试全等（最快） */
+      || all.find(t => norm(t.url) === target)   /* 再试去锚点 */
+      || null;
 }
 
 function apiMarkDone(url, title, course){
   if(window.pywebview?.api?.mark_done)
     return window.pywebview.api.mark_done(url, title, course);
-  if(IS_WEB)
+  if(isWebMode())
     return fetch('/api/mark_done?url=' + encodeURIComponent(url)
       + '&title=' + encodeURIComponent(title)
       + '&course=' + encodeURIComponent(course)).then(r=>r.json());
@@ -3265,7 +5779,7 @@ function apiMarkDone(url, title, course){
 function apiUnmarkDone(url, title, course){
   if(window.pywebview?.api?.unmark_done)
     return window.pywebview.api.unmark_done(url, title, course);
-  if(IS_WEB)
+  if(isWebMode())
     return fetch('/api/unmark_done?url=' + encodeURIComponent(url)
       + '&title=' + encodeURIComponent(title)
       + '&course=' + encodeURIComponent(course)).then(r=>r.json());
@@ -3344,7 +5858,7 @@ let FSTATE = {
 function apiListFiles(cid, fid, force){
   if(window.pywebview?.api?.files_list)
     return window.pywebview.api.files_list(cid, fid || '', !!force);
-  if(IS_WEB)
+  if(isWebMode())
     return fetch('/api/files_list?cid=' + encodeURIComponent(cid)
       + '&fid=' + encodeURIComponent(fid || '')
       + (force ? '&force=1' : '')).then(r=>r.json());
@@ -3353,9 +5867,10 @@ function apiListFiles(cid, fid, force){
 }
 
 function apiFilesDownload(item){
+  watchDownload();
   if(window.pywebview?.api?.files_download)
     return window.pywebview.api.files_download(item);
-  if(IS_WEB)
+  if(isWebMode())
     return fetch('/api/files_download', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(item)
@@ -3364,24 +5879,17 @@ function apiFilesDownload(item){
 }
 
 function apiFilesDownloadAll(cid, fid, className, folderName){
+  watchDownload();
   if(window.pywebview?.api?.files_download_all)
     return window.pywebview.api.files_download_all(cid, fid || '',
                                                    className || '',
                                                    folderName || '');
-  if(IS_WEB)
+  if(isWebMode())
     return fetch('/api/files_download_all?cid=' + encodeURIComponent(cid)
       + '&fid=' + encodeURIComponent(fid || '')
       + '&cls=' + encodeURIComponent(className || '')
       + '&folder=' + encodeURIComponent(folderName || '')).then(r=>r.json());
   return Promise.resolve({ok:false, error:'当前模式不支持'});
-}
-
-function apiFilesOpen(classId){
-  if(window.pywebview?.api?.open_url && classId){
-    const c = (DATA?.courses||[]).find(x => x.class_id === classId);
-    openURL(c ? (c.url + '/files') : '');
-  }
-  return Promise.resolve();
 }
 
 /* ---- 课程选择（下拉） ---- */
@@ -3753,14 +6261,125 @@ function bindFiles(){
 
 let DPANEL_URL = null;        /* 当前展开的面板对应的任务 */
 
-function apiTaskDetail(url){
+/* ══════════ 详情的新鲜度（0.5.2 修）══════════
+ *
+ * 【原来为什么坏】
+ *   apiTaskDetail 固定传 force=false，而后端 taskdetail.fetch 的
+ *   语义是「命中缓存就直接返回，缓存 24 小时」：
+ *
+ *       app/taskdetail.py
+ *         if not force:
+ *             c = _read_cache(tid)      # 24 小时内直接返回
+ *             if c: return c            # ← 含旧成绩
+ *
+ *   于是老师改了分之后：
+ *     · 列表页会更新（每 5 分钟重建，读的是 DATA）
+ *     · **点开详情看到的还是旧成绩**，而且一整天都不会变
+ *   用户看到的就是「一直保持原成绩」。
+ *
+ * 【现在怎么做】
+ *   1. 用**列表页已经抓到的成绩**覆盖详情里的成绩。
+ *      列表每 5 分钟刷新一次，它才是当下最新的事实。
+ *      这一步零成本（数据就在内存里），且立刻见效。
+ *   2. 详情本身加一个「最短 revisit 间隔」：超过 3 分钟再点开就真去抓一次。
+ *      不再让 24 小时缓存挡住成绩变化。
+ *      3 分钟是折中 —— 连着点开几个任务不会被站点限速，
+ *      而改分这种低频事件最多 3 分钟就能看到。
+ */
+const DPANEL_REVISIT_MS = 3 * 60 * 1000;
+
+/* 已展开过的任务：tid → 上次真正联网抓取的时间 */
+const DPANEL_FETCHED = new Map();
+
+function dpTidOf(url){
+  const m = /\/core_tasks\/(\d+)/.exec(url || '');
+  return m ? m[1] : (url || '');
+}
+
+/* 该不该真去抓一次 */
+function dpNeedsFetch(url){
+  const tid = dpTidOf(url);
+  if(!tid) return true;
+  const last = DPANEL_FETCHED.get(tid);
+  return !last || (Date.now() - last) >= DPANEL_REVISIT_MS;
+}
+
+function dpMarkFetched(url){
+  const tid = dpTidOf(url);
+  if(tid) DPANEL_FETCHED.set(tid, Date.now());
+}
+
+function apiTaskDetail(url, force){
+  /*
+      ★ force=true 时后端会**跳过缓存**直接抓页面。
+        注意别在同一个任务上反复用 true —— 站点有限速。
+  */
+  const f = !!force;
+  if(f) dpMarkFetched(url);
   if(window.pywebview?.api?.task_detail)
-    return window.pywebview.api.task_detail(url, false);
-  if(IS_WEB)
-    return fetch('/api/task_detail?url=' + encodeURIComponent(url))
+    return window.pywebview.api.task_detail(url, f);
+  if(isWebMode())
+    return fetch('/api/task_detail?url=' + encodeURIComponent(url)
+                 + (f ? '&force=1' : ''))
       .then(r=>r.json());
   return Promise.resolve({ok:false, error:'当前模式不支持', attachments:[],
                           description:'', grade:{}});
+}
+
+/* 用列表页的成绩覆盖详情里的成绩。
+ *
+ * 【为什么只覆盖成绩，不动别处】
+ *   描述 / 附件在老师改分时不会变，用缓存没问题（还省流量）；
+ *   只有成绩是「会被人改」的字段，所以要以后者为准。
+ *
+ * 【为什么要判空】
+ *   列表页有时读不到成绩（页面没渲染完 / 字段名变了）。
+ *   那种情况下**不要**拿空值去覆盖详情里已有的成绩 ——
+ *   宁可显示略旧的正确值，也不要显示一个空白。
+ */
+function dpPreferListGrade(d, url){
+  try{
+    const t = findTaskByUrl(url);
+    if(!t) return d;
+    const g = (d && d.grade) || {};
+
+    /* 列表页说「有成绩」才覆盖 */
+    const hasListGrade = t.graded && t.score != null && t.score !== ''
+                         && t.score !== 'N/A';
+    if(!hasListGrade) return d;
+
+    const listScore = numOf(t.score);
+    if(listScore == null) return d;
+
+    /* 已经是同一个值就别动（避免无谓的重绘） */
+    if(g.score === listScore && g.percent != null) return d;
+
+    /*  ★ 成绩以**列表页**为准：它是每 5 分钟刷新的新鲜数据，
+        详情缓存里的那个可能是几小时前的（老师改分前）。
+        这里必须让列表页赢 —— 写反了就等于没修。 */
+    const merged = Object.assign({}, g, {
+      score: listScore,
+      percent: (t.percent != null) ? t.percent
+               : ((g.percent != null) ? g.percent
+                  : (t.percent == null && listScore != null
+                     ? listScore : null)),
+      level: t.level || g.level || '',
+      text: (t.level ? t.level + ' ' : '') + listScore
+            + (g.max != null ? ' / ' + g.max : ''),
+    });
+    return Object.assign({}, d, { grade: merged, grade_from_list: true });
+  }catch(e){
+    return d;
+  }
+}
+
+/* 在 DATA 里按 URL 反查任务（实现在前面，见 findTaskByUrl） */
+
+/* 宽松地把 "88" / "88%" / "88 / 100" 变成数字 */
+function numOf(v){
+  if(typeof v === 'number') return v;
+  const m = /(\d+(?:\.\d+)?)/.exec(String(v == null ? '' : v));
+  return m ? parseFloat(m[1]) : null;
 }
 
 function fileIconFor(name){
@@ -3781,12 +6400,6 @@ function icon(name, cls){
   return `<svg class="oi ${cls||''}"><use href="#${name}"/></svg>`;
 }
 /* 把按钮内容换成「加载中」的转圈图标（保留布局尺寸） */
-function setSpin(el, on){
-  if(!el) return;
-  el.innerHTML = on ? icon('i-refresh') : el.dataset.rest;
-  el.classList.toggle('spin', !!on);
-}
-
 /* 打开时的「骨架」—— 立刻显示我们**已经知道**的信息
    （标题 / 课程 / 截止 / 成绩 / 类型），只把「老师要求 + 附件」
    留成占位。这样用户点下去**立刻有反馈**，不用干等 1 秒。
@@ -3843,11 +6456,6 @@ function dpSkeleton(t){
 }
 
 /* 兼容旧调用（不需要任务信息时） */
-function dpLoading(){
-  return `<div class="dpanel"><div class="dp-load">
-    <span class="spin-ic">${icon('i-refresh')}</span>正在读取详情……</div></div>`;
-}
-
 function dpRender(url, d){
   const atts = d.attachments || [];
   const desc = (d.description || '').trim();
@@ -3896,6 +6504,20 @@ function dpRender(url, d){
       ${esc(gtxt || '尚未登记成绩')}</span></div>`;
   }
   h += `</div>`;
+
+  /* ── 教师评语 ──
+     ★ 只有真的有评语才出这张卡。
+       没有就**整个块都不渲染** —— 空卡片比没有卡片更让人困惑：
+       用户会以为是加载失败。 */
+  const cmt = (d.comment || '').trim();
+  if(cmt){
+    const who = (d.comment_author || '').replace(/\s+/g, ' ').trim();
+    h += `<div class="dp-block dp-comment">
+      <div class="dp-label">${icon('i-note','sm inl')}教师评语</div>
+      <div class="dp-cmt">${esc(cmt)}</div>
+      ${who ? `<div class="dp-cmtby">${esc(who)}</div>` : ''}
+    </div>`;
+  }
 
   /* ── 附件 ── */
   if(atts.length){
@@ -4033,7 +6655,17 @@ function toggleDetail(url, cardEl){
     setTimeout(()=>cardEl.classList.remove('dp-src'), 520);
   }
 
-  apiTaskDetail(url).then(d=>{
+  /*  ★ 该不该真去抓一次 —— 由 dpNeedsFetch 按「距上次抓取多久」决定。
+      以前这里固定 force=false，结果 24 小时的缓存一直挡在前面，
+      老师改过分也看不到。现在超过 3 分钟就重新抓。
+      （见文件上方「详情的新鲜度」注释） */
+  const needFresh = dpNeedsFetch(url);
+
+  apiTaskDetail(url, needFresh).then(raw=>{
+    /*  成绩以**列表页**为准 —— 它每 5 分钟刷新一次，
+        是当下最新的事实；详情缓存里的成绩可能已经过时。
+        描述 / 附件仍用详情的（那些内容不会被人改）。 */
+    const d = dpPreferListGrade(raw, url);
     dpSwap(url, panel0, dpRender(url, d));
   }).catch(e=>{
     dpSwap(url, panel0, dpRender(url,
@@ -4127,24 +6759,120 @@ function suClearMsg(){
   if(el) el.className = 'su-msg';
 }
 
-/* 构建引导页（图标 + 眼睛 + 按钮文案都用 icon()，保持一致） */
+/* 构建引导页（图标 + 眼睛 + 按钮文案都用 icon()，保持一致）
+   ★ 三个页面各有自己的按钮，一次都建好 */
 function buildSetup(){
   const ic = $('#suIc'); if(ic) ic.innerHTML = icon('i-shield','lg');
+  $('#suEye')?.replaceChildren();
   const e1 = $('#suEye'); if(e1) e1.innerHTML = icon('i-eye','sm');
-  const f1 = $('#suFic'); if(f1) f1.innerHTML = icon('i-cal','sm inl');
-  const g1 = $('#suGo');  if(g1) g1.innerHTML = icon('i-check','sm') + '<span>登录</span>';
+  const e2 = $('#suSchEye'); if(e2) e2.innerHTML = icon('i-eye','sm');
+  const g1 = $('#suGo');
+  if(g1) g1.innerHTML = icon('i-check','sm') + '<span>登录并继续</span>';
+  const g2 = $('#suGo2');
+  if(g2) g2.innerHTML = icon('i-check','sm') + '<span>保存并继续</span>';
+  const g3 = $('#suGo3');
+  if(g3) g3.innerHTML = icon('i-check','sm') + '<span>完成</span>';
+  suPageSet(1, {force: true});
 }
 
-function openSetup(){
+/* ══════════ 分页引导（一个网站一页）══════════
+
+   ★ 用户的反馈：
+     「初次开启时，输入帐密，一个网站一个页面，方便分辨。」
+
+   三页：
+     1. ManageBac（学校系统）—— 必填
+     2. 课表（希悦校园）    —— 可跳过
+     3. EC 名单名字         —— 可跳过
+
+   ★ 为什么用「页面」而不是一页堆三段：
+     要填的是**两个不同网站**的账号，形态还不一样
+     （一个是学校邮箱、一个是手机号）。
+     堆在一页上填错了才报错，还得回头找是哪个框。
+     分页之后每页顶上都写着「这是哪个系统」。
+
+   ★ 切页用类名 + CSS 动画，不用重建 DOM ——
+     重建会把用户已经填进去的内容丢掉。 */
+let SU_PAGE = 1;
+const SU_PAGES = 3;
+
+/* 跳到第 n 页。back=true 时入场方向反过来（往回翻的手感）。 */
+function suPageSet(n, opt){
+  n = Math.max(1, Math.min(SU_PAGES, n | 0));
+  const prev = SU_PAGE;
+  const back = !!(opt && opt.back) || n < prev;
+  const force = !!(opt && opt.force);
+
+  for(let i = 1; i <= SU_PAGES; i++){
+    const el = document.getElementById('suP' + i);
+    if(!el) continue;
+    el.classList.remove('on', 'out', 'back');
+    if(i === n){
+      el.classList.add('on');
+      if(back) el.classList.add('back');
+    }
+  }
+  /*  步骤点：已在的实心、当前的高亮、没到的浅色。
+      这样能看出「共几页 / 走到哪了」。 */
+  const dots = document.querySelectorAll('#suDots i');
+  dots.forEach((d, idx)=>{
+    d.classList.toggle('on', idx === n - 1);
+    d.classList.toggle('done', idx < n - 1);
+  });
+
+  SU_PAGE = n;
+  suUpdateHead();
+  suClearMsg();
+  /*  换页之后聚焦到这一页的第一个输入框 —— 键盘用户不用再点一下。
+      带 force 的那次（建页面时）不聚焦，否则会抢走主界面的焦点。 */
+  if(!force){
+    setTimeout(()=>{
+      try{
+        const el = document.querySelector('#suP' + n + ' .su-in');
+        el?.focus();
+      }catch(e){}
+    }, 180);
+  }
+}
+
+/* 每页的标题 / 副标题 —— 说的都是「这一页在填谁」 */
+function suUpdateHead(){
+  const T = $('#suTitle'), S = $('#suSub'), F = $('#suFoot');
+  if(T){
+    T.textContent = ({1:'登录', 2:'课表', 3:'EC 名单'})[SU_PAGE] || '登录';
+  }
+  if(S){
+    S.textContent = ({
+      1:'学校系统，必填',
+      2:'希悦校园，可以跳过',
+      3:'可不填',
+    })[SU_PAGE] || '';
+  }
+  if(F){
+    F.textContent = SU_PAGE === 1
+      ? '账号保存在本机。'
+      : ('第 ' + SU_PAGE + ' / ' + SU_PAGES + ' 步');
+  }
+}
+
+function openSetup(page){
   const el = $('#setup');
   if(!el) return;
   el.classList.add('open');
   document.body.classList.add('setting-up');
-  /* 网址默认值：从后端拿到的默认站点里抽域名 */
+  /* 网址默认值：从后端拿到的默认站点里抽域名。
+     ★ 占位域名不预填 —— 预填进去用户会以为已是对的，
+       直接提交打到假域名上。留空让输入框自己的 placeholder
+       露出来，反而更显眼。 */
   const u = $('#suUrl');
   if(u && !u.value){
-    u.value = suHostOf(DEFAULT_HOST || 'your-school.managebac.cn');
+    const h = suHostOf(DEFAULT_HOST || '');
+    if(h && h !== SETUP_PLACEHOLDER_HOST) u.value = h;
   }
+  /*  回填已经存过的东西 —— 用户可能只是漏了课表没填，
+      重新打开引导页时不该让他把账号再打一遍。 */
+  suPrefill();
+  suPageSet(page || 1, {force: true});
   setTimeout(()=>{ try{ $('#suUser')?.focus(); }catch(e){} }, 320);
 }
 function closeSetup(){
@@ -4153,12 +6881,115 @@ function closeSetup(){
   document.body.classList.remove('setting-up');
 }
 
+/* 把后端已经存下的账号回填到对应页 —— 少打一遍字 */
+async function suPrefill(){
+  try{
+    const s = await apiSetupStatus();
+    if(!s) return;
+    const put = (sel, v)=>{
+      const el = $(sel);
+      if(el && !el.value && v) el.value = v;
+    };
+    put('#suUser', s.mb_user);
+    put('#suUrl', s.mb_host);
+    put('#suSchUser', s.sch_user);
+    put('#suEc', (s.ec_names || []).join('、'));
+  }catch(e){}
+}
+
+/* 「跳过」按钮的处理。
+
+   ★ 设计上的一条规则：**跳过的语义是「这一页不填」**。
+     所以如果用户其实已经填了，那就不算跳过 —— 直接按「保存并继续」走
+     （复用 suSubmitSchedule，有「正在保存…」反馈、失败会停在本页报错）。
+
+     早先这里自己写了一遍保存逻辑，结果是：
+       · 点跳过时没有任何反馈，用户不知道是不是在存
+       · 保存失败也照样往下走，内容悄悄丢了
+       · 同一段逻辑写两遍，将来改一处漏一处
+     现在把它交给 suSubmitSchedule，一处逻辑一处改。
+
+   第 2 页（课表）：填了就存，没填就翻下一页。
+   第 3 页（EC）：填了就存 + 收尾，没填就直接收尾。 */
+async function suSkip(n){
+  if(n === 2){
+    const u = ($('#suSchUser')?.value || '').trim();
+    const p = ($('#suSchPw')?.value || '');
+    if(u || p){
+      /* 填了 → 走「保存并继续」（它自己会翻到第 3 页） */
+      await suSubmitSchedule();
+      return;
+    }
+    suPageSet(3);
+    return;
+  }
+  if(n === 3){
+    const ec = ($('#suEc')?.value || '').trim();
+    if(ec){
+      await suSubmitEc();
+      return;
+    }
+    await suFinish('');
+    return;
+  }
+  /* 第 1 页没有跳过（账号必填）—— 保持一致：直接进下一页 */
+  suPageSet(n + 1);
+}
+
+/* 收尾：装自启 + 进主界面 + 抓一次 */
+async function suFinish(ecNames){
+  /*  顺手把开机预热装上 —— 这一步是「装好即用」的最后一块：
+        装完之后，以后开机它自己在后台把数据抓好，
+        点开小组件立刻有内容，不用等。
+      失败也不拦着用户（有些环境不允许写启动文件夹），
+      只记下来，设置面板里还能手动开。 */
+  try{
+    const a = await apiAutostartInstall();
+    AUTOSTART_ON = !!(a && a.ok);
+  }catch(e){ AUTOSTART_ON = false; }
+
+  suMsg('ok', icon('i-check','sm inl')
+    + (AUTOSTART_ON
+        ? '全部搞定！以后开机会自动更新，打开即用。'
+        : '全部搞定！正在读取你的作业和成绩…'));
+
+  HAS_CREDENTIALS = true;      /*  填完了，之后不再显示引导 */
+  setTimeout(()=>{ closeSetup(); }, 700);
+  lastSig = '';
+  poll();
+  try{ await apiRefresh(); }catch(e){}
+  HAS_CREDENTIALS = true;
+}
+
 /* 判断是否需要引导页，需要就打开。
     抽成函数（不直接写在 DOMContentLoaded 里）的理由：
      预览页 / pywebview 可能在 DOMContentLoaded **之后**才注入脚本，
      那种情况下监听器永远不会触发 —— 这是在浏览器里验证时真实踩到的坑。 */
 async function bootSetup(){
   try{
+    /*   打包版实测踩中：pywebview 的 api 是**页面加载完之后**才注入的
+        （见 reportReady 的说明），bootSetup 在初始化时同步就跑，
+        此刻 window.pywebview 多半还没出现 → apiSetupStatus 落到
+        网页模式兜底值 {need_setup:false} → **引导页永远不弹**，
+        新用户第一次打开看到的是空看板而不是三步引导。
+        修法：先等桥出现（最多 3 秒）再问。
+        网页版（app/server.py）永远没有桥，等 3 秒无害 ——
+        那里 need_setup 本来就是 false。注意不能用 IS_WEB 区分：
+        打包版走 pywebview 内置 http 服务，协议也是 http。 */
+    if(!(window.pywebview && window.pywebview.api)){
+      await new Promise(res => {
+        let done = false;
+        const finish = ()=>{ if(!done){ done = true; res(); } };
+        window.addEventListener('pywebviewready', finish, {once:true});
+        const t0 = Date.now();
+        (function poll(){
+          if(done) return;
+          if(window.pywebview && window.pywebview.api) return finish();
+          if(Date.now() - t0 > 3000) return finish();
+          setTimeout(poll, 100);
+        })();
+      });
+    }
     const s = await apiSetupStatus();
     if(s){
       /*  记住「有没有填过账号」——
@@ -4171,33 +7002,37 @@ async function bootSetup(){
 
 let suBusy = false;
 
-/* 点击「测试并保存」 */
+/* 点击「登录」 */
 async function suSubmit(){
   if(suBusy) return;
 
-  const host = suHostOf($('#suUrl')?.value);
+  const host = suHostOf($('#suUrl')?.value) || suHostOf(DEFAULT_HOST || '');
   const user = ($('#suUser')?.value || '').trim();
   const pw   = ($('#suPw')?.value || '');
-  const suser = ($('#suSUser')?.value || '').trim();
-  const spw   = ($('#suSPw')?.value || '');
 
   /* ── 本地校验（不发请求就能发现的问题先挡掉）── */
-  ['#suUrl','#suUser','#suPw'].forEach(s=>{
+  ['#suUser','#suPw','#suUrl'].forEach(s=>{
     const el = $(s); if(el) el.classList.remove('bad');
   });
-  if(!host){
+  /*  网址为空或还是占位域名 → 不发了，发了也是「无法连接」。
+      顺手把折叠区掀开（默认已开，这里是兜底）并聚焦过去。 */
+  if(!host || host === SETUP_PLACEHOLDER_HOST){
     $('#suUrl')?.classList.add('bad');
-    suMsg('err', icon('i-alert','sm inl') + '请填学校网址');
+    document.getElementById('suUrlFold')?.classList.add('open');
+    suMsg('err', icon('i-alert','sm inl') + '请把学校网址改成你学校的域名');
+    try{ $('#suUrl')?.focus(); }catch(e){}
     return;
   }
   if(!user){
     $('#suUser')?.classList.add('bad');
-    suMsg('err', icon('i-alert','sm inl') + '请填 ManageBac 账号');
+    suMsg('err', icon('i-alert','sm inl') + '请填账号');
+    try{ $('#suUser')?.focus(); }catch(e){}
     return;
   }
   if(!pw){
     $('#suPw')?.classList.add('bad');
-    suMsg('err', icon('i-alert','sm inl') + '请填 ManageBac 密码');
+    suMsg('err', icon('i-alert','sm inl') + '请填密码');
+    try{ $('#suPw')?.focus(); }catch(e){}
     return;
   }
 
@@ -4206,10 +7041,9 @@ async function suSubmit(){
   const oldHtml = btn ? btn.innerHTML : '';
   if(btn){
     btn.disabled = true;
-    btn.innerHTML = icon('i-refresh','sm spin') + '<span>正在测试登录…</span>';
+    btn.innerHTML = icon('i-refresh','sm spin') + '<span>正在登录…</span>';
   }
-  suMsg('info', icon('i-refresh','sm inl')
-    + '正在连接学校系统，大约 10 秒。请别关窗口。');
+  suMsg('info', '正在连接，大约 10 秒。');
 
   const fullUrl = 'https://' + host;
 
@@ -4226,29 +7060,111 @@ async function suSubmit(){
     }
 
     /* ── 第二步：测试通过才保存 ── */
-    suMsg('info', icon('i-check','sm inl') + '登录成功，正在保存…');
-    const s = await apiSaveSetup(user, pw, fullUrl, suser, spw);
+    suMsg('info', '正在保存…');
+    const s = await apiSaveSetup(user, pw, fullUrl);
     if(!s || !s.ok){
       suMsg('err', icon('i-alert','sm inl')
         + esc((s && s.error) || '保存失败'));
       return;
     }
 
-    suMsg('ok', icon('i-check','sm inl')
-      + '全部搞定！正在读取你的作业和成绩…');
-
-    /* ── 第三步：进入主界面并立刻抓一次 ── */
-    HAS_CREDENTIALS = true;      /*  填完了，之后不再显示引导 */
-    setTimeout(()=>{ closeSetup(); }, 700);
-    lastSig = '';
-    poll();
-    try{ await apiRefresh(); }catch(e){}
-    /* 抓取是后台跑的，前端每秒轮询自己会更新，不用等在这 */
-    HAS_CREDENTIALS = true;          /*  填完了，之后不再显示引导 */
+    /*  ★ 存好了 → 翻到第 2 页（课表）。
+          不在这里做「装自启 + 抓取」，那些放到最后一页收尾 ——
+          不然用户还在填课表，后台就开始抓了，
+          而且自启装了之后万一课表填错也没机会改。 */
+    suMsg('ok', icon('i-check','sm inl') + '学校系统好了。');
+    setTimeout(()=>{ suPageSet(2); }, 420);
 
   }catch(e){
     suMsg('err', icon('i-alert','sm inl')
       + esc('出错了：' + (e && e.message ? e.message : e)));
+  }finally{
+    suBusy = false;
+    if(btn){
+      btn.disabled = false;
+      btn.innerHTML = oldHtml;
+    }
+  }
+}
+
+/* 第 2 页：保存课表账号（希悦校园）。
+   ★ 课表是**另一个网站**，账号形态也不同（手机号）。
+     存失败不拦用户往下走 —— 课表是可选的。 */
+async function suSubmitSchedule(){
+  if(suBusy) return;
+  const u = ($('#suSchUser')?.value || '').trim();
+  const p = ($('#suSchPw')?.value || '');
+
+  ['#suSchUser','#suSchPw'].forEach(s=>{
+    const el = $(s); if(el) el.classList.remove('bad');
+  });
+  if(!u && !p){
+    /* 什么都没填 → 当跳过处理 */
+    suPageSet(3);
+    return;
+  }
+  if(!u){
+    $('#suSchUser')?.classList.add('bad');
+    suMsg('err', icon('i-alert','sm inl') + '请填手机号');
+    return;
+  }
+  if(!p){
+    $('#suSchPw')?.classList.add('bad');
+    suMsg('err', icon('i-alert','sm inl') + '请填密码');
+    return;
+  }
+
+  suBusy = true;
+  const btn = $('#suGo2');
+  const oldHtml = btn ? btn.innerHTML : '';
+  if(btn){
+    btn.disabled = true;
+    btn.innerHTML = icon('i-refresh','sm spin') + '<span>正在保存…</span>';
+  }
+  suMsg('info', '正在保存课表账号…');
+  try{
+    const r = await apiSaveSchedule(u, p);
+    if(!r || !r.ok){
+      suMsg('err', icon('i-alert','sm inl')
+        + esc((r && r.error) || '保存失败'));
+      return;
+    }
+    suMsg('ok', icon('i-check','sm inl') + '课表账号好了。');
+    setTimeout(()=>{ suPageSet(3); }, 420);
+  }catch(e){
+    suMsg('err', icon('i-alert','sm inl') + esc('出错了：' + e));
+  }finally{
+    suBusy = false;
+    if(btn){
+      btn.disabled = false;
+      btn.innerHTML = oldHtml;
+    }
+  }
+}
+
+/* 第 3 页：EC 名字 + 收尾 */
+async function suSubmitEc(){
+  if(suBusy) return;
+  const ec = ($('#suEc')?.value || '').trim();
+  suBusy = true;
+  const btn = $('#suGo3');
+  const oldHtml = btn ? btn.innerHTML : '';
+  if(btn){
+    btn.disabled = true;
+    btn.innerHTML = icon('i-refresh','sm spin') + '<span>保存中…</span>';
+  }
+  try{
+    if(ec){
+      const r = await apiEcSave(ec, true);
+      if(r && !r.ok){
+        suMsg('err', icon('i-alert','sm inl')
+          + esc((r && r.error) || '保存失败'));
+        return;
+      }
+    }
+    await suFinish(ec);
+  }catch(e){
+    suMsg('err', icon('i-alert','sm inl') + esc('出错了：' + e));
   }finally{
     suBusy = false;
     if(btn){
@@ -4282,35 +7198,97 @@ function suFriendly(raw){
 
 /* 绑定引导页的所有交互 */
 function bindSetup(){
+  /*  幂等：只能绑一次。
+      踩过的坑：页面里有两个 DOMContentLoaded 监听器都会调到这里，
+      第二次进来 buildSetup() 重建 innerHTML → 旧节点连同监听器一起丢 →
+      表现为「按钮点了没反应」，而且不报任何错。 */
+  if(bindSetup._done) return;
+  bindSetup._done = true;
+
   buildSetup();
 
-  $('#suEye')?.addEventListener('click', e=>{
-    e.stopPropagation();
-    const p = $('#suPw');
-    if(!p) return;
-    const show = p.type === 'password';
-    p.type = show ? 'text' : 'password';
-    $('#suEye').innerHTML = icon(show ? 'i-eye-off' : 'i-eye', 'sm');
-  });
+  /*  眼睛按钮：账号页 + 课表页各一个。
+      ★ 抽成函数，别复制两遍 —— 复制出来的那份迟早会漏改。 */
+  function bindEye(eyeSel, pwSel){
+    const eye = $(eyeSel), pw = $(pwSel);
+    if(!eye || !pw) return;
+    eye.addEventListener('click', e=>{
+      e.stopPropagation();
+      const show = pw.type === 'password';
+      pw.type = show ? 'text' : 'password';
+      eye.innerHTML = icon(show ? 'i-eye-off' : 'i-eye', 'sm');
+    });
+  }
+  bindEye('#suEye', '#suPw');
+  bindEye('#suSchEye', '#suSchPw');
 
-  $('#suFhead')?.addEventListener('click', ()=>{
-    $('#suFold')?.classList.toggle('open');
-  });
+  /*  学校网址折叠：用事件委托挂在 document 上。
+      比直接绑 #suUrlHead 稳 —— 那个节点将来要是被重建，
+      委托不会跟着失效。 */
+  document.addEventListener('click', e=>{
+    const t = e.target;
+    if(t && t.closest && t.closest('#suUrlHead')){
+      e.preventDefault();
+      e.stopPropagation();
+      document.getElementById('suUrlFold')
+        ?.classList.toggle('open');
+    }
+  }, true);
+
+  /* 状态条里的「立即刷新」*/
+  (function bindMsgRetry(){
+    const rt = document.getElementById('msgRetry');
+    if(!rt || rt.dataset.bound) return;
+    rt.dataset.bound = '1';
+    rt.addEventListener('click', async e=>{
+      e.stopPropagation();
+      /*  先自己进 busy（后端状态要下一次轮询才会变成 running）——
+          不然用户会在这半秒里连点好几下 */
+      rt.classList.add('busy');
+      try{ await apiRefresh(); }catch(err){}
+    });
+  })();
 
   $('#suGo')?.addEventListener('click', e=>{
     e.stopPropagation();
     suSubmit();
   });
+  $('#suGo2')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    suSubmitSchedule();
+  });
+  $('#suGo3')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    suSubmitEc();
+  });
+  $('#suSkip2')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    suSkip(2);
+  });
+  $('#suSkip3')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    suSkip(3);
+  });
+  $('#suSkip1')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    suSkip(1);
+  });
 
-  /* 回车提交（三个框都支持） */
-  ['#suUrl','#suUser','#suPw','#suSUser','#suSPw'].forEach(s=>{
-    const el = $(s);
+  /* 回车提交 —— 每页的回车落在**自己那页**的提交上，
+     别让课表页的回车跑到账号页去提交。 */
+  const ENTER_MAP = [
+    ['#suUser',    suSubmit],
+    ['#suPw',      suSubmit],
+    ['#suUrl',     suSubmit],
+    ['#suSchUser', suSubmitSchedule],
+    ['#suSchPw',   suSubmitSchedule],
+    ['#suEc',      suSubmitEc],
+  ];
+  ENTER_MAP.forEach(([sel, fn])=>{
+    const el = $(sel);
     if(!el) return;
     el.addEventListener('keydown', e=>{
-      if(e.key === 'Enter'){
-        e.preventDefault();
-        suSubmit();
-      }
+      if(e.key === 'Enter'){ e.preventDefault(); fn(); }
     });
     /* 一开始输入就清掉红色标记，别让用户一直看着报错 */
     el.addEventListener('input', ()=>{
@@ -4385,12 +7363,19 @@ function bind(){
     });
   });
 
-  /* 资料（Files）按钮 */
+  /*  资料（Files）按钮 —— 0.5.2：直接跳到「资料」页并定位到这门课。
+     以前是在卡片里内嵌一个文件浏览器（读一遍 DOM、再渲染一遍），
+     两套实现并存容易改一处漏一处，现在只留「资料」页那一套。 */
   document.querySelectorAll('.fbtn[data-files]').forEach(btn=>{
     btn.addEventListener('click', e=>{
       e.stopPropagation();
-      const [cid, name] = btn.dataset.files.split('|');
-      toggleFiles(cid, name, '');
+      const cid = btn.dataset.files.split('|')[0];
+      FSTATE.cid = cid;
+      FSTATE.fid = '';
+      FSTATE.fname = '';
+      FSTATE.data = null;
+      switchTab(3);
+      filesLoad('', true, '');
     });
   });
   /* 全部下载 */
@@ -4405,110 +7390,60 @@ function bind(){
 }
 
 /* ══════════ Files 浏览 ══════════ */
-function apiListFiles(cid, folder){
-  if(window.pywebview?.api?.list_files)
-    return window.pywebview.api.list_files(cid, folder || '');
-  return Promise.resolve({ok:false, items:[]});
-}
 
-function renderFiles(box, cid, name, folder, items){
-  if(!items.length){
-    box.innerHTML = `<div class="empty" style="padding:9px">没有文件</div>`;
-    return;
-  }
-  const back = folder
-    ? `<div class="fitem" data-back="1"><span class="fi">${icon('i-back','sm')}</span>
-         <span class="fn">返回上一级</span></div>` : '';
-  box.innerHTML = back + items.map(it=>{
-    if(it.kind === 'folder'){
-      return `<div class="fitem folder" data-dir="${esc(it.folderId)}">
-        <span class="fi">${icon('i-folder','sm')}</span>
-        <span class="fn">${esc(it.name)}</span></div>`;
-    }
-    return `<div class="fitem" data-file="${esc(it.url)}"
-        data-name="${esc(it.name)}">
-      <span class="fi">${icon(fileIcon(it.name),'sm')}</span>
-      <span class="fn">${esc(it.name)}</span>
-      ${it.size?`<span class="fs">${esc(it.size)}</span>`:''}</div>`;
-  }).join('');
-
-  box.querySelectorAll('[data-dir]').forEach(el=>{
-    el.addEventListener('click', e=>{
-      e.stopPropagation();
-      toggleFiles(cid, name, el.dataset.dir);
+/*  文件名 → 图标 id */
+/* ══════════ 按钮 ══════════
+/*  ★ 「立即刷新」和「数据与备份」已经从标题栏挪到设置面板底部 ——
+      标题栏原来 11 个按钮，小窗口下要横向滚才放得下。
+      这里改用**事件委托**：不管在哪个容器里，
+      只要 id 对得上就绑上（读的是 document，不依赖具体位置）。 */
+function bindOpButtons(){
+  const rf = document.getElementById('opRefresh');
+  if(rf && !rf.dataset.bound){
+    rf.dataset.bound = '1';
+    rf.addEventListener('click', ()=>{
+      rf.classList.add('spin');
+      apiRefresh();
+      /*  刷新按钮的「转圈」状态本来由 render() 按 DATA.status 控制，
+          但那绑的是老 id；这里给个兜底，转 1.2 秒就停。 */
+      setTimeout(()=> rf.classList.remove('spin'), 1200);
     });
-  });
-  box.querySelectorAll('[data-back]').forEach(el=>{
-    el.addEventListener('click', e=>{
-      e.stopPropagation();
-      toggleFiles(cid, name, '');
-    });
-  });
-  box.querySelectorAll('[data-file]').forEach(el=>{
-    el.addEventListener('click', e=>{
-      e.stopPropagation();
-      const url = el.dataset.file, fn = el.dataset.name;
-      toast('正在下载 ' + fn + ' ……', '', '');
-      Promise.resolve(apiDownloadOne(url, fn, name));
-    });
-  });
-}
-
-/* 文件名 → 图标 id（旧的卡片内浏览器也用这个） */
-function fileIcon(name){
-  const n = (name||'').toLowerCase();
-  if(/\.pdf$/.test(n)) return 'i-file';
-  if(/\.docx?$/.test(n)) return 'i-doc';
-  if(/\.pptx?$/.test(n)) return 'i-slides';
-  if(/\.(xlsx?|csv)$/.test(n)) return 'i-table';
-  if(/\.(zip|rar|7z)$/.test(n)) return 'i-zip';
-  if(/\.(png|jpe?g|gif|webp|bmp)$/.test(n)) return 'i-image';
-  if(/\.(mp4|mov|avi)$/.test(n)) return 'i-video';
-  if(/\.(mp3|wav|m4a)$/.test(n)) return 'i-audio';
-  return 'i-file';
-}
-
-let filesCache = {};
-function toggleFiles(cid, name, folder){
-  const box = document.getElementById('fbox-' + cid);
-  if(!box) return;
-  const key = cid + '|' + (folder||'');
-  if(box.dataset.key === key && box.innerHTML.trim()){
-    box.innerHTML = '';                 // 收起
-    box.dataset.key = '';
-    return;
   }
-  box.dataset.key = key;
-  box.innerHTML = `<div class="empty" style="padding:9px">正在读取……</div>`;
-  if(filesCache[key]){
-    renderFiles(box, cid, name, folder, filesCache[key]);
-    return;
+  const dt = document.getElementById('opData');
+  if(dt && !dt.dataset.bound){
+    dt.dataset.bound = '1';
+    dt.addEventListener('click', ()=> openData());
   }
-  apiListFiles(cid, folder).then(d=>{
-    const items = (d && d.items) || [];
-    filesCache[key] = items;
-    renderFiles(box, cid, name, folder, items);
-  }).catch(()=>{
-    box.innerHTML = `<div class="empty" style="padding:9px">读取失败</div>`;
-  });
+  /*  0.5.1 从标题栏收进来的两个：暂停自动刷新、重新登录。
+      逻辑抽成了 doToggleAuto / doRelogin，谁绑都一样。 */
+  const au = document.getElementById('opAuto');
+  if(au && !au.dataset.bound){
+    au.dataset.bound = '1';
+    au.addEventListener('click', doToggleAuto);
+  }
+  const lg = document.getElementById('opLogin');
+  if(lg && !lg.dataset.bound){
+    lg.dataset.bound = '1';
+    lg.addEventListener('click', ()=> doRelogin(lg));
+  }
 }
-
-function apiDownloadOne(url, filename, subdir){
-  if(window.pywebview?.api?.download_file)
-    return window.pywebview.api.download_file(url, filename, subdir);
+/*  设置面板在文件后面才解析出来，得等 DOM ——
+    同 bootSettingsMini 那个坑（见那里的说明）。 */
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', bindOpButtons);
+}else{
+  setTimeout(bindOpButtons, 0);
 }
+setTimeout(bindOpButtons, 800);
 
-/* ══════════ 按钮 ══════════ */
-$('#btnRefresh').addEventListener('click',()=>{
-  $('#btnRefresh').classList.add('spin');
-  apiRefresh();
-});
-$('#btnAuto').addEventListener('click',()=>{
+/*  暂停 / 开启自动刷新 —— 0.5.1 起从标题栏收进设置「操作」区（opAuto）。
+    标题栏上的 #live 倒计时还在，暂停时显示 ||，状态照样看得见。 */
+function doToggleAuto(){
   const on = !(DATA && DATA.auto_refresh);
   apiSetAuto(on);
   if(DATA) DATA.auto_refresh = on;
   render();
-});
+}
 /* ══════════ 重新登录 ══════════
    用户要求：「不要让我自己运行某个 python 程序」。 */
 function apiRelogin(){
@@ -4551,68 +7486,26 @@ function bindRelogin(root){
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
-  if(IS_WEB){
-    const b = document.getElementById('btnMin');
-    if(b) b.style.display = 'none';
-  }
+  /*  网页模式下没有真实的窗口可管 ——
+      最小化/最大化/关闭这组按钮藏起来，
+      否则点了没反应，看着像坏了。
+      （判定在 syncWinbtnsVisibility 里，桥到了会自己纠正。） */
+  syncWinbtnsVisibility();
 
   /*  首次运行：看有没有填过账号。
      没填过 → 弹出引导页（盖住主界面）；
      填过   → 什么都不做，直接进主界面。 */
   bindSetup();
   bootSetup();
+  checkDbHealth();
+  checkBrowserHealth();
   bindCustomPanel();
   bindSettings();
+  bindSearch();
+  bindOpenDialog();
   bindTeams();
 
-  /* Tab 点击 */
-  document.querySelectorAll('.tab').forEach(el=>{
-    el.addEventListener('click', ()=> switchTab(+el.dataset.tab));
-  });
 
-  /* 左右滑动切换（共 4 页） */
-  const MAXTAB = 3;
-  const vp = $('#viewport');
-  if(vp){
-    let sx = 0, sy = 0, dragging = false;
-    vp.addEventListener('touchstart', e=>{
-      sx = e.touches[0].clientX; sy = e.touches[0].clientY; dragging = true;
-    }, {passive:true});
-    vp.addEventListener('touchmove', e=>{
-      if(!dragging) return;
-      const dx = e.touches[0].clientX - sx, dy = e.touches[0].clientY - sy;
-      if(Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)*1.6){
-        dragging = false;
-        if(dx < 0 && curTab < MAXTAB) switchTab(curTab + 1);
-        else if(dx > 0 && curTab > 0) switchTab(curTab - 1);
-      }
-    }, {passive:true});
-    vp.addEventListener('touchend', ()=>{ dragging = false; }, {passive:true});
-
-    /* 鼠标横向滚轮 / Shift+滚轮也可切换 */
-    vp.addEventListener('wheel', e=>{
-      if(Math.abs(e.deltaX) > Math.abs(e.deltaY) + 8){
-        if(e.deltaX > 24 && curTab < MAXTAB) switchTab(curTab + 1);
-        else if(e.deltaX < -24 && curTab > 0) switchTab(curTab - 1);
-      }
-    }, {passive:true});
-  }
-
-  /* 键盘左右方向键 */
-  document.addEventListener('keydown', e=>{
-    /* 输入框里按方向键不切页 */
-    const t = e.target;
-    if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
-| t.tagName === 'SELECT')) return;
-    if(e.key === 'ArrowRight' && curTab < 3) switchTab(curTab + 1);
-    else if(e.key === 'ArrowLeft' && curTab > 0) switchTab(curTab - 1);
-  });
-
-  /* 恢复上次所在页 */
-  const saved = parseInt(localStorage.getItem('mb.tab') || '0', 10);
-  switchTab(Number.isFinite(saved) ? saved : 0);
-
-  poll();
   pollWarm();
   refreshDigestDot();
   if(pollTimer) clearInterval(pollTimer);
@@ -4625,6 +7518,42 @@ document.addEventListener('DOMContentLoaded',()=>{
   /* 晚报状态变化很慢（一天一次），低频轮询就够 */
   digTimer = setInterval(refreshDigestDot, 120000);
 });
+
+/* 本地关键状态体检：成绩历史库 + 凭据文件。
+ *
+ * · grades.db 是成绩历史的**唯一副本** —— 没有它就画不了趋势、
+ *   也回不到过去某天的分数。以前库里写失败只写 debug 日志（默认看不到）。
+ * · credentials.json 一旦读不出来，用户会莫名其妙回到首次引导页，
+ *   看起来像「账号丢了」。
+ * 两处都不该让用户在无解释的情况下自己猜，所以启动时问一次，坏了就明说。 */
+async function checkDbHealth(){
+  try{
+    if(!(window.pywebview?.api?.db_health)) return;
+    const h = await window.pywebview.api.db_health();
+    if(h && h.ok === false){
+      toast('本地数据有问题：' + (h.note || '未知原因'), 'err');
+    }
+  }catch(e){ /* 体检本身不该影响启动 */ }
+}
+
+/*  ★ 浏览器依赖体检（0.5.2 补）
+    为什么值得开机就问一次：Chromium 内核浏览器（跳转 + Teams + EC + 附件下载）
+    和 WebView2 运行时装（界面渲染）是**两个独立组件**。
+    「有 WebView2 没有浏览器」的机器上，界面照常打开、什么都不报错，
+    但上面那些功能会一起失灵 —— 用户只会觉得「这软件坏了」。
+    Edge / Chrome / Brave / Chromium 任意一个都行，缺了才报。
+    这里缺什么就明说，并且只提醒一次（免得每次启动都弹）。 */
+async function checkBrowserHealth(){
+  try{
+    if(!(window.pywebview?.api?.browser_health)) return;
+    const h = await window.pywebview.api.browser_health();
+    if(h && h.ok === false && h.message){
+      if(sessionStorage.getItem('bhwarn') === '1') return;
+      sessionStorage.setItem('bhwarn','1');
+      toast(h.message, 'err');
+    }
+  }catch(e){ /* 体检本身不该影响启动 */ }
+}
 
 /* 界面上所有带 data-opensetup 的按钮 → 打开首次运行引导页
    （用于「还没填过账号」时的空状态引导） */
@@ -4639,16 +7568,14 @@ function bindOpenSetup(root){
   });
 }
 
-$('#btnLogin').addEventListener('click',()=>{
-  /*  点顶栏钥匙：
-       没填过账号 → 打开引导页让他填
-       填过了     → 重新登录（不是弹提示让你敲命令） */
+/*  重新登录（自动）—— 0.5.1 起从标题栏收进设置「操作」区（opLogin）。
+    用户要求：「不要让我自己运行某个 python 程序」。
+    没填过账号 → 打开引导页让他填；填过了 → 后台自动登录。 */
+function doRelogin(b){
   if(!HAS_CREDENTIALS){ openSetup(); return; }
-
-  const b = $('#btnLogin');
   if(b && b.classList.contains('spin')) return;    /* 防重复点 */
 
-  if(b){ b.classList.add('spin'); b.title = '正在登录…'; }
+  if(b){ b.classList.add('spin'); }
   toast('正在自动恢复登录状态……（两个系统一起）', '', '');
 
   Promise.resolve(apiRelogin()).then(res=>{
@@ -4661,35 +7588,302 @@ $('#btnLogin').addEventListener('click',()=>{
     toast('登录失败：' + e, 'err', '');
   }).finally(()=>{
     /* 登录是后台跑的，先恢复按钮外观；数据会自己刷新 */
-    setTimeout(()=>{
-      if(b){ b.classList.remove('spin'); b.title = '重新登录（自动）'; }
-    }, 4000);
+    setTimeout(()=>{ if(b) b.classList.remove('spin'); }, 4000);
   });
-});
+}
 /* ── 晚报：点顶部信封按钮展开 ── */
 $('#btnDigest').addEventListener('click', openDigest);
-/* ── 数据与备份 ── */
-$('#btnData').addEventListener('click', openData);
+/* ── 数据与备份：入口在设置面板里（见 bindOpButtons） ── */
 
-/* ESC 关闭面板（晚报 / 数据与备份）—— 优先于其他操作 */
+/* ══════════════════════════════════════════════════════════════════
+   窗口菜单（ESC 唤出）
+
+   ★ 为什么要有：窗口是无边框的，关窗/最小化全靠界面上画的按钮。
+     万一那几个按钮点不到（界面卡住、鼠标拖不动、或者就是想少点两下），
+     窗口就变成一个关不掉的方块。Esc 唤出一层重模糊遮罩 +
+     三个大按钮，是第二道保险。
+
+   ★ Esc 的处理顺序（由内到外，一层层退）：
+       ① 窗口菜单开着   → 关掉菜单
+       ② 有面板开着     → 关掉那个面板
+       ③ 在输入框里     → 只是取消聚焦
+       ④ 什么都没开     → 唤出窗口菜单
+     顺序不能乱：先关最上层的，最后才轮到唤出 ——
+     否则菜单会把用户正在看的设置面板盖住。
+   ══════════════════════════════════════════════════════════════════ */
+
+function winMenuEl(){ return document.getElementById('winmenu'); }
+
+function openWinMenu(){
+  const el = winMenuEl();
+  if(!el) return;
+  syncWinMenu();
+  el.classList.add('open');
+}
+
+function closeWinMenu(){
+  const el = winMenuEl();
+  if(el) el.classList.remove('open');
+}
+
+function winMenuOpen(){
+  const el = winMenuEl();
+  return !!(el && el.classList.contains('open'));
+}
+
+/*  菜单里那个「最大化 / 还原」要按当前状态显示 ——
+    写着「最大化」却已经最大了，点下去看不出变化，会让人以为坏了。 */
+function syncWinMenu(){
+  const b = document.getElementById('wmMax');
+  if(!b) return;
+  const use = b.querySelector('.wm-ic use');
+  const t = b.querySelector('.wm-tx b');
+  if(use) use.setAttribute('href', WIN_MAXED ? '#i-winrest' : '#i-winmax');
+  if(t) t.textContent = WIN_MAXED ? '还原' : '最大化';
+}
+
+/*  Esc 总入口 */
 document.addEventListener('keydown', e=>{
   if(e.key !== 'Escape') return;
-  const dg = $('#digest');
-  const dp = $('#datapanel');
-  if(dg && dg.classList.contains('open')){
+
+  /*  ⓪ 教程开着 → 关掉教程。
+      ★ 它排在最前面，因为它是 z-index 最高的那一层
+        （950，比窗口菜单的 999 低但比面板的 900 高 ——
+         而且 openTour() 会先把窗口菜单和面板都关掉，
+         所以教程开着的时候不会有别的东西叠在它上面）。
+      按 Esc 退掉 = 用户不想看，直接记「看过了」，
+      不然下次启动又冒出来。 */
+  if(document.getElementById('tour')?.classList.contains('open')){
     e.stopPropagation();
-    closeDigest();
+    e.preventDefault();
+    closeTour(true);
     return;
   }
-  if(dp && dp.classList.contains('open')){
+
+  /*  ① 窗口菜单开着 → 关掉它（最高优先级） */
+  if(winMenuOpen()){
     e.stopPropagation();
-    closeData();
+    e.preventDefault();
+    closeWinMenu();
+    return;
   }
+
+  /*  ② 有面板开着 → 关掉那个面板（沿用原来的行为） */
+  const panels = [
+    ['#digest',    ()=> closeDigest()],
+    ['#datapanel', ()=> closeData()],
+    ['#setpanel',  ()=> closeSettings()],
+    ['#teampanel', ()=> closeTeams()],
+    ['#clpanel',   ()=> closeCustomPanel()],
+  ];
+  for(const [sel, fn] of panels){
+    const p = $(sel);
+    if(p && p.classList.contains('open')){
+      e.stopPropagation();
+      fn();
+      return;
+    }
+  }
+
+  /*  ③ 焦点在输入框里 → 只取消聚焦，不弹菜单 */
+  const t = e.target;
+  if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
+           || t.tagName === 'SELECT')){
+    try{ t.blur(); }catch(err){}
+    return;
+  }
+
+  /*  ④ 什么都没开 → 唤出窗口菜单 */
+  e.preventDefault();
+  openWinMenu();
 }, true);
-$('#btnMin').addEventListener('click',()=>{
-  if(window.pywebview?.api?.minimize) window.pywebview.api.minimize();
-  else document.body.classList.toggle('compact');
+
+/* 菜单上的四个按钮 */
+$('#wmMin')?.addEventListener('click', ()=>{
+  winApi('minimize');
+  closeWinMenu();
 });
+$('#wmMax')?.addEventListener('click', async ()=>{
+  const r = await winApi('win_maximize');
+  if(r && r.state) WIN_MAXED = (r.state === 'max');
+  else WIN_MAXED = !WIN_MAXED;
+  syncMaxIcon();
+  syncWinMenu();
+  closeWinMenu();
+});
+$('#wmClose')?.addEventListener('click', ()=>{
+  closeWinMenu();
+  winApi('win_close');
+});
+$('#wmQuit')?.addEventListener('click', ()=>{
+  winApi('win_quit');
+});
+
+/*  点遮罩（卡片外面）也关掉菜单。
+    判断 e.target 就是遮罩本身 —— 点卡片内部不该关。 */
+winMenuEl()?.addEventListener('click', e=>{
+  if(e.target && e.target.id === 'winmenu') closeWinMenu();
+});
+
+/*  标题栏那个 MB 图标也能唤出菜单 ——
+    Esc 是给「知道的人」用的，图标是给「不知道的人」看的。 */
+document.getElementById('bar')?.addEventListener('click', e=>{
+  if(e.target.closest('.logo')) openWinMenu();
+});
+(function hintLogo(){
+  const lg = document.querySelector('#bar .logo');
+  if(lg) lg.title = '窗口操作（也可按 Esc）';
+})();
+
+/* ══════════════════════════════════════════════════════════════════
+   窗口按钮（最小化 / 最大化 / 关闭）
+
+   为什么要有这组按钮：
+     窗口是无边框的 —— 没有系统标题栏，也就没有系统的
+     最小化/最大化/关闭。不给这组按钮，窗口就关不掉了。
+
+   三个按钮都在右上角同一区域，和 Windows 上别的程序位置一致。
+   ══════════════════════════════════════════════════════════════════ */
+function winApi(name){
+  const a = window.pywebview && window.pywebview.api;
+  return (a && typeof a[name] === 'function') ? a[name]() : null;
+}
+
+/* 最大化 / 还原。图标跟着状态换 —— 点完要是还显示「方框」，
+   用户就不知道再点一下会还原。 */
+let WIN_MAXED = false;
+
+function syncMaxIcon(){
+  const b = document.querySelector('#btnWinMax .oi use');
+  if(b) b.setAttribute('href', WIN_MAXED ? '#i-winrest' : '#i-winmax');
+  const bar = document.getElementById('bar');
+  if(bar) bar.classList.toggle('maxed', WIN_MAXED);
+  const btn = document.getElementById('btnWinMax');
+  if(btn) btn.title = WIN_MAXED ? '还原' : '最大化';
+}
+
+/*  0.5.2：窗口只有「最大化」与「最小化」两种状态，
+    最大化/还原按钮已从标题栏删除，这里对应地只保留最小化与关闭。
+    绑定一律先判存在 —— 元素被删掉时不能抛异常，
+    否则整段脚本停在这里，后续所有绑定都会失效。 */
+const _btnMin = $('#btnWinMin');
+if(_btnMin) _btnMin.addEventListener('click', ()=>{
+  winApi('minimize');
+});
+
+const _btnClose = $('#btnWinClose');
+if(_btnClose) _btnClose.addEventListener('click', ()=>{
+  winApi('win_close');
+});
+
+/*  双击标题栏曾经是「最大化 / 还原」。现在窗口恒为最大化，
+    这个动作没有意义，改成不做任何事（保留监听以免影响拖动判定）。 */
+const _bar = $('#bar');
+if(_bar) _bar.addEventListener('dblclick', (e)=>{
+  if(e.target.closest('button')) return;
+});
+
+/* ══════════ 自绘拖动（0.5.1）══════════
+   ★ 为什么不用 pywebview 内建拖动（.pywebview-drag-region）了：
+     那条链路（内建 http 分发 + 无边框 + WinForms）实测不生效 ——
+     合成事件和真鼠标都试过，window.move 调了窗口纹丝不动。
+     内建机制留着也无害（类名还在 HTML 上），但真正拖窗的是这里。
+
+   做法：#bar 上按下左键 → mousemove 算屏幕坐标增量 →
+   后端 win_drag(dx, dy) 走 SetWindowPos。
+     · 点在按钮 / logo / 链接上不拖（它们有自己的点击功能）
+     · 增量用 screenX（CSS 像素），DPI 换算在后端做
+     · 桥调用节流：每帧最多送一次，攒着的增量一起送 */
+(function selfDrag(){
+  const bar = document.getElementById('bar');
+  if(!bar) return;
+  let on = false, lastX = 0, lastY = 0, pendX = 0, pendY = 0, sent = false;
+  /*  把攒下的增量送出去；桥调用在飞时先攒着，回来后再送 —
+      注意 finally 里要再补一次 flush，不然「最后一次移动
+      到鼠标松开」之间的增量会丢（窗口差几像素不到位）。 */
+  function flush(){
+    if(sent || (!pendX && !pendY)) return;
+    const a = window.pywebview && window.pywebview.api;
+    if(!(a && typeof a.win_drag === 'function')) return;
+    sent = true;
+    const dx = pendX, dy = pendY;
+    pendX = 0; pendY = 0;
+    Promise.resolve(a.win_drag(dx, dy))
+      .catch(()=>{})
+      .finally(()=>{ sent = false; flush(); });
+  }
+  bar.addEventListener('mousedown', e=>{
+    if(e.button !== 0) return;
+    if(e.target.closest('button, a, input, select, .logo')) return;
+    on = true; sent = false;
+    lastX = e.screenX; lastY = e.screenY;
+    pendX = 0; pendY = 0;
+    e.preventDefault();              /* 别进入文字选择/滚动 */
+  });
+  window.addEventListener('mousemove', e=>{
+    if(!on) return;
+    pendX += e.screenX - lastX;
+    pendY += e.screenY - lastY;
+    lastX = e.screenX; lastY = e.screenY;
+    flush();
+  });
+  window.addEventListener('mouseup', ()=>{ on = false; });
+})();
+
+/*  记住窗口尺寸 —— 用户拖过大小之后，下次启动照旧。
+    监听 resize，但拖拽过程中会连续触发，所以节流。 */
+let _rszT = null;
+window.addEventListener('resize', ()=>{
+  clearTimeout(_rszT);
+  _rszT = setTimeout(()=>{
+    /*  最大化状态下尺寸跟着屏幕走，不要存成「用户偏好」。
+        ★ 0.5.1：判断挪到保存**之前** —— 以前是存完才判断，
+          启动即最大化会把整个屏幕的尺寸写进 full_size。 */
+    const maxed = window.outerWidth >= screen.availWidth - 4;
+    if(!maxed){
+      const a = window.pywebview && window.pywebview.api;
+      if(a && typeof a.win_resize === 'function'){
+        a.win_resize(window.outerWidth || 0, window.outerHeight || 0);
+      }
+    }
+    WIN_MAXED = maxed;
+    syncMaxIcon();
+  }, 500);
+});
+
+/*  ★ 启动即最大化的场景：后端在页面加载完之前就放大了窗口，
+    resize 监听没赶上这趟车，WIN_MAXED 还停在 false ——
+    图标会一直显示「方框」（其实已经是最大化），
+    用户就不知道再点一下能还原。第一次同步前先量一次真实尺寸。 */
+WIN_MAXED = window.outerWidth >= screen.availWidth - 4;
+syncMaxIcon();
+
+/*  ★ 向后端报个到：「前端起来了，标题栏按钮已就位」。
+    后端拿这个当**安全网** —— 无边框窗口没有系统关闭键，
+    界面要是没跑起来（比如某个 JS 出错），窗口就关不掉了。
+    超时没报到的话，后端会主动把系统边框装回去。
+
+    ★ 时机很重要：pywebview 的 api 对象是**页面加载完之后**
+      才注入的，所以这里不能直接调 —— 要等它出现。
+      用 pywebviewready 事件（最准），再加一个轮询兜底
+      （网页模式下没这个事件，轮询也不会误报）。 */
+function reportReady(){
+  if(reportReady._done) return;
+  const a = window.pywebview && window.pywebview.api;
+  if(!a || typeof a.win_ready !== 'function') return;
+  reportReady._done = true;
+  try{ a.win_ready(); }catch(e){}
+}
+window.addEventListener('pywebviewready', reportReady);
+/*  兜底：每 300ms 看一次，最多 40 次（12 秒）。
+    和后端的 READY_TIMEOUT 对齐。 */
+(function pollReady(n){
+  if(reportReady._done || n <= 0) return;
+  reportReady();
+  if(!reportReady._done) setTimeout(()=>pollReady(n - 1), 300);
+})(40);
+
+
 $('#btnFold').addEventListener('click',()=>{
   const ids=['tasks','quiz','hw','other','courses','done',
              'sch-today','sch-tmr','sch-rest'];
@@ -4779,9 +7973,32 @@ function apiTeamsSync(rounds){
     return window.pywebview.api.teams_sync(rounds == null ? 8 : rounds);
   return Promise.resolve({ok:false, reason:'当前模式不支持'});
 }
-function apiEcList(kw, date){
-  if(window.pywebview?.api?.ec_list) return window.pywebview.api.ec_list(kw||'', date||'');
-  return Promise.resolve({ok:false, items:[]});
+/*  全部 Teams 消息（所有团队 / 所有频道）。
+    Teams 整页用这个 —— 数据来自后端全量抓取的结果，
+    每条都带 team / channel / date / kind 字段。 */
+function apiTmAll(kw, date, channel, team){
+  if(window.pywebview?.api?.tm_all)
+    return window.pywebview.api.tm_all(kw||'', date||'',
+                                       channel||'', team||'');
+  /* 预览 / 网页模式：退回 ec_list，至少能用 */
+  if(window.pywebview?.api?.ec_list)
+    return window.pywebview.api.ec_list(kw||'', date||'');
+  return Promise.resolve({ok:false, items:[], total:0});
+}
+/*  Teams 全量数据的概览（团队数 / 频道数 / 帖子数 / 抓取时间） */
+function apiTmStats(){
+  if(window.pywebview?.api?.tm_stats) return window.pywebview.api.tm_stats();
+  return Promise.resolve({ok:false, nTeams:0, nChannels:0, nPosts:0});
+}
+/*  发起一次全量抓取（后台跑，用 apiTmCrawlStatus 轮询进度） */
+function apiTmCrawl(scroll, deep){
+  if(window.pywebview?.api?.tm_crawl) return window.pywebview.api.tm_crawl(scroll||10, !!deep);
+  return Promise.resolve({ok:false, reason:'当前模式不支持'});
+}
+function apiTmCrawlStatus(){
+  if(window.pywebview?.api?.tm_crawl_status)
+    return window.pywebview.api.tm_crawl_status();
+  return Promise.resolve({ok:true, running:false, message:''});
 }
 function apiTeamsDownload(){
   if(window.pywebview?.api?.teams_download_ec) return window.pywebview.api.teams_download_ec();
@@ -4831,25 +8048,26 @@ function pollWarm(){
 }
 
 document.addEventListener('DOMContentLoaded',()=>{
-  /* 网页模式下隐藏「最小化」按钮（那是桌面窗口才有的功能） */
-  if(IS_WEB){
-    const b = document.getElementById('btnMin');
-    if(b) b.style.display = 'none';
-  }
+  /*  网页模式没有真实窗口可管 ——
+      最小化/最大化/关闭这组藏起来，免得点了没反应。
+      （判定在 syncWinbtnsVisibility 里，桥到了会自己纠正。） */
+  syncWinbtnsVisibility();
 
   /*  首次运行：看有没有填过账号。
      没填过 → 弹出引导页（盖住主界面）；
      填过   → 什么都不做，直接进主界面。 */
   bindSetup();
   bootSetup();
+  checkDbHealth();
+  checkBrowserHealth();
 
   /* Tab 点击 */
   document.querySelectorAll('.tab').forEach(el=>{
     el.addEventListener('click', ()=> switchTab(+el.dataset.tab));
   });
 
-  /* 左右滑动切换（共 4 页） */
-  const MAXTAB = 3;
+  /* 左右滑动切换（共 5 页） */
+  const MAXTAB = 4;
   const vp = $('#viewport');
   if(vp){
     let sx = 0, sy = 0, dragging = false;
@@ -4867,22 +8085,28 @@ document.addEventListener('DOMContentLoaded',()=>{
     }, {passive:true});
     vp.addEventListener('touchend', ()=>{ dragging = false; }, {passive:true});
 
-    /* 鼠标横向滚轮 / Shift+滚轮也可切换 */
+    /* 鼠标横向滚轮 / Shift+滚轮也可切换
+       ★ 判据要「明确是横向意图」才切页：
+         触控板两指斜着滑时 deltaX 也不小，判松了会让人在正常滚动时
+         莫名其妙换页。所以要求横向量足够大、同时纵向量足够小。 */
     vp.addEventListener('wheel', e=>{
-      if(Math.abs(e.deltaX) > Math.abs(e.deltaY) + 8){
-        if(e.deltaX > 24 && curTab < MAXTAB) switchTab(curTab + 1);
-        else if(e.deltaX < -24 && curTab > 0) switchTab(curTab - 1);
+      if(Math.abs(e.deltaX) > 40 && Math.abs(e.deltaY) < 12){
+        if(e.deltaX > 0 && curTab < MAXTAB) switchTab(curTab + 1);
+        else if(e.deltaX < 0 && curTab > 0) switchTab(curTab - 1);
       }
     }, {passive:true});
   }
 
   /* 键盘左右方向键 */
   document.addEventListener('keydown', e=>{
+    /*  教程开着时不切页 —— 用户是在看教程，
+        底下的页签跟着翻会让人莫名其妙。 */
+    if(document.getElementById('tour')?.classList.contains('open')) return;
     /* 输入框里按方向键不切页 */
     const t = e.target;
     if(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
-| t.tagName === 'SELECT')) return;
-    if(e.key === 'ArrowRight' && curTab < 3) switchTab(curTab + 1);
+      || t.tagName === 'SELECT')) return;
+    if(e.key === 'ArrowRight' && curTab < 4) switchTab(curTab + 1);
     else if(e.key === 'ArrowLeft' && curTab > 0) switchTab(curTab - 1);
   });
 
@@ -4909,3 +8133,2319 @@ window.addEventListener('pywebviewready', ()=>{
 
 /* 页面重新可见时立即刷新一次（避免长时间最小化后数据陈旧） */
 document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ poll(); pollWarm(); } });
+
+
+/* ══════════════ 小浮窗（compact 形态）══════════════
+   这是「小组件」这三个字的本意：浮在桌面上的一小块，
+   扫一眼就知道下一节课是什么、还有多少事没做。
+
+   ★ 它只读 DATA，不写 DATA。
+   ★ 它只切 body 上的一个类，不重建任何 DOM ——
+     所以来回切形态不会丢滚动位置或展开状态。
+   ══════════════════════════════════════════════════════════════════ */
+
+const SHAPE_KEY = 'mb.shape';
+/*  小浮窗已删除：本地若还留着 compact，直接丢弃，一律进完整形态 */
+let SHAPE = 'full';
+try{ localStorage.removeItem(SHAPE_KEY); }catch(_){ }
+/* 置顶状态：真正的开关在后端（窗口属性），
+   这里只记「界面显示成什么样」，每次进设置都重新问一次。 */
+let ON_TOP = false;
+
+const isWidgetMode = () => hasBridge();
+const miniEl = () => document.getElementById('mini');
+
+/* ── 切形态：先改界面，再让后端调窗口大小 ──
+   ★ 顺序有讲究：先给 body 加类（界面立刻变成小浮窗的样子），
+     再让后端去 resize。反过来的话，窗口已经缩了、
+     界面还是完整布局，会看到一瞬间的挤压变形。 */
+async function setShape(shape, quiet){
+  /*  ★ 0.5.2：小浮窗（compact）形态已删除 ★
+
+      窗口只有「最大化（不是全屏）」与「最小化」两种状态。
+      这个函数保留（调用点很多），但只做一件事：
+      确保界面是完整形态，并清掉历史上留在本地的 compact 记录。
+
+      ★ 不再调用后端 win_set('shape')：
+        后端已改为只接受 full，调它只会拿到一个拒绝。 */
+  if(SHAPE !== 'full'){
+    SHAPE = 'full';
+    try{ localStorage.removeItem(SHAPE_KEY); }catch(_){ }
+  }
+  document.body.classList.remove('compact');
+  setMiniLabels();
+  syncShapeSeg();
+  return {ok: true, shape: 'full'};
+}
+
+/*  面板上「完整界面 / 小浮窗」那两格的选中态，跟着 SHAPE 走。
+    单独抽一个函数是因为有三处要同步：切形态时、开机时、点「开机右上角」时。 */
+function syncShapeSeg(){
+  document.querySelectorAll('#setShape span').forEach(x=>
+    x.classList.toggle('on', x.dataset.s === SHAPE));
+}
+
+/* 置顶开关：后端真的去改窗口的 TOPMOST 属性 */
+async function setOnTop(on, quiet){
+  const a = window.pywebview && window.pywebview.api;
+  if(!(a && typeof a.win_set === 'function')){
+    /*  网页版 / 后端没起来：这一项在浏览器里本来就做不到。
+        不要弹「不能改」的错 —— 而是**把这一项藏掉**，
+        免得用户反复点、反复失败。
+        （踩过：网页版点置顶，弹「置顶没能改成功」，
+          但那根本不是用户的问题，是环境不支持。） */
+    hideWidgetOnlyRows();
+    if(!quiet) return false;
+    return false;
+  }
+  try{
+    const r = await a.win_set('on_top', !!on);
+    const ok = !!(r && r.ok);
+    if(ok){
+      ON_TOP = !!on;
+      localStorage.setItem('mb.ontop', on ? '1' : '0');
+      syncTopBtn();
+    }else if(!quiet){
+      toast('置顶没能改成功：' + ((r && r.error) || '未知原因'), 'err', '');
+    }
+    return ok;
+  }catch(e){
+    if(!quiet) toast('置顶没能改成功：' + e, 'err', '');
+    return false;
+  }
+}
+
+/*  ── 只在桌面版有意义的几项，在网页版直接藏掉 ──
+    包括：形态、置顶、开机右上角、开机自动更新。
+    （小浮窗在浏览器里没窗口可缩，形态改了也没用。） */
+function hideWidgetOnlyRows(){
+  ['setShapeRow', 'setTopRow', 'setPinRow', 'setMiniRow'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.hidden = true;
+  });
+  /*  老 id 兼容（setShape 那一行的容器当时没起 id） */
+  const sc = document.getElementById('setShape');
+  if(sc && sc.closest('.setrow')) sc.closest('.setrow').hidden = true;
+}
+
+/*  ★★★ 0.5.2 修：把上面那几行**恢复显示**。
+
+    【踩过的坑（用户反馈「找不到关闭置顶按键」）】
+      bootSettingsMini() 在 DOMContentLoaded 时就跑，而 pywebview 的桥
+      （window.pywebview.api）是**页面加载完成之后**才注入的。
+      于是那句判断：
+
+          if(!(a && typeof a.win_set === 'function')) hideWidgetOnlyRows();
+
+      在桌面版启动的**那一刻**也成立 —— 桥还没来，看起来就像网页版，
+      直接把「固定在其他窗口上层」那几行永久藏掉了。
+      而 bootSettingsMini 带 _done 守卫，只跑一次，
+      等桥真的注入时已经晚了，再也不会恢复。
+
+      后果：**桌面版用户根本看不到置顶开关**，也看不到「开机以小浮窗」
+      与「窗口形态」那两行。
+
+    【修法】
+      · 判断改为「等桥就绪再定」（见 bootSettingsMini 里的 waitBridge）
+      · 同时提供这个恢复函数，发现桥到了就把行显示回来（幂等）
+ */
+function showWidgetOnlyRows(){
+  ['setShapeRow', 'setTopRow', 'setPinRow', 'setMiniRow'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.hidden = false;
+  });
+  const sc = document.getElementById('setShape');
+  if(sc && sc.closest('.setrow')) sc.closest('.setrow').hidden = false;
+}
+
+/*  等桥就绪（最多 3 秒），到了调 onReady。
+    桥注入得比 DOMContentLoaded 晚，所以不能当场判断。 */
+function waitBridge(onReady, tries){
+  const n = tries == null ? 30 : tries;
+  const a = window.pywebview && window.pywebview.api;
+  if(a && typeof a.win_set === 'function'){ onReady(true); return; }
+  if(n <= 0){ onReady(false); return; }
+  setTimeout(()=> waitBridge(onReady, n - 1), 100);
+}
+
+function syncTopBtn(){
+  const b = document.getElementById('mnTop');
+  if(b) b.classList.toggle('on', ON_TOP);
+  const sw = document.getElementById('setTop');
+  if(sw) sw.classList.toggle('on', ON_TOP);
+}
+
+/* ══════════ 小浮窗内容 ══════════
+   只做三件事：下一节课、三个数字、一行提示。
+   刻意**不**做「最近成绩」「待办列表」—— 那些是完整界面的事，
+   小窗塞满了就不叫小窗了。 */
+function renderMini(){
+  /*  0.5.2：小浮窗面板已从 index.html 删除，这里只需安全返回。
+      保留函数名是因为 poll 里还有调用点。 */
+  if(!miniEl()) return;
+
+  const el = miniEl();
+  if(!el) return;
+
+  const lessons = ((DATA || {}).schedule || {}).lessons || [];
+
+  /* ── ① 下一节课 ── */
+  const host = document.getElementById('mnNext');
+  if(host){
+    const nx = findNextLesson(lessons);
+    /*  小浮窗里的这几行**每秒都在变**（倒计时），
+        所以不能整块重建 —— 会看到文字在闪。
+        拆成「结构」和「会变的那个数」两部分：
+        结构只在换课/换状态时重建，数字每秒就地更新。 */
+    const sig = nx
+      ? [nx.lesson.subject, nx.lesson.start, nx.lesson.room,
+         nx.lesson.teacher, nx.running].join('|')
+      : '__none__';
+
+    if(host.dataset.sig !== sig){
+      host.dataset.sig = sig;
+
+      if(!nx){
+        host.className = 'mn-next';
+        host.style.removeProperty('--mc');
+        host.innerHTML = `<div class="mn-none">
+          <div class="mn-ic">${icon('i-sunrise','xxl')}</div>
+          <div class="mn-t">暂时没有课</div>
+          <div class="mn-d">课表里还没有安排，或者课都上完了</div>
+        </div>`;
+      }else{
+        const l = nx.lesson;
+        const endM = minsUntil(l.end);
+        const running = !!nx.running;
+        const soon = !running && nx.mins != null && nx.mins <= 30
+                     && l.day === todayISO();
+        const col = running ? 'var(--green)'
+                  : soon ? 'var(--orange)' : 'var(--blue)';
+        const tag = running ? '<span class="mn-tag now">进行中</span>'
+                  : soon ? '<span class="mn-tag soon">马上开始</span>'
+                  : '<span class="mn-tag next">下一节</span>';
+
+        /* 自编课有 [上操] 这种前缀，拆出来当标签使 */
+        let title = l.subject || '(未命名)';
+        let flag = '';
+        const fm = /^\[([^\]]+)\]\s*(.*)$/.exec(title);
+        if(fm){ flag = fm[1]; title = fm[2] || fm[1]; }
+
+        const meta = [];
+        if(l.room) meta.push(`<span>${esc(l.room)}</span>`);
+        if(l.teacher) meta.push(`<span>${esc(l.teacher)}</span>`);
+        if(flag) meta.unshift(`<span><b>${esc(flag)}</b></span>`);
+        if(l.end && !l.selfStudy){
+          meta.push(`<span><b>${esc(hm(l.start))}–${esc(hm(l.end))}</b></span>`);
+        }else{
+          meta.push(`<span><b>${esc(hm(l.start))}</b></span>`);
+        }
+
+        host.className = 'mn-next' + (running ? ' now' : '');
+        host.style.setProperty('--mc', col);
+        host.innerHTML = `
+          <div class="mn-lab">${running ? '现在在上' : '接下来'}${tag}</div>
+          <div class="mn-subj">${esc(title)}</div>
+          <div class="mn-meta">${meta.join('')}</div>
+          <div class="mn-when" id="mnWhen"></div>`;
+      }
+    }
+
+    /* 会变的那个数：每秒（以及每次数据更新）重算 */
+    const whenEl = document.getElementById('mnWhen');
+    if(whenEl && nx){
+      const l = nx.lesson;
+      const endM = minsUntil(l.end);
+      let txt;
+      if(nx.running){
+        txt = (endM != null && endM > 0)
+          ? `${countdownText(endM)}下课` : '正在进行';
+      }else{
+        txt = whenText(l, nx.mins);
+      }
+      if(whenEl.dataset.v !== txt){
+        whenEl.dataset.v = txt;
+        whenEl.innerHTML = `${icon('i-clock','sm')}${esc(txt)}`;
+      }
+    }
+  }
+
+  /* ── ② 三个数字 ──
+      挑最需要「一眼看到」的三个：
+        还有多少事没做 / 有几件已经过期 / GPA。 */
+  const st = document.getElementById('mnStats');
+  if(st){
+    const tasks = ((DATA || {}).tasks || []).map(liveTask);
+    const todo = tasks.filter(x => !x.completed);
+    const overdue = todo.filter(x =>
+      x.days_left != null && x.days_left < 0).length;
+    const s = (DATA || {}).summary || {};
+
+    /*  GPA 口径必须和完整界面一致 ——
+        官方值优先，没有就用估算，都没有显示破折号。 */
+    let gpaN = '—', gpaC = 'var(--dim)';
+    const off = s.gpa_official;
+    if(off && off.value != null){
+      gpaN = Number(off.value).toFixed(2); gpaC = 'var(--green)';
+    }else if(s.gpa_estimated != null){
+      gpaN = Number(s.gpa_estimated).toFixed(2); gpaC = 'var(--blue)';
+    }
+
+    const cells = [
+      {n: todo.length, l: '待完成', c: overdue ? 'var(--blue)' : 'var(--blue)',
+       tab: 0},
+      {n: overdue, l: '已过期',
+       c: overdue ? 'var(--red)' : 'var(--dim)', tab: 0},
+      {n: gpaN, l: 'GPA', c: gpaC, tab: 2},
+    ];
+
+    const csig = JSON.stringify(cells.map(x => [x.n, x.l, x.c]));
+    if(st.dataset.sig !== csig){
+      st.dataset.sig = csig;
+      st.innerHTML = cells.map(x => `
+        <div class="mn-cell" data-tab="${x.tab}" title="打开完整界面看详情">
+          <div class="n" style="color:${x.c}">${esc(String(x.n))}</div>
+          <div class="l">${esc(x.l)}</div>
+        </div>`).join('');
+      /* 点数字 → 展开完整界面并跳到那一页 */
+      st.querySelectorAll('.mn-cell').forEach(c=>{
+        c.addEventListener('click', async ()=>{
+          const t = +c.dataset.tab;
+          await setShape('full', true);
+          switchTab(t, true);
+        });
+      });
+    }
+  }
+
+  /* ── ③ 底部提示 ──
+      只在「数据旧了」或「出错了」时出现。
+      正常时完全不占位 —— 小窗口里每个像素都金贵。 */
+  const mmsg = document.getElementById('mnMsg');
+  if(mmsg){
+    let txt = '', kind = '';
+    const d = DATA || {};
+    if(d.status === 'error'){
+      txt = d.message || '上次抓取失败了'; kind = 'err';
+    }else if(d.status === 'need_login'){
+      txt = d.message || '需要重新登录'; kind = 'err';
+    }else if(d.status === 'running'){
+      txt = '正在更新……'; kind = 'stale';
+    }else{
+      const w = WARM || {};
+      const age = w.cache_age;
+      if(age != null && age > 7200){
+        txt = `${Math.floor(age/3600)} 小时前的数据`;
+        kind = 'stale';
+      }
+    }
+    const show = !!txt;
+    mmsg.className = show ? `mn-msg show ${kind}` : 'mn-msg';
+    if(show && mmsg.textContent !== txt) mmsg.textContent = txt;
+  }
+}
+
+/* ── 小浮窗里的按钮 ── */
+function bindMini(){
+  const rf = document.getElementById('mnRefresh');
+  if(rf && !rf.dataset.bound){
+    rf.dataset.bound = '1';
+    rf.addEventListener('click', async ()=>{
+      rf.classList.add('spin');
+      try{ await apiRefresh(); }catch(e){}
+      setTimeout(()=>rf.classList.remove('spin'), 1200);
+    });
+  }
+
+  const tp = document.getElementById('mnTop');
+  if(tp && !tp.dataset.bound){
+    tp.dataset.bound = '1';
+    tp.addEventListener('click', ()=> setOnTop(!ON_TOP));
+  }
+
+  const fu = document.getElementById('mnFull');
+  if(fu && !fu.dataset.bound){
+    fu.dataset.bound = '1';
+    fu.addEventListener('click', ()=> setShape('full'));
+  }
+}
+
+/* ── 标题栏上的「收成小浮窗」 ── */
+function bindMiniToggle(){
+  const b = document.getElementById('btnMini');
+  if(!b) return;   /* 0.5.2：小浮窗按钮已删除 */
+  if(b && !b.dataset.bound){
+    b.dataset.bound = '1';
+    b.addEventListener('click', ()=> setShape('compact'));
+  }
+}
+
+/* ══════════ 启动时的形态恢复 ══════════
+   两种来源要分清：
+     · 网页版         → 只有 localStorage（没有窗口可调）
+     · 桌面版         → **后端说了算**。窗口大小是后端建的，
+                        前端 localStorage 可能和它对不上
+                        （比如用户改了 data/window.json，
+                          或者打包时写死了 compact）。
+   所以桌面版要问一次后端，以后端为准。 */
+async function bootShape(){
+  const a = window.pywebview && window.pywebview.api;
+
+  /* 先按本地记的上（不闪默认样式） */
+  document.body.classList.toggle('compact', SHAPE === 'compact');
+  bindMini();
+
+  if(!(a && typeof a.win_cfg === 'function')){
+    /*  网页版：没有后端可问，但设置面板里的控件还是要接上 */
+    bootSettingsMini({});
+    return;
+  }
+
+  try{
+    const r = await a.win_cfg();
+    if(r && r.cfg && r.cfg.shape){
+      const s = (r.cfg.shape === 'compact') ? 'compact' : 'full';
+      if(s !== SHAPE){
+        /*  ★ 0.5.1：不一致时走 setShape（quiet），别只改类名。
+            只改类的话窗口尺寸还是旧形态的 ——
+            踩过：localStorage 记着 compact、后端记着 full，
+            开机就是「小浮窗界面 + 大窗口」，留白一半、
+            底部按钮被顶到任务栏以下。setShape 会把窗口
+            尺寸一起摆正。 */
+        await setShape(s, true);
+      }else{
+        document.body.classList.toggle('compact', s === 'compact');
+      }
+    }
+    /* 置顶：也以后端的为准 */
+    if(r && r.cfg && typeof r.cfg.on_top === 'boolean'){
+      ON_TOP = !!r.cfg.on_top;
+    }
+    syncTopBtn();
+    bootSettingsMini(r && r.cfg);
+  }catch(e){
+    bootSettingsMini({});
+  }
+}
+
+/* ══════════ 设置面板里那几项的接法 ══════════
+   ★★ 这里踩过一个坑，说明白免得再犯 ——
+
+     `app.js` 在 index.html 里是**紧跟首次引导页**引入的，
+     而设置面板在文件**更靠后**的位置。
+     所以脚本刚解析到这一行的时候，
+     `#setShape` / `#setTop` / `#setPin` **根本还不存在** ——
+     `querySelectorAll` 返回空列表，监听一个都没贴上。
+     表现就是：面板打开着，但那三个控件**点不动**。
+
+     （同样的问题在配色那边也有过一次，
+       见 `bootThemeLater` 的说明。凡是「要操作设置面板里的元素」
+       的初始化，都得等 DOM 解析完。）
+
+   → 所以这里拆成两步：
+       ① bootShape() 只管**数据**（问后端要形态/置顶）
+       ② bootSettingsMini() 只管**接控件**，等 DOM 好了再跑
+*/
+function bootSettingsMini(cfg){
+  if(bootSettingsMini._done) return;
+  if(!document.getElementById('setShape')) return;   /* 面板还没来 */
+  bootSettingsMini._done = true;
+  bindSettingsMini(cfg || {});
+
+  /*  ★★★ 等桥就绪再判断显隐（修「桌面版看不到置顶开关」）
+      桥注入得比这里晚，当场判断会把桌面版误判成网页版，
+      然后就把那几行永久藏掉了。 */
+  waitBridge((isDesktop)=>{
+    if(isDesktop){
+      showWidgetOnlyRows();     /* 桌面版：确保显示（幂等） */
+    }else{
+      hideWidgetOnlyRows();     /* 真网页版：藏掉 */
+    }
+  });
+}
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', ()=> bootSettingsMini());
+}else{
+  setTimeout(()=> bootSettingsMini(), 0);
+}
+/*  双保险：DOM 早过了也不会漏（同 bindSettings 的做法） */
+setTimeout(()=> bootSettingsMini(), 800);
+
+
+/* ══════════ 设置面板里新增的三项 ══════════ */
+function bindSettingsMini(cfg){
+  cfg = cfg || {};
+
+  /* 形态：两档 */
+  document.querySelectorAll('#setShape span').forEach(el=>{
+    if(el.dataset.mbound) return;
+    el.dataset.mbound = '1';
+    el.classList.toggle('on', el.dataset.s === SHAPE);
+    el.addEventListener('click', async e=>{
+      e.stopPropagation();
+      document.querySelectorAll('#setShape span').forEach(x=>
+        x.classList.toggle('on', x === el));
+      await setShape(el.dataset.s);
+      setMiniLabels();
+    });
+  });
+
+  /* 置顶 */
+  const tp = document.getElementById('setTop');
+  if(tp && !tp.dataset.mbound){
+    tp.dataset.mbound = '1';
+    tp.classList.toggle('on', ON_TOP);
+    tp.addEventListener('click', async e=>{
+      e.stopPropagation();
+      tp.disabled = true;
+      const want = !ON_TOP;
+      const ok = await setOnTop(want, true);
+      if(ok){
+        tp.classList.toggle('on', want);
+        toast(want ? '已固定在其他窗口上层' : '已取消置顶', 'ok', '');
+      }else{
+        toast('置顶没能改成功', 'err', '');
+      }
+      tp.disabled = false;
+    });
+  }
+
+  /* 开机摆到右上角 */
+  const pr = document.getElementById('setPin');
+  if(pr && !pr.dataset.mbound){
+    pr.dataset.mbound = '1';
+    pr.classList.toggle('on', !!cfg.pin_right);
+    pr.addEventListener('click', async e=>{
+      e.stopPropagation();
+      pr.disabled = true;
+      const want = !pr.classList.contains('on');
+      const a = window.pywebview && window.pywebview.api;
+      try{
+        const r = (a && typeof a.win_set === 'function')
+          ? await a.win_set('pin_right', want) : null;
+        if(r && r.ok){
+          pr.classList.toggle('on', want);
+          /*  只开「贴右上角」还不够 ——
+              要真的在开机时是那个样子，形态也得是小浮窗。
+              这里用 setShape() 而不是自己改 SHAPE 和类名，
+              免得两处状态不一致（踩过：标签和实际对不上）。 */
+          if(want && SHAPE !== 'compact'){
+            await setShape('compact', true);
+          }
+          toast(want ? '开机会以小浮窗出现在右上角' : '已关闭', 'ok', '');
+        }else{
+          toast('没能改成功：' + ((r && r.error) || '未知原因'), 'err', '');
+        }
+      }catch(err){
+        toast('没能改成功：' + err, 'err', '');
+      }
+      pr.disabled = false;
+      setMiniLabels();
+      syncShapeSeg();
+    });
+  }
+
+  setMiniLabels();
+  syncShapeSeg();
+}
+
+function setMiniLabels(){
+  const v = document.getElementById('setValShape');
+  if(v) v.textContent = (SHAPE === 'compact') ? '小浮窗' : '完整界面';
+}
+
+/* ══════════ 和主流程的关系 ══════════
+   ★ 本来想「包一层 render()」—— 在它跑完之后跟着更新小浮窗。
+     实测这条路走不通，记下原因免得再试：
+
+       app.js 里的 ``render()`` 是**函数声明**，
+       别处调它写的是裸名字 ``render()``，会直接解析到那个声明上，
+       改 ``window.render`` 根本不影响它们。
+
+   → 改用最简单的办法：小浮窗开着的时候，**每秒重算一次**
+     （``startMiniTick``）。数据变了最多 1 秒后就反映出来，
+     而 ``renderMini`` 自带「值没变就不碰 DOM」的签名判断，
+     所以每秒跑一次的开销只是一次字符串比较。
+*/
+
+/* 小浮窗里那个倒计时也要每秒走 ——
+   它不在 #page-sch 里，所以 tickCountdown() 管不到它。 */
+let miniTickTimer = null;
+function startMiniTick(){
+  if(miniTickTimer) return;
+  miniTickTimer = setInterval(()=>{
+    if(document.body.classList.contains('compact')) renderMini();
+  }, 1000);
+}
+
+
+/* ══════════ 小浮窗：启动 ══════════ */
+bindMiniToggle();
+bootShape();
+startMiniTick();
+
+
+/* ══════════════ 配色预设 ══════════════
+   一套预设 = 一组 CSS 变量的值。换主题就是一次性写进去。
+
+   ★ 为什么不做成 `.theme-x` 类：
+     切主题要和「透明度」「毛玻璃」叠加（那两项也在改变量）。
+     用类名的话两处都在改同一个变量，谁赢取决于选择器权重，
+     很难推理。统一走 JS 写内联变量 —— 只有一条路径，不会打架。
+
+   ★ 为什么每个预设要给九个值：
+     只换底色的话，玻璃卡片还是米白的、阴影还是暖褐的、
+     背景光斑还是原来的暖黄 —— 换汤不换药，一眼看出没配套。 */
+const THEMES = {
+  /*  ── 浅绿系（用户点名要的）──
+      清爽的青草色，配一点点黄绿光斑 */
+  green: {
+    name: '浅绿',
+    bg:'#eef5ec', bg2:'#e4efe2', tint:'250,255,250',
+    shadow:'86,110,84', line:'196,214,192',
+    glow1:'#f7fdf5', glow2:'#e8f4e4', glow3:'#dfeedd',
+    bgRGB:'238,245,236', fade:'rgba(238,245,236,.95)',
+    scrim:'rgba(48,58,46,.26)',
+  },
+  /*  ── 米白暖色（原本的默认）── */
+  warm: {
+    name: '米白',
+    bg:'#f5f1e8', bg2:'#efe9dc', tint:'255,253,248',
+    shadow:'120,105,80', line:'214,202,179',
+    glow1:'#fefbf3', glow2:'#f8f0e3', glow3:'#efe8d9',
+    bgRGB:'245,241,232', fade:'rgba(245,241,232,.95)',
+    scrim:'rgba(61,56,48,.26)',
+  },
+  /*  ── 冷灰（安静、适合长时间看）── */
+  gray: {
+    name: '冷灰',
+    bg:'#f2f3f5', bg2:'#e8eaed', tint:'253,254,255',
+    shadow:'92,99,110', line:'206,211,218',
+    glow1:'#fbfcfd', glow2:'#eef1f4', glow3:'#e6e9ed',
+    bgRGB:'242,243,245', fade:'rgba(242,243,245,.95)',
+    scrim:'rgba(46,50,56,.26)',
+  },
+  /*  ── 浅蓝 ── */
+  blue: {
+    name: '浅蓝',
+    bg:'#eef3f9', bg2:'#e3ecf6', tint:'250,253,255',
+    shadow:'80,100,126', line:'194,208,226',
+    glow1:'#f8fbff', glow2:'#e9f1fa', glow3:'#dee9f6',
+    bgRGB:'238,243,249', fade:'rgba(238,243,249,.95)',
+    scrim:'rgba(44,54,68,.26)',
+  },
+  /*  ── 藕粉 ── */
+  pink: {
+    name: '藕粉',
+    bg:'#f8f0f2', bg2:'#f2e6ea', tint:'255,252,253',
+    shadow:'124,94,104', line:'224,202,210',
+    glow1:'#fffafb', glow2:'#faeef1', glow3:'#f3e4e9',
+    bgRGB:'248,240,242', fade:'rgba(248,240,242,.95)',
+    scrim:'rgba(64,50,54,.26)',
+  },
+  /*  ── 深色（护眼，晚上用）──
+      深色下玻璃要「往亮里透」才对：tint 用偏白的低 alpha，
+      阴影改用纯黑（暖褐在黑底上看不见）*/
+  dark: {
+    name: '深色',
+    bg:'#25272b', bg2:'#1f2125', tint:'58,62,68',
+    shadow:'0,0,0', line:'62,66,73',
+    glow1:'#2d3036', glow2:'#22242a', glow3:'#1c1e22',
+    bgRGB:'37,39,43', fade:'rgba(37,39,43,.95)',
+    scrim:'rgba(0,0,0,.5)',
+    dark: true,
+  },
+};
+
+/* 深色主题要额外改一批「跟底色对比」的变量 ——
+   文字、卡片、标签…如果只换底色，深底上会是黑字，读不了。 */
+const DARK_VARS = {
+  '--text':'#e6e4e0', '--muted':'#a8a49c', '--dim':'#847f78',
+  '--card':'#2e3136', '--card2':'#33363c',
+  '--line':'#3e4247', '--line2':'#4a4e54',
+  '--glass':'rgba(58,62,68,.72)',
+  '--glass-2':'rgba(58,62,68,.55)',
+  '--glass-3':'rgba(58,62,68,.88)',
+  '--glassTop':'inset 0 1px 0 rgba(255,255,255,.09)',
+  '--glassEdge':'rgba(255,255,255,.14)',
+};
+/* 亮色主题要把这些**显式还原** ——
+   否则从深色切回亮色时，上面那批还留在 :root 上。 */
+const LIGHT_VARS = {
+  '--text':'#3d3830', '--muted':'#8a8171', '--dim':'#a89e8b',
+  '--card':'#fffdf8', '--card2':'#f7f2e7',
+  '--line':'#e2d9c7', '--line2':'#d6cab3',
+  '--glass':'rgba(255,253,248,.72)',
+  '--glass-2':'rgba(255,253,248,.55)',
+  '--glass-3':'rgba(255,253,248,.86)',
+  '--glassTop':'inset 0 1px 0 rgba(255,255,255,.75)',
+  '--glassEdge':'rgba(255,255,255,.62)',
+};
+
+const THEME_KEY = 'mb.theme';
+const BGI_KEY   = 'mb.bgimg';      /* 背景图（dataURL，存 localStorage） */
+const BGA_KEY   = 'mb.bgalpha';
+
+let THEME_NAME = localStorage.getItem(THEME_KEY) || 'warm';
+let CUSTOM_BG = localStorage.getItem('mb.bg') || '';
+/*  自定义字色。空 = 没设过（跟着预设 / 自动挑） */
+let CUSTOM_TEXT = localStorage.getItem('mb.fg') || '';
+/*  最近一次算出来的那套字色（正文/次要/三级），对比度提示要用 */
+let TEXT_LOCK = null;
+let BG_IMG = '';
+
+/* 把一套配色写进 :root */
+function applyTheme(name){
+  const t = THEMES[name] || THEMES.warm;
+  const rt = document.documentElement;
+
+  /*  ① 先还原「对比色」那批 —— 深色切回亮色时要用 */
+  const base = t.dark ? DARK_VARS : LIGHT_VARS;
+  for(const k in base) rt.style.setProperty(k, base[k]);
+
+  /*  ② 再写这套预设自己的九个值 */
+  rt.style.setProperty('--bgColor',  t.bg);
+  rt.style.setProperty('--bgColor2', t.bg2);
+  rt.style.setProperty('--bgRGB',    t.bgRGB);
+  rt.style.setProperty('--tintRGB',  t.tint);
+  rt.style.setProperty('--shadowRGB', t.shadow);
+  rt.style.setProperty('--lineRGB',  t.line);
+  rt.style.setProperty('--glow1',    t.glow1);
+  rt.style.setProperty('--glow2',    t.glow2);
+  rt.style.setProperty('--glow3',    t.glow3);
+  rt.style.setProperty('--fadeTop',  t.fade);
+  rt.style.setProperty('--scrim',    t.scrim);
+
+  /*  ③ 自定义底色盖在预设之上（如果设过）
+         —— 它会连带处理字色（自动挑 + 用户自定） */
+  if(CUSTOM_BG) applyCustomBg(CUSTOM_BG, true);
+
+  /*  ④ 用户自己定过字色 → 盖掉预设那套
+         （放在自定义底色之后：用户明确指定的优先级最高） */
+  if(CUSTOM_TEXT) applyCustomText(CUSTOM_TEXT, true);
+
+  /*  ⑤ 玻璃那三层要按新底色重算 ——
+        applyLook() 里写的是「米白」的固定写法，
+        换主题之后得用新 tint 重写一遍，否则玻璃还是米白的。 */
+  if(typeof applyLook === 'function' && LOOK) applyLook(LOOK);
+
+  /*  ⑥ 深色主题下高光要淡一点（见 lqSyncDark 的说明） */
+  if(typeof lqSyncDark === 'function'){
+    try{ lqSyncDark(); }catch(e){}
+  }
+}
+
+/* 从 '#rrggbb' 算出「亮一点的同色系」，返回**十进制**的 'R,G,B'
+   （不是十六进制 —— 那个格式直接拼进 rgba() 是无效颜色） */
+function lighten(hex, k){
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || '');
+  if(!m) return null;
+  /*  ★ parseInt(v, 16) —— 忘了写 16 会按十进制解析，
+         "d9" 会变成 NaN，算出来的颜色整个是坏的 */
+  const up = v => Math.min(255,
+    Math.round(parseInt(v, 16) + (255 - parseInt(v, 16)) * k));
+  return [up(m[1]), up(m[2]), up(m[3])].join(',');
+}
+
+/* 相对亮度（WCAG 那套）—— 用来判断「这个底色该配深字还是浅字」 */
+function hexLum(hex){
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || '');
+  if(!m) return null;
+  const [r, g, b] = [m[1], m[2], m[3]].map(v=>{
+    const c = parseInt(v, 16) / 255;
+    return c <= 0.03928 ? c/12.92 : Math.pow((c+0.055)/1.055, 2.4);
+  });
+  return 0.2126*r + 0.7152*g + 0.0722*b;
+}
+
+/* 两个颜色的对比度（1~21）。WCAG 正文要求 ≥4.5 */
+function contrastOf(a, b){
+  const la = hexLum(a), lb = hexLum(b);
+  if(la == null || lb == null) return null;
+  const hi = Math.max(la, lb), lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/*  自动挑一个「看得清」的字色。
+    ★ 用户自己改底色之后最容易出的事就是字看不清 ——
+      浅底配白字、深底配黑字，都是几分钟看不出问题、
+      真用起来眼睛疼的那种。所以改底色时顺手算一遍对比度，
+      不够就自动换一套字色，并且告诉他「自动调过了」。 */
+function autoTextFor(bg, dark){
+  /*  深色主题配浅字，亮色主题配深字 —— 但**还要看对比度**，
+      深色主题下用户挑了个亮黄底色，就不能再用浅字了。 */
+  const light = { text:'#e6e4e0', muted:'#a8a49c', dim:'#847f78' };
+  const darkV =  { text:'#3d3830', muted:'#8a8171', dim:'#a89e8b' };
+  const cand = dark ? [light, darkV] : [darkV, light];
+  const pick = cand.find(set=>{
+    const c = contrastOf(bg, set.text);
+    return c != null && c >= 4.5;
+  });
+  return pick || cand[0];
+}
+
+/*  对比度提示（设置面板「当前对比度」那一行）。
+    字色 / 底色任一变都调它；算不出（没底色没字色）就自己收起来。
+    底色优先用自定义，其次当前预设；字色优先自定义，其次自动挑的那套。 */
+function updateContrastHint(){
+  const row = document.getElementById('setCtrRow');
+  const cv = document.getElementById('setCtrVal');
+  if(!row || !cv) return;
+  const bg = CUSTOM_BG || (THEMES[THEME_NAME] || {}).bg || '';
+  const fg = CUSTOM_TEXT || (TEXT_LOCK || {}).text
+           || getComputedStyle(document.documentElement)
+                .getPropertyValue('--text').trim();
+  const cr = (bg && fg) ? contrastOf(bg, fg) : null;
+  if(cr == null){
+    row.classList.remove('show');
+    return;
+  }
+  row.classList.add('show');
+  const ok = cr >= 4.5;
+  cv.textContent = cr.toFixed(1) + (ok ? '' : '（可能看不清）');
+  cv.style.color = ok ? 'var(--green)' : 'var(--orange)';
+}
+
+function applyCustomBg(hex, quiet){
+  CUSTOM_BG = hex || '';
+  const rt = document.documentElement;
+  if(!CUSTOM_BG){
+    rt.style.removeProperty('--bgColor');
+    rt.style.removeProperty('--bgRGB');
+    rt.style.removeProperty('--tintRGB');
+    rt.style.removeProperty('--fadeTop');
+    rt.style.removeProperty('--text');
+    rt.style.removeProperty('--muted');
+    rt.style.removeProperty('--dim');
+    /*  去掉覆盖 → 回到预设自己的值 */
+    applyTheme(THEME_NAME);
+    const tx0 = document.getElementById('setTextTx');
+    if(tx0) tx0.textContent = '跟着预设走';
+    updateContrastHint();      /* 底色清空 → 报预设组合的对比度 */
+    return;
+  }
+  localStorage.setItem('mb.bg', CUSTOM_BG);
+  rt.style.setProperty('--bgColor', CUSTOM_BG);
+
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(CUSTOM_BG);
+  if(m){
+    /*  ★ 必须转成**十进制**再拼 ——
+          CSS 变量里 --bgRGB 的格式是「245,241,232」（十进制），
+          而颜色选择器给的是十六进制字符串（"d9e8f5"）。
+          直接把十六进制塞进去会得到
+             rgba(d9,e8,f5,.95)
+          这是**无效颜色**，浏览器会整条丢掉 ——
+          症状是「视口上下那两条渐隐带不见了」，
+          不报错、不提示，很难查。
+          （踩过一次：值打印出来才看出来是 d9 不是 217。） */
+    const dec = [m[1], m[2], m[3]].map(v => parseInt(v, 16));
+    const arr = dec.join(',');
+    rt.style.setProperty('--bgRGB', arr);
+    /*  玻璃底：底色往白里提一点 —— 玻璃总比底色亮，才像玻璃 */
+    const tt = lighten(CUSTOM_BG, 0.72);
+    if(tt) rt.style.setProperty('--tintRGB', tt);
+    /*  边缘渐隐要跟底色一致，否则会看出两条色带 */
+    rt.style.setProperty('--fadeTop', `rgba(${arr},.95)`);
+
+    /*  ── 字色：用户没自己定的话，按底色的明暗自动挑一套 ──
+         见 autoTextFor() 的说明：改底色最容易把字弄成看不清，
+         所以这里顺手算一遍对比度。 */
+    if(!CUSTOM_TEXT){
+      const isDark = !!(THEMES[THEME_NAME] || {}).dark;
+      const set = autoTextFor(CUSTOM_BG, isDark);
+      TEXT_LOCK = set;
+      rt.style.setProperty('--text', set.text);
+      rt.style.setProperty('--muted', set.muted);
+      rt.style.setProperty('--dim', set.dim);
+      const tx = document.getElementById('setTextTx');
+      if(tx) tx.textContent = '已按底色自动选（' + set.text.toUpperCase() + '）';
+    }
+    /*  对比度兜底：不管字色是不是用户定的，都报一次数。
+        低于 4.5 就提醒 —— 但不强行改（用户可能有他的理由）。 */
+    updateContrastHint();
+  }
+  if(!quiet) toast('背景颜色已更新', 'ok', '');
+}
+
+/* ── 自定义字色 ──
+   三种状态要分清楚：
+     · 没设过    → CUSTOM_TEXT 空，跟着预设/自动走
+     · 设过      → 用用户的值
+     · 「自动」  → 把 CUSTOM_TEXT 清掉，让 autoTextFor 重新挑 */
+function applyCustomText(hex, quiet){
+  const rt = document.documentElement;
+  CUSTOM_TEXT = hex || '';
+  if(!CUSTOM_TEXT){
+    localStorage.removeItem('mb.fg');
+    rt.style.removeProperty('--text');
+    rt.style.removeProperty('--muted');
+    rt.style.removeProperty('--dim');
+    TEXT_LOCK = null;
+    /*  回到「跟着底色自动挑」——拿当前底色再算一遍 */
+    if(CUSTOM_BG){
+      const isDark = !!(THEMES[THEME_NAME] || {}).dark;
+      const set = autoTextFor(CUSTOM_BG, isDark);
+      TEXT_LOCK = set;
+      rt.style.setProperty('--text', set.text);
+      rt.style.setProperty('--muted', set.muted);
+      rt.style.setProperty('--dim', set.dim);
+    }
+    const tx = document.getElementById('setTextTx');
+    if(tx) tx.textContent = '跟着预设走';
+    updateContrastHint();      /* 字色回到自动 → 报新组合的对比度 */
+    if(quiet !== true) toast('字色已跟着底色', 'ok', '');
+    return;
+  }
+  localStorage.setItem('mb.fg', CUSTOM_TEXT);
+  /*  只改「正文色」，次要色按同色系推 ——
+      只改一个 --text 的话，标签、说明文字还是旧色，
+      深浅底之间切换会显得「半新半旧」。 */
+  const set = textSetFrom(CUSTOM_TEXT);
+  TEXT_LOCK = set;
+  rt.style.setProperty('--text', set.text);
+  rt.style.setProperty('--muted', set.muted);
+  rt.style.setProperty('--dim', set.dim);
+
+  /*  顺手报一下对比度 —— 用户挑了看不清的组合，要当场知道 */
+  updateContrastHint();
+  if(quiet !== true) toast('字体颜色已更新', 'ok', '');
+}
+
+/* 从一个「正文色」推出配套的次要色 ——
+   正文往灰里调一点 = 次要色，再淡一点 = 三级色。
+   这样三档颜色的色相一致，不会「正文是蓝的、说明是灰的」那么乱。 */
+function textSetFrom(hex){
+  const m = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(hex || '');
+  if(!m) return { text:hex, muted:hex, dim:hex };
+  const v = [m[1], m[2], m[3]].map(x=>parseInt(x, 16));
+  const L = hexLum(hex);
+  /*  往哪个方向调：亮字（在深底上）要往暗里调才「次要」，
+      暗字（在亮底上）要往亮里调。 */
+  const dir = (L != null && L < 0.4) ? -1 : 1;
+  const mix = (a, k)=>{
+    /*  朝中灰（128）靠 —— 灰色在任何底色上都比纯色更像「次要」 */
+    const t = 128;
+    return Math.round(a + (t - a) * k);
+  };
+  const s1 = v.map(x=>mix(x, 0.42));
+  const s2 = v.map(x=>mix(x, 0.62));
+  const hx = a => '#' + a.map(x=>x.toString(16).padStart(2,'0')).join('');
+  return { text:hex, muted:hx(s1), dim:hx(s2), dir };
+}
+
+/* ── 背景图片 ──
+   存成 dataURL 放 localStorage（不上传、不依赖网络）。
+   图太大会撑爆 localStorage（一般 5MB 配额），
+   所以先缩到最长边 1600 再存。
+
+   渲染靠 CSS 的 body::before 那一层（见 app.css），
+   这里只负责把 url 和浓度写到变量上。 */
+function applyBgImage(dataUrl){
+  const rt = document.documentElement;
+  if(!dataUrl){
+    rt.style.setProperty('--bgImage', 'none');
+    BG_IMG = '';
+    return;
+  }
+  BG_IMG = dataUrl;
+  /*  变量值里带引号 —— 路径里的括号、空格才不会截断 url() */
+  rt.style.setProperty('--bgImage', 'url("' + dataUrl + '")');
+  applyBgAlpha(localStorage.getItem(BGA_KEY) || 100);
+}
+
+function applyBgAlpha(v){
+  const a = Math.max(0.1, Math.min(1, (+v || 100) / 100));
+  document.documentElement.style.setProperty('--bgImageAlpha', String(a));
+}
+
+function setBgAlpha(v){
+  const n = Math.max(10, Math.min(100, Math.round(+v || 100)));
+  localStorage.setItem(BGA_KEY, String(n));
+  applyBgAlpha(n);
+  const el = document.getElementById('setValBga');
+  if(el) el.textContent = n + '%';
+}
+
+/* 图片先缩放再存 —— 原图直存很容易超 localStorage 配额 */
+function shrinkImage(file, cb){
+  const fr = new FileReader();
+  fr.onload = ()=>{
+    const img = new Image();
+    img.onload = ()=>{
+      const MAX = 1600;
+      let w = img.width, h = img.height;
+      if(w > MAX || h > MAX){
+        const k = MAX / Math.max(w, h);
+        w = Math.round(w * k); h = Math.round(h * k);
+      }
+      try{
+        const cv = document.createElement('canvas');
+        cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        /*  jpeg 0.82 —— 看得过去，又能把体积压下来 */
+        cb(cv.toDataURL('image/jpeg', 0.82));
+      }catch(e){
+        cb(fr.result);        /* 转不了就用原图 */
+      }
+    };
+    img.onerror = ()=>{ cb(''); };
+    img.src = fr.result;
+  };
+  fr.onerror = ()=>{ cb(''); };
+  fr.readAsDataURL(file);
+}
+
+/* ── 设置面板里的配色控件 ── */
+function renderThemeSwatches(){
+  const box = document.getElementById('setTheme');
+  if(!box) return;
+  const keys = Object.keys(THEMES);
+  box.innerHTML = keys.map(k=>{
+    const t = THEMES[k];
+    return `<div class="th${k === THEME_NAME ? ' on' : ''}" data-th="${k}"
+      title="${esc(t.name)}">
+      <i style="background:${t.bg}"></i>
+      <i style="background:${t.tint.replace(/,/g,' ')};clip-path:
+        polygon(0 66%,100% 66%,100% 100%,0 100%)"></i>
+    </div>`;
+  }).join('');
+  if(!box.dataset.bound){
+    box.dataset.bound = '1';
+    box.addEventListener('click', e=>{
+      const el = e.target.closest('.th');
+      if(!el) return;
+      e.stopPropagation();
+      THEME_NAME = el.dataset.th;
+      localStorage.setItem(THEME_KEY, THEME_NAME);
+      /*  换预设时把「自定义底色」清掉 ——
+          不然用户会看到「点了没变化」（自定义色盖住了预设）。 */
+      if(CUSTOM_BG){
+        CUSTOM_BG = '';
+        localStorage.removeItem('mb.bg');
+        const tx = document.getElementById('setBgTx');
+        if(tx) tx.textContent = '选一个自己喜欢的底色';
+      }
+      applyTheme(THEME_NAME);
+      renderThemeSwatches();
+      updateContrastHint();    /* 换预设后报新组合的对比度 */
+      const v = document.getElementById('setValTheme');
+      if(v) v.textContent = (THEMES[THEME_NAME] || {}).name || '';
+    });
+  }
+  const v = document.getElementById('setValTheme');
+  if(v) v.textContent = (THEMES[THEME_NAME] || {}).name || '';
+}
+
+/* ── 颜色存档 ──
+   挑过的自定义颜色默认留下来（勾选框默认勾选），
+   下次想换回去点一下色块就行，不必重新调。
+   存 localStorage：mb.bg.arch / mb.fg.arch（JSON 数组，新的在前，最多 12 个）。 */
+const ARCH_KEY = { bg:'mb.bg.arch', fg:'mb.fg.arch' };
+const ARCH_MAX = 12;
+
+function archLoad(kind){
+  try{
+    const a = JSON.parse(localStorage.getItem(ARCH_KEY[kind]) || '[]');
+    return Array.isArray(a) ? a.filter(x => /^#[\da-f]{6}$/i.test(x)) : [];
+  }catch(e){ return []; }
+}
+function archAdd(kind, hex){
+  hex = (hex || '').toUpperCase();
+  if(!/^#[\da-f]{6}$/i.test(hex)) return;
+  const a = archLoad(kind).filter(x => x !== hex);   /* 去重，新的排最前 */
+  a.unshift(hex);
+  localStorage.setItem(ARCH_KEY[kind], JSON.stringify(a.slice(0, ARCH_MAX)));
+}
+function archRemove(kind, hex){
+  hex = (hex || '').toUpperCase();
+  localStorage.setItem(ARCH_KEY[kind],
+    JSON.stringify(archLoad(kind).filter(x => x !== hex)));
+}
+function renderArch(kind){
+  const box = document.getElementById(kind === 'bg' ? 'setBgArch' : 'setFgArch');
+  if(!box) return;
+  const a = archLoad(kind);
+  box.innerHTML = a.map(hex =>
+    `<button class="asw" data-arch="${hex}" style="background:${hex}"
+       title="${hex} —— 点一下换回来"><span class="asx" data-archx="${hex}"
+       title="从存档删除">×</span></button>`).join('');
+  if(box.dataset.bound) return;
+  box.dataset.bound = '1';
+  box.addEventListener('click', e=>{
+    e.stopPropagation();
+    const x = e.target.closest('[data-archx]');
+    if(x){                                   /* × ：从存档删掉 */
+      archRemove(kind, x.dataset.archx);
+      renderArch(kind);
+      toast('已从存档删除', 'ok', '');
+      return;
+    }
+    const sw = e.target.closest('[data-arch]');
+    if(!sw) return;                          /* 色块：直接应用 */
+    const hex = sw.dataset.arch;
+    if(kind === 'bg'){
+      applyCustomBg(hex);
+      const inp = document.getElementById('setBg');
+      const swBox = document.getElementById('setBgSw');
+      const tx = document.getElementById('setBgTx');
+      if(inp) inp.value = hex;
+      if(swBox) swBox.style.background = hex;
+      if(tx) tx.innerHTML = `当前 <b>${esc(hex)}</b>`;
+    }else{
+      applyCustomText(hex);
+      const inp = document.getElementById('setFg');
+      const swBox = document.getElementById('setFgSw');
+      if(inp) inp.value = hex;
+      if(swBox) swBox.style.background = hex;
+    }
+  });
+}
+/* 取色器「落定」时调用：勾选了存档才存（默认勾着） */
+function archMaybeSave(kind, hex){
+  const chk = document.getElementById(kind === 'bg' ? 'setBgArchChk' : 'setFgArchChk');
+  if(chk && !chk.checked) return;
+  archAdd(kind, hex);
+  renderArch(kind);
+}
+
+function bindThemeControls(){
+  if(bindThemeControls._done) return;
+  bindThemeControls._done = true;
+
+  /* 自定义底色 */
+  const sw = document.getElementById('setBg');
+  const swBox = document.getElementById('setBgSw');
+  if(sw){
+    if(CUSTOM_BG) sw.value = CUSTOM_BG;
+    sw.addEventListener('input', ()=>{
+      applyCustomBg(sw.value, true);
+      if(swBox) swBox.style.background = sw.value;
+      const tx = document.getElementById('setBgTx');
+      if(tx) tx.innerHTML = `当前 <b>${esc(sw.value.toUpperCase())}</b>`;
+    });
+    sw.addEventListener('change', ()=>{
+      applyCustomBg(sw.value);
+      archMaybeSave('bg', sw.value);     /* 存档（勾选框默认勾着） */
+      const tx = document.getElementById('setBgTx');
+      if(tx) tx.innerHTML = `当前 <b>${esc(sw.value.toUpperCase())}</b>`;
+    });
+  }
+  /* 色块本身也要显示当前色（取色器是透明的） */
+  if(swBox) swBox.style.background = CUSTOM_BG || (THEMES[THEME_NAME]||{}).bg || '#f5f1e8';
+  const tx = document.getElementById('setBgTx');
+  if(tx && CUSTOM_BG) tx.innerHTML = `当前 <b>${esc(CUSTOM_BG.toUpperCase())}</b>`;
+
+  document.getElementById('setBgReset')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    CUSTOM_BG = '';
+    localStorage.removeItem('mb.bg');
+    const tx2 = document.getElementById('setBgTx');
+    if(tx2) tx2.textContent = '选一个自己喜欢的底色';
+    if(swBox) swBox.style.background = (THEMES[THEME_NAME]||{}).bg || '#f5f1e8';
+    applyTheme(THEME_NAME);
+    updateContrastHint();      /* 跟回预设后，报预设组合的对比度 */
+    toast('已跟回预设配色', 'ok', '');
+  });
+
+  /* ── 字体颜色 ── */
+  const fgSw = document.getElementById('setFg');
+  const fgBox = document.getElementById('setFgSw');
+  if(fgSw){
+    if(CUSTOM_TEXT) fgSw.value = CUSTOM_TEXT;
+    fgSw.addEventListener('input', ()=>{
+      applyCustomText(fgSw.value, true);
+      if(fgBox) fgBox.style.background = fgSw.value;
+    });
+    fgSw.addEventListener('change', ()=>{
+      applyCustomText(fgSw.value);
+      archMaybeSave('fg', fgSw.value);   /* 存档（勾选框默认勾着） */
+    });
+  }
+  if(fgBox){
+    const cur = getComputedStyle(document.documentElement)
+                  .getPropertyValue('--text').trim();
+    fgBox.style.background = CUSTOM_TEXT || cur || '#3d3830';
+  }
+  document.getElementById('setFgAuto')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    /*  先清掉用户的设定，再让它按当前底色重挑 ——
+        这样「自动」永远是「按现在这个底色算」，不是按上次的。 */
+    CUSTOM_TEXT = '';
+    localStorage.removeItem('mb.fg');
+    if(CUSTOM_BG){
+      applyCustomBg(CUSTOM_BG, true);
+    }else{
+      applyTheme(THEME_NAME);
+      const s = (THEMES[THEME_NAME]||{}).dark ? DARK_VARS : LIGHT_VARS;
+      TEXT_LOCK = { text:s['--text'], muted:s['--muted'], dim:s['--dim'] };
+      const tx = document.getElementById('setTextTx');
+      if(tx) tx.textContent = '跟着预设走';
+    }
+    updateContrastHint();      /* 自动挑完了，把新组合的对比度报出来 */
+    if(fgSw && TEXT_LOCK) fgSw.value = TEXT_LOCK.text;
+    if(fgBox && TEXT_LOCK) fgBox.style.background = TEXT_LOCK.text;
+    toast('字体颜色已按底色自动选好', 'ok', '');
+  });
+
+  /* 背景图 */
+  const file = document.getElementById('setBgiFile');
+  document.getElementById('setBgiPick')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    file?.click();
+  });
+  file?.addEventListener('change', ()=>{
+    const f = file.files && file.files[0];
+    if(!f) return;
+    shrinkImage(f, url=>{
+      if(!url){ toast('这张图读不出来', 'err', ''); return; }
+      try{
+        localStorage.setItem(BGI_KEY, url);
+      }catch(err){
+        toast('图片太大，存不下（换张小一点的）', 'err', '');
+        return;
+      }
+      applyBgImage(url);
+      document.getElementById('setBgAlphaRow')?.classList.add('show');
+      const v = document.getElementById('setValBgi');
+      if(v) v.textContent = '已设置';
+      toast('背景图片已设置', 'ok', '');
+    });
+    file.value = '';
+  });
+  document.getElementById('setBgiClear')?.addEventListener('click', e=>{
+    e.stopPropagation();
+    localStorage.removeItem(BGI_KEY);
+    applyBgImage('');
+    document.getElementById('setBgAlphaRow')?.classList.remove('show');
+    const v = document.getElementById('setValBgi');
+    if(v) v.textContent = '';
+    toast('背景图片已移除', 'ok', '');
+  });
+
+  /* 图片浓度 */
+  const ga = document.getElementById('setBga');
+  if(ga){
+    const saved = parseInt(localStorage.getItem(BGA_KEY) || '100', 10);
+    ga.value = String(Number.isFinite(saved) ? saved : 100);
+    setBgAlpha(ga.value);
+    ga.addEventListener('input', ()=> setBgAlpha(ga.value));
+  }
+
+  /* 颜色存档：把上次存下来的色块渲染出来 */
+  renderArch('bg');
+  renderArch('fg');
+}
+
+/* 开机时把配色装回去 */
+function bootTheme(){
+  renderThemeSwatches();
+  bindThemeControls();
+  applyTheme(THEME_NAME);
+  /*  背景图读出来要稍等一下（dataURL 可能几百 KB）*/
+  setTimeout(()=>{
+    try{
+      const img = localStorage.getItem(BGI_KEY);
+      if(img){
+        applyBgImage(img);
+        document.getElementById('setBgAlphaRow')?.classList.add('show');
+        const v = document.getElementById('setValBgi');
+        if(v) v.textContent = '已设置';
+      }
+    }catch(e){}
+  }, 60);
+}
+
+
+/* ══════════ 配色：启动 ══════════
+   ★ 时机有讲究 —— app.js 在 index.html 里**位于设置面板之前**，
+     直接调 bootTheme() 时 #setTheme 还不存在，色板会渲染成空的。
+     （踩过：页面上色板一个都没有，但手动调一次函数就出来了。）
+
+     分两半：
+       · 变量要立刻写 —— 晚了会看到一瞬间的默认配色（闪一下）
+       · 控件要等 DOM —— 面板还没解析出来，找不到元素 */
+(function bootThemeNow(){
+  /*  ① 变量立刻生效（此时 :root 一定在） */
+  try{
+    applyTheme(THEME_NAME);
+    renderThemeSwatches();      /* 面板不在就什么也不做 */
+  }catch(e){}
+})();
+
+function bootThemeLater(){
+  if(bootThemeLater._done) return;
+  const host = document.getElementById('setTheme');
+  if(!host) return;
+  bootThemeLater._done = true;
+  /*  首屏配色已经写过了，这里只补控件 + 背景图 */
+  renderThemeSwatches();
+  bindThemeControls();
+  /*  字色控件同步一下当前值（可能是上次存的） */
+  const fgSw = document.getElementById('setFg');
+  const fgBox = document.getElementById('setFgSw');
+  const cur = TEXT_LOCK ? TEXT_LOCK.text
+            : getComputedStyle(document.documentElement)
+                .getPropertyValue('--text').trim();
+  if(fgSw && cur) fgSw.value = cur;
+  if(fgBox && cur) fgBox.style.background = cur;
+  const tx = document.getElementById('setTextTx');
+  if(tx){
+    tx.textContent = CUSTOM_TEXT ? ('当前 ' + CUSTOM_TEXT.toUpperCase())
+                   : (CUSTOM_BG ? '已按底色自动选' : '跟着预设走');
+  }
+  try{
+    const img = localStorage.getItem(BGI_KEY);
+    if(img){
+      applyBgImage(img);
+      document.getElementById('setBgAlphaRow')?.classList.add('show');
+      const v = document.getElementById('setValBgi');
+      if(v) v.textContent = '已设置';
+    }
+  }catch(e){}
+}
+if(document.readyState === 'loading'){
+  document.addEventListener('DOMContentLoaded', bootThemeLater);
+}else{
+  bootThemeLater();
+}
+/*  双保险：DOMContentLoaded 早就过了也不会漏（同 bindSettings 的做法） */
+setTimeout(bootThemeLater, 0);
+setTimeout(bootThemeLater, 800);
+
+
+/* ══════════════ 深色主题标记 ══════════════
+   原本这里还有一整套「鼠标高光随动」——
+   鼠标在卡片上滑动时，一层柔光跟着走，写 --mx / --my 两个变量。
+
+   ★ 已按要求**删除**（用户：「删除鼠标高光随动」）。
+     连监听器一起摘掉：这类「每次 pointermove 都要读一次
+     getBoundingClientRect」的写法，在窄窗口里
+     是实打实的每帧强制重排来源，去掉之后更稳。
+
+   ★ 只保留下面这个「打深色标记」的小函数 ——
+     它没有性能开销，而且深色主题下别的地方（面板、滚动条）
+     也可能想用这个标记。 */
+
+/*  ── 深色主题下高光要淡一点 ──
+      白高光铺在黑底上很扎眼（像一块污渍），
+      降到一半才像「反光」。
+      CSS 里也有 @media 那种写法，但主题是 JS 切的，
+      所以在这里打个标记，让 CSS 用属性选择器接上。 */
+function lqSyncDark(){
+  const isDark = !!(THEMES[THEME_NAME] || {}).dark;
+  document.documentElement.setAttribute('data-dark', isDark ? '1' : '0');
+}
+
+
+/* ══════════ 深色标记：启动 ══════════ */
+lqSyncDark();
+
+
+/* ══════════════ 最大化流畅性 ══════════════
+   窗口尺寸变化的那一小段时间，把最贵的视觉效果临时关掉
+   （规则在 app.css 的 `html.resizing` 那一段）。
+
+   为什么需要：
+      页面上有 46 处 backdrop-filter。单看每一处都不贵，
+      但最大化那一刻「尺寸变 9.5 倍 × 46 处重新采样」，
+      加起来就是肉眼可见的顿。
+
+   怎么判断「变得差不多了」：
+      用 debounce —— resize 停稳 220ms 之后才摘掉 .resizing。
+      拖拽过程中会一连串触发 resize，每次都会把定时器推后，
+      所以拖的过程中一直保持「轻量模式」，松手才恢复。
+
+   ★ 为什么不用 transitionend / animationend：
+     窗口 resize 不触发这些事件，只能靠 debounce。 */
+let _rszLightT = null;
+let _rszLightOn = false;
+
+function lightenDuringResize(){
+  if(!_rszLightOn){
+    _rszLightOn = true;
+    document.documentElement.classList.add('resizing');
+  }
+  clearTimeout(_rszLightT);
+  _rszLightT = setTimeout(()=>{
+    _rszLightOn = false;
+    document.documentElement.classList.remove('resizing');
+  }, 220);
+}
+
+/*  捕获阶段监听 —— resize 不冒泡，普通监听挂在 window 上就行；
+    这里用 passive 是因为我们只读不写事件本身。 */
+window.addEventListener('resize', lightenDuringResize, {passive:true});
+
+/*  最大化/还原的瞬间立刻进入轻量模式 ——
+    不等 resize 事件（那要等窗口开始变才来），
+    先把模糊关掉，动完再开，观感更顺。 */
+function markMaximizing(){
+  if(!_rszLightOn){
+    _rszLightOn = true;
+    document.documentElement.classList.add('resizing');
+  }
+  clearTimeout(_rszLightT);
+  _rszLightT = setTimeout(()=>{
+    _rszLightOn = false;
+    document.documentElement.classList.remove('resizing');
+  }, 420);       /* 最大化比一般 resize 慢一点，时间给长些 */
+}
+
+
+/* 最大化时先关模糊再动（见 markMaximizing 的说明） */
+(function patchMaximize(){
+  const b = document.getElementById('btnWinMax');
+  if(!b || b.dataset.lqPatched) return;
+  b.dataset.lqPatched = '1';
+  /*  捕获阶段插一个「提前」的动作 ——
+      原来的 click 处理是 async（要等后端返回），
+      所以在它之前先把轻量模式打开。 */
+  b.addEventListener('click', ()=> markMaximizing(), true);
+})();
+
+
+/* ══════════════ 使用教程 ══════════════
+   逐条介绍每个可交互点：把元素圈出来 + 旁边浮一张说明卡。
+
+   ★ 用户的原话：
+     「esc 之类太繁琐了，安装包里额外加初次使用页面教程，
+      指明几乎每一个可交互点的作用。可跳过，可在设置里面再次唤起。」
+
+   ★ 为什么拆成「步骤数组」而不写死一段 HTML：
+     增删步骤只要动数组；排版、定位、进度、按钮全是共用的。
+     而且以后加了新按钮，往数组里补一条就行。
+   ══════════════════════════════════════════════════════════════════ */
+
+const TOUR_KEY = 'mb.tour.done';
+
+/*  ── 教程步骤 ──
+    sel 为空 = 不圈元素，卡片居中（讲的是「没有具体按钮」的事，
+    比如快捷键）。 */
+const TOUR_STEPS = [
+  {
+    sel: '',
+    t: '先看一圈',
+    b: `<p>这里用一分钟把每个能点的地方过一遍。</p>
+        <p class="dim">随时可以点「跳过」—— 以后在
+        <b>设置</b>里还能再叫出来。</p>`,
+  },
+  {
+    sel: '#bar .brand',
+    t: '顶栏：这是你的数据',
+    b: `<p>最左边显示 <b>上次更新时间</b>。</p>
+        <p>旁边那排圆按钮从左往右是：</p>
+        <ul>
+          <li><b>折叠</b> —— 把所有区块一起收起 / 展开</li>
+          <li><b>倒计时</b> —— 点一下立刻刷新</li>
+          <li><b>暂停键</b> —— 开关自动刷新</li>
+          <li><b>信封</b> —— 晚报（工作日晚 9 点后生成）</li>
+          <li><b>钥匙</b> —— 重新登录</li>
+          <li><b>Teams</b> —— 打开 Teams / EC 面板</li>
+          <li><b>齿轮</b> —— 设置（外观 / 操作）</li>
+          <li><b>收起</b> —— 缩成小浮窗</li>
+        </ul>`,
+  },
+  {
+    sel: '.winbtns',
+    t: '右上角：窗口按钮',
+    b: `<p>最小化 / 最大化 / 关闭。</p>
+        <p class="dim">窗口没有系统标题栏，所以这三个是唯一的
+        关窗途径。整条顶栏都能拖动窗口。</p>
+        <div class="tr-tip">${icon('i-key','sm')}
+          <span>按 <kbd>Esc</kbd> 也能唤出这几个操作（含「退出程序」）。
+          万一界面卡住点不到按钮，它是第二道保险。</span></div>`,
+  },
+  {
+    sel: '#tabs',
+    t: '五个页签',
+    b: `<p>课程成绩 / 今日课表 / GPA / 资料 / Teams。</p>
+        <p class="dim">每个页签右边的小数字是「这个页有几件事」。<br>
+        左右滑动、横向滚轮、方向键也能切页。</p>`,
+  },
+  {
+    sel: '#stats',
+    t: '六个关键数字',
+    b: `<p>待完成 / 已过期 / 7 天内 / 已完成 / 平均分 / GPA。</p>
+        <p class="dim">GPA 优先用学校公布的；没有就按你的分数
+        本机估算，并标明「估算」。</p>`,
+  },
+  {
+    sel: '#page-grade .card, #page-grade .grid',
+    t: '任务卡片',
+    b: `<p>每张卡是一个要交的作业。左侧的色条按紧急程度变色：
+        过期红、3 天内橙、7 天内黄、更远绿。</p>
+        <p><b>鼠标移上去</b>右上角会冒出按钮：</p>
+        <ul>
+          <li><b>我已完成</b> —— 线下交了 / 老师没给分，
+              标记后不再提示（只在本机生效）</li>
+          <li><b>下载</b> —— 有附件的任务才有这个键</li>
+        </ul>
+        <p class="dim">点卡片本身会展开详情面板。完成的任务，
+        状态会显示在<b>右上角</b>（不再是挤在底部标签里）。</p>`,
+  },
+  {
+    sel: '#live',
+    t: '自动刷新',
+    b: `<p>默认每 <b>5 分钟</b>自动抓一次。</p>
+        <p class="dim">那个圆按钮上的数字是倒计时，点一下立刻刷新。</p>`,
+  },
+  {
+    sel: '#btnDigest',
+    t: '晚报',
+    b: `<p>每个工作日晚上 9 点后自动生成一份当日小结：
+        今天新出了什么、明天有什么要交。</p>
+        <p class="dim">有新的会挂红点。</p>`,
+  },
+  {
+    sel: '#btnTeams',
+    t: 'Teams / EC',
+    b: `<p>点开是 Teams 面板 —— 把各个团队频道里的消息汇总到一处，
+        可以搜索。</p>
+        <div class="tr-tip">${icon('i-check','sm')}
+          <span>如果你在设置里填过<b>「EC 名单里的名字」</b>，
+          每天出的 EC 名单会自动扫一遍，上面有你就会提醒。</span></div>`,
+  },
+  {
+    sel: '#btnSettings',
+    t: '设置',
+    b: `<p>外观（圆角 / 透明度 / 毛玻璃 / <b>六套配色</b> /
+        自定义底色和背景图 / 字体颜色）都在这里。</p>
+        <p><b>操作</b>区在最底下：立即刷新、数据与备份。</p>
+        <p class="dim">「窗口形态」也在设置里 —— 可以切小浮窗。</p>`,
+  },
+  {
+    sel: '#btnWinMin',
+    t: '收成小浮窗',
+    b: `<p>点它就缩成一个小方块，浮在桌面上。</p>
+        <p>小浮窗里只放最要紧的三样：<b>下一节课</b>、
+        几个关键数字、三个按钮（刷新 / 置顶 / 展开）。</p>
+        <p class="dim">还能拖边缘调大小；设置里可以开「固定在其他窗口上层」。</p>`,
+  },
+  {
+    sel: '',
+    t: '两个快捷键',
+    b: `<p><kbd>Esc</kbd> —— 关掉最上层的东西（面板 / 教程）；
+        都没开的时候，唤出<b>窗口菜单</b>（最小化 / 关闭 / 退出）。</p>
+        <p><kbd>←</kbd> <kbd>→</kbd> —— 切换五个页签。</p>
+        <p class="dim">双击顶栏空白处 = 最大化 / 还原。</p>`,
+  },
+  {
+    sel: '',
+    t: '好了',
+    b: `<p>就这些。</p>
+        <p class="dim">以后想再看一遍：设置面板最底下有个
+        <b>「看一遍使用教程」</b>。</p>`,
+  },
+];
+
+let trIdx = 0;
+
+function trEl(id){ return document.getElementById(id); }
+
+/*  把某一页摆出来：圈目标 + 放卡片 + 填文字 */
+function trShow(i){
+  const host = trEl('tour');
+  if(!host) return;
+  const steps = TOUR_STEPS;
+  trIdx = Math.max(0, Math.min(steps.length - 1, i));
+  const st = steps[trIdx];
+
+  trEl('trStep').textContent = (trIdx + 1) + ' / ' + steps.length;
+  trEl('trTitle').textContent = st.t;
+  /*  正文里嵌了 icon() 生成的 SVG ——
+      它是我们自己的模板，不是用户输入，直接 innerHTML 是安全的。 */
+  trEl('trBody').innerHTML = st.b;
+
+  trEl('trPrev').disabled = (trIdx === 0);
+  trEl('trNext').textContent =
+    (trIdx === steps.length - 1) ? '开始使用' : '下一步';
+
+  /*  ── 定位 ── */
+  const spot = trEl('trSpot');
+  const card = trEl('trCard');
+  let box = null;
+
+  if(st.sel){
+    const t = document.querySelector(st.sel);
+    if(t){
+      /*  ★ getBoundingClientRect 给的是**视口坐标**，
+          而 #tour 是 fixed 定位 —— 两者的参照系一致，
+          所以直接用，不用加 scrollTop。 */
+      const r = t.getBoundingClientRect();
+      if(r.width > 1 && r.height > 1){
+        box = {x: r.left, y: r.top, w: r.width, h: r.height};
+      }
+    }
+  }
+
+  if(box){
+    const PAD = 6;                       // 圈稍微比元素大一点，好看
+    host.classList.add('has-spot');
+    spot.style.display = 'block';
+    spot.style.left = (box.x - PAD) + 'px';
+    spot.style.top = (box.y - PAD) + 'px';
+    spot.style.width = (box.w + PAD * 2) + 'px';
+    spot.style.height = (box.h + PAD * 2) + 'px';
+  }else{
+    /*  ★ 没圈元素时不能靠 .tr-spot 的阴影来压暗屏幕：
+          它的阴影是从元素矩形往外扩 9999px，
+          元素被塞到角落的话只盖住一块，屏幕还是亮的。
+          所以改用 .tr-mask（满屏半透明），.tr-spot 收掉。 */
+    host.classList.remove('has-spot');
+    spot.style.display = 'none';
+  }
+
+  /*  ── 卡片位置 ──
+      规则：目标在上半屏 → 卡放下面；反之放上面。
+      没目标 → 居中。
+      左右尽量贴着目标那一侧，但保证不出界。 */
+  const CW = Math.min(330, window.innerWidth - 24);
+  const CH = card.offsetHeight || 220;
+  const M = 12;
+  let cx, cy;
+
+  if(box){
+    const midY = box.y + box.h / 2;
+    if(midY < window.innerHeight / 2){
+      cy = box.y + box.h + M;                      // 卡放下面
+    }else{
+      cy = box.y - CH - M;                         // 卡放上面
+    }
+    cx = Math.min(Math.max(M, box.x), window.innerWidth - CW - M);
+    /*  上下都放不下 → 放右侧那半边 */
+    if(cy < M || cy + CH > window.innerHeight - M){
+      cy = Math.max(M, Math.min(window.innerHeight - CH - M,
+                                window.innerHeight / 2 - CH / 2));
+      cx = (box.x + box.w / 2 < window.innerWidth / 2)
+        ? Math.min(window.innerWidth - CW - M, box.x + box.w + M)
+        : Math.max(M, box.x - CW - M);
+    }
+  }else{
+    cy = window.innerHeight / 2 - CH / 2;
+    cx = window.innerWidth / 2 - CW / 2;
+  }
+  card.style.left = Math.round(cx) + 'px';
+  card.style.top = Math.round(Math.max(M, cy)) + 'px';
+}
+
+function openTour(fromStart){
+  const host = trEl('tour');
+  if(!host) return;
+  /*  ★ 教程开着的时候先把其它浮层关掉 ——
+      叠在一起会互相盖住，用户不知道在看哪个。 */
+  try{
+    closeWinMenu();
+    closeSettings();
+    closeDigest();
+    closeData();
+    closeTeams();
+    closeCustomPanel();
+  }catch(e){}
+  host.classList.add('open');
+  document.body.classList.add('touring');
+  trShow(fromStart ? 0 : trIdx);
+}
+
+function closeTour(markDone){
+  const host = trEl('tour');
+  if(host) host.classList.remove('open');
+  document.body.classList.remove('touring');
+  if(markDone) tourMarkDone();
+}
+
+/*  ── 记下「看过了」──
+    ★ 两边都记：
+        · localStorage —— 快，下次启动立刻能读到
+        · 后端 window.json —— 稳，用户清了 WebView2 缓存也还在
+      弹之前两边都问一遍，只要有一边记得就不再弹。 */
+function tourMarkDone(){
+  try{ localStorage.setItem(TOUR_KEY, '1'); }catch(e){}
+  const a = window.pywebview && window.pywebview.api;
+  if(a && typeof a.tour_done === 'function'){
+    try{ a.tour_done(); }catch(e){}
+  }
+}
+
+/*  当前是不是「已经看过了」。先同步给一个初值（localStorage），
+    再由 maybeAutoTour() 异步向后端确认一次。
+
+    ★ 为什么不能只靠 localStorage：
+      之前 pywebview 是隐私模式，localStorage **每次启动都是空的**，
+      于是「看过了」根本记不住、教程每次启动都弹。
+      现在虽然开了持久化（见 widget.py 的 webview.start），
+      但多一个服务端副本更保险。 */
+function tourSeen(){
+  try{ return !!localStorage.getItem(TOUR_KEY); }catch(e){ return false; }
+}
+
+function bindTour(){
+  if(bindTour._done) return;
+  bindTour._done = true;
+
+  trEl('trNext')?.addEventListener('click', ()=>{
+    if(trIdx >= TOUR_STEPS.length - 1){ closeTour(true); return; }
+    trShow(trIdx + 1);
+  });
+  trEl('trPrev')?.addEventListener('click', ()=> trShow(trIdx - 1));
+  trEl('trSkip')?.addEventListener('click', ()=> closeTour(true));
+  trEl('trClose')?.addEventListener('click', ()=> closeTour(true));
+
+  /*  点遮罩空白处也能退（跟其它浮层的行为一致） */
+  trEl('tour')?.addEventListener('click', e=>{
+    if(e.target === trEl('tour') || e.target === trEl('trMask')){
+      closeTour(true);
+    }
+  });
+
+  /*  窗口尺寸变了要重新摆（不然圈会错位） */
+  window.addEventListener('resize', ()=>{
+    if(trEl('tour')?.classList.contains('open')) trShow(trIdx);
+  }, {passive:true});
+}
+
+/*  ── 首次自动弹 ──
+    ★ 时机：**引导页关了之后**才弹。
+      两个浮层叠一起会互相盖住，用户也不知道先看哪个。
+      所以这里轮询等「引导页不在 / 已经填过账号」。
+
+    ★ 判「要不要弹」要问两边（localStorage + 后端），
+      只要有一边记得看过，就安静地不弹。 */
+function maybeAutoTour(){
+  if(tourSeen()) return;
+
+  let tries = 0;
+  const tick = ()=>{
+    tries++;
+    const su = document.getElementById('setup');
+    const suOpen = !!(su && su.classList.contains('open'));
+    /*  引导页还开着 → 等；等超过 60 秒也放弃（用户可能在慢慢填）*/
+    if(suOpen && tries < 120){ setTimeout(tick, 500); return; }
+    if(suOpen) return;
+
+    /*  向后端确认一次「到底看过没有」。
+        ★ 这里是异步的，所以「等」不能写在外层 ——
+          不然用户没配 pywebview 时永远等不到。 */
+    const a = window.pywebview && window.pywebview.api;
+    if(a && typeof a.tour_status === 'function'){
+      try{
+        a.tour_status().then(r=>{
+          if(r && r.done){
+            /*  后端说看过 → 同步回 localStorage（省得下次再问），
+                但不弹。 */
+            try{ localStorage.setItem(TOUR_KEY, '1'); }catch(e){}
+            return;
+          }
+          openTour(true);
+        }).catch(()=> openTour(true));
+        return;
+      }catch(e){}
+    }
+    openTour(true);
+  };
+  setTimeout(tick, 1200);
+}
+
+/*  ── 设置里的「看一遍教程」按钮 ── */
+function bindTourEntry(){
+  const b = document.getElementById('opTour');
+  if(b && !b.dataset.bound){
+    b.dataset.bound = '1';
+    b.addEventListener('click', ()=> openTour(true));
+  }
+}
+
+
+/* ══════════ 使用教程：启动 ══════════ */
+bindTour();
+(function tourBoot(){
+  /*  和别的设置面板入口一样：等 DOM 解析完再接按钮
+      （app.js 在 index.html 里位于面板之前）。 */
+  const go = ()=>{
+    bindTourEntry();
+  };
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', go);
+  }else{
+    setTimeout(go, 0);
+  }
+  setTimeout(go, 800);
+})();
+maybeAutoTour();
+
+
+/* ══════════════ EC 名单关注 ══════════════
+   用户原话：
+     「可否直接在输入帐密的注册环节索要可能出现在 ec 里面的名字，
+      每回出名单自动扫描，有的话发通知」
+
+   ★ 为什么在注册时问：
+     EC 名单是每天出的 PDF，上面写的是**学校系统里的名字**。
+     用户自己知道那个名字长什么样（可能是拼音、可能带中间名），
+     但程序猜不到 —— 与其事后让他去设置里配，不如注册时顺手问一句。
+
+   ★ 名字可以填好几个：
+     中文名、拼音全拼、姓在前 / 名在前的写法……
+     任何一个命中就算命中。分隔符随便用（逗号、空格、换行、斜杠）。
+   ══════════════════════════════════════════════════════════════════ */
+
+function apiEcStatus(){
+  if(window.pywebview?.api?.ec_watch_status)
+    return window.pywebview.api.ec_watch_status();
+  return Promise.resolve({ok:false});
+}
+function apiEcSave(names, notify){
+  if(window.pywebview?.api?.ec_watch_save)
+    return window.pywebview.api.ec_watch_save(names, !!notify);
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+function apiEcScan(){
+  if(window.pywebview?.api?.ec_watch_scan)
+    return window.pywebview.api.ec_watch_scan();
+  return Promise.resolve({ok:false, error:'当前模式不支持'});
+}
+
+let EC_ON = false;          // 有没有配过名字
+let EC_ALERT = false;       // 最近一次扫描命中了吗
+
+/*  ── 顶栏那个红点 ──
+      挂在 Teams 键上。为什么是它：EC 名单是从 Teams 里下载的 PDF，
+      和那个面板是同一件事，用户看到红点第一反应就是点进去。
+      写法沿用晚报那个 .digdot：静态节点 + 切 .on 类，
+      不去增删 DOM（增删会让每次轮询都触发一次重排）。 */
+function ecDrawDot(){
+  const d = document.getElementById('ecdot');
+  const b = document.getElementById('btnTeams');
+  if(!d || !b) return;
+  d.classList.toggle('on', EC_ALERT);
+  if(EC_ALERT){
+    b.title = 'EC 名单上有你';
+    b.classList.add('dig');
+  }else{
+    b.title = 'Teams / EC';
+    b.classList.remove('dig');
+  }
+}
+
+/*  ── 设置面板里把当前状态显示出来 ── */
+function ecRenderSet(st){
+  const note = document.getElementById('setEcNote');
+  const val = document.getElementById('setValEc');
+  if(!note) return;
+  if(!st || !st.ok){
+    note.textContent = '';
+    if(val) val.textContent = '';
+    return;
+  }
+  if(val){
+    val.textContent = st.n_names
+      ? (st.n_names + ' 个名字')
+      : '还没填';
+  }
+  /*  最近一次扫描的结果 —— 说清「扫了几份」「什么时候扫的」，
+      免得用户以为是没生效。
+      ★ st.last 是**一个对象**（{ok,names,scanned,hit,found,at}），
+        不是字符串 —— 别拿它去 String()，那会显示成 [object Object]。
+        真正要显示的是 st.at 和 st.scanned。 */
+  const when = st.at ? String(st.at).replace('T', ' ').slice(0, 16) : '';
+  const n = st.scanned || 0;
+  if(st.found && st.found.length){
+    note.innerHTML = icon('i-check','sm inl') + ' 在名单上找到：<b>'
+      + st.found.map(esc).join('、') + '</b>'
+      + (when ? '<span class="dim">（' + esc(when) + '）</span>' : '');
+    note.className = 'ec-note hit';
+  }else if(n){
+    note.innerHTML = '最近检查了 ' + n + ' 份名单 PDF，没有你'
+      + (when ? '<span class="dim">（' + esc(when) + '）</span>' : '');
+    note.className = 'ec-note';
+  }else{
+    note.innerHTML = st.n_names
+      ? '还没扫到名单 PDF。出名单后会自动检查。'
+      : '填上名字后，每天出的名单 PDF 会自动扫一遍。';
+    note.className = 'ec-note';
+  }
+}
+
+/*  ══════════ EC 命中片段（0.5.2）══════════
+
+    以前命中只给「有你 / 没你」，用户还得自己打开 PDF、Ctrl+F 找。
+    这里把命中处附近的原文摆出来，顺便把里面认得出的
+    时间 / 地点 / 组别标成小标签。
+
+    ★ 三条原则，写在代码里免得以后被“优化”掉：
+      ① 只**照抄原文**，不补全、不推测。名单没写地点就没地点栏。
+      ② 片段可能截在句子中间，所以标明「…」并且不修饰。
+      ③ 下面那句提醒（未匹配不代表不在名单中）**必须留着** ——
+        文字匹配不是名单核验，用户要自己核对原名单。
+ */
+function sigChips(sig){
+  if(!sig) return '';
+  const out = [];
+  (sig.times || []).forEach(t=> out.push(`<span class="ecsig t">${esc(t)}</span>`));
+  (sig.places || []).forEach(t=> out.push(`<span class="ecsig p">${esc(t)}</span>`));
+  (sig.groups || []).forEach(t=> out.push(`<span class="ecsig g">${esc(t)}</span>`));
+  return out.join('');
+}
+
+function ecRenderDetails(st){
+  const box = document.getElementById('ecDetails');
+  if(!box) return;
+  const ds = (st && st.details) || [];
+  if(!ds.length){
+    if(box.innerHTML) box.innerHTML = '';
+    box.hidden = true;
+    return;
+  }
+  const h = ds.map(d=>{
+    const chips = sigChips(d.signals);
+    /*  来源写清楚是「哪份 PDF」—— 名单在附件里，不在消息正文里，
+        所以显示文件名比显示消息标题有用得多。 */
+    const src = [d.file, d.where, d.at].filter(Boolean).join(' · ');
+    return `<div class="ecdet">
+      <div class="ecdet-h">
+        <b>${esc(d.name || '')}</b>
+        ${src?`<span class="ecdet-s" title="取自这条路名单 PDF 的文字">${esc(src)}</span>`:''}
+      </div>
+      ${chips?`<div class="ecdet-c">${chips}</div>`:''}
+      <div class="ecdet-t">…${esc(d.text || '')}…</div>
+    </div>`;
+  }).join('');
+  const note = esc((st && st.note) ||
+    '按文字匹配。未匹配不代表不在名单中。以学校原名单为准。');
+  const src2 = `<div class="ecdet-n">${icon('i-file','sm inl')}`
+    + `名单来自附件里的 PDF，不是消息正文。下面是 PDF 里命中处的原文。`
+    + `</div>`;
+  const nh = `${h}<div class="ecdet-n">${icon('i-alert','sm inl')}${note}</div>` + src2;
+  /*  每秒轮询会走到这 —— 先比对再写，别白重排一遍 */
+  if(box.innerHTML !== nh) box.innerHTML = nh;
+  box.hidden = false;
+}
+
+async function ecRefresh(){
+  try{
+    const st = await apiEcStatus();
+    EC_ON = !!(st && st.n_names);
+    EC_ALERT = !!(st && st.alert);
+    ecDrawDot();
+    ecRenderSet(st);
+    ecRenderDetails(st);
+    /*  Teams 面板里的 EC 状态行（0.5.1：EC 并入 Teams 板块）。
+        一秒一轮的轮询也会走到这 —— 先比对再写，别触发重排。 */
+    const tm = document.getElementById('tmEc');
+    if(tm){
+      let h, cls;
+      if(st && st.ok && st.found && st.found.length){
+        h = icon('i-check','sm inl') + ' EC 名单上有你：<b>'
+          + st.found.map(esc).join('、') + '</b>'
+          + '<span class="dim"> — 点看 PDF 原文片段</span>';
+        cls = 'tm-ec hit';
+      }else if(st && st.ok && st.n_names){
+        h = 'EC 关注 ' + st.n_names + ' 个名字'
+          + (st.scanned ? '，最近扫了 ' + st.scanned + ' 份名单 PDF，没你'
+                        : '，还没扫到名单 PDF');
+        cls = 'tm-ec';
+      }else{
+        h = '还没设置 EC 关注名字 —— 点这行去设置';
+        cls = 'tm-ec';
+      }
+      if(tm.innerHTML !== h) tm.innerHTML = h;
+      if(tm.className !== cls) tm.className = cls;
+    }
+    /*  设置里那个输入框：只在用户还没动过的时候回填，
+        免得把正在编辑的内容冲掉。 */
+    const inp = document.getElementById('setEcNames');
+    if(inp && !inp.dataset.dirty && st && st.names){
+      inp.value = (st.names || []).join('、');
+    }
+  }catch(e){}
+}
+
+function bindEcEntry(){
+  /*  Teams 面板里那行 EC 状态：整行可点 → 打开设置面板改名字 */
+  const tm = document.getElementById('tmEc');
+  if(tm && !tm.dataset.bound){
+    tm.dataset.bound = '1';
+    tm.addEventListener('click', ()=> openSettings());
+  }
+  const inp = document.getElementById('setEcNames');
+  if(inp && !inp.dataset.bound){
+    inp.dataset.bound = '1';
+    inp.addEventListener('input', ()=>{ inp.dataset.dirty = '1'; });
+  }
+  const sv = document.getElementById('setEcSave');
+  if(sv && !sv.dataset.bound){
+    sv.dataset.bound = '1';
+    sv.addEventListener('click', async ()=>{
+      const raw = (inp && inp.value) || '';
+      const old = sv.textContent;
+      sv.disabled = true;
+      sv.textContent = '保存中…';
+      try{
+        const r = await apiEcSave(raw, true);
+        if(r && r.ok){
+          if(inp) delete inp.dataset.dirty;
+          sv.textContent = '已保存';
+          setTimeout(()=>{ sv.textContent = old; sv.disabled = false; }, 1200);
+          ecRefresh();
+          return;
+        }
+        /*  出错也要把原因说出来 —— 光变回原样用户会以为没点上 */
+        const n = document.getElementById('setEcNote');
+        if(n){
+          n.textContent = (r && r.error) || '保存失败';
+          n.className = 'ec-note bad';
+        }
+      }catch(e){}
+      sv.textContent = old;
+      sv.disabled = false;
+    });
+  }
+  const sc = document.getElementById('setEcScan');
+  if(sc && !sc.dataset.bound){
+    sc.dataset.bound = '1';
+    sc.addEventListener('click', async ()=>{
+      const old = sc.textContent;
+      sc.disabled = true;
+      sc.textContent = '检查中…';
+      const n = document.getElementById('setEcNote');
+      try{
+        const r = await apiEcScan();
+        if(r && r.ok){
+          if(r.found && r.found.length){
+            if(n){
+              n.innerHTML = icon('i-check','sm inl') + ' 找到：<b>'
+                + r.found.map(esc).join('、') + '</b>';
+              n.className = 'ec-note hit';
+            }
+          }else if(n){
+            n.textContent = r.scanned
+              ? ('扫了 ' + r.scanned + ' 份名单，没有你')
+              : '本机还没有 EC 名单。先在 Teams 面板里抓一次。';
+            n.className = 'ec-note';
+          }
+        }else if(n){
+          n.textContent = (r && r.error) || '检查失败';
+          n.className = 'ec-note bad';
+        }
+      }catch(e){}
+      sc.textContent = old;
+      sc.disabled = false;
+      ecRefresh();
+    });
+  }
+}
+
+/*  ── 低频轮询 ──
+      为什么低频：名单一天出一份，没必要勤查。
+      而且这个只读本地文件，几乎不耗资源。 */
+let ecTimer = null;
+function startEcTick(){
+  ecRefresh();
+  if(ecTimer) return;
+  ecTimer = setInterval(ecRefresh, 5 * 60 * 1000);
+}
+
+
+/* ══════════ EC：启动 ══════════ */
+(function ecBoot(){
+  const go = ()=>{
+    bindEcEntry();
+    startEcTick();
+  };
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', go);
+  }else{
+    setTimeout(go, 0);
+  }
+  setTimeout(go, 900);
+})();
+
+/* ══════════════ 液态玻璃 v2（静态玻璃 + 缓慢流光）══════════════
+   v0.5.0 改版，两个原因：
+
+     · 用户要求「删除鼠标高光随动」—— 跟鼠标的那套已经拆掉
+     · 用户要求「试着重置液态玻璃……粒子、折射、流动、高光，
+       但不要太夸张」
+
+   现在的玻璃质感是**四层静态叠加**（CSS 里写的）：
+       ① 斜向偏色   ← 折射感
+       ② 顶部棱边反光 ← 高光
+       ③ 磨砂颗粒   ← 粒子
+       ④ 缓慢流光   ← 流动（就是这里插的这个元素）
+
+   ★ 为什么流光单独用一个子元素，而不是第三个伪元素
+     伪元素只有两个（::before / ::after），已经用完了：
+       ::before 画「偏色 + 颗粒」，::after 画「棱边反光」。
+     而且流光要做 `transform` 位移动画，和上面那些
+     `background` 抢同一层会打架。
+
+   ★ 为什么只给卡片不给按钮
+     按钮最小才 28×26。一条 102 度的斜光带在这么小的框里
+     会被裁成一条生硬的斜线，看起来像划痕，不像光。
+     所以按钮只保留偏色 + 棱边反光。
+
+   ★ 为什么不做真折射
+     真折射要用 SVG displacement map（WebView2 支持不稳）
+     或者 WebGL（包体、耗电都不划算）。
+     用户也说了「不要太夸张」，所以走视觉等效。
+    ────────────────────────────────────────────────────────── */
+
+/*  ── 贴 `.lq` 类 ──
+   ★★ 这一步不能漏（真踩过）：
+      CSS 里所有玻璃效果都挂在 `.lq` 这个类上。
+      上一版是 `lqDecorate()` 负责贴类，删「鼠标随动」时
+      把它一起删了 → `.lq` 永远不出现 →
+      `--lqA` 是空的、`::before` 的 background 是 none，
+      看起来「玻璃整个失效了」。
+      → 贴类和「跟鼠标」是两件事，前者必须留下。
+
+   ★★ 为什么**不能**给浮层面板贴这个类（这里真出过事故）
+      `.lq` 规则里有 `position:relative`（玻璃层要相对它定位）。
+      而 `.digwrap` / `.clwrap` 这些浮层面板自己写的是
+      `position:absolute` + `top/bottom` 撑满屏幕。
+
+      两条规则**特异度相同**（都是一个类），
+      而 `.lq` 在文件里排在后面 → **它赢** →
+      面板变成 `position:relative`。
+
+      症状（实测）：`top/bottom` 从「撑满」变成「相对偏移」，
+      高度于是塌成内容高度 —— 晚报面板在小浮窗里量出
+      `502x1711`，而视口只有 `518x276`。
+      用户看到的就是「晚报显示不完整」。
+
+      → 所以**浮层面板一律不贴**。它们本来就有自己的玻璃底
+        （`--glass-3` + `backdrop-filter`），不需要这一套。 */
+const LQ_SEL = [
+  '.card', '.grow', '.tm-item', '.stat',
+].join(',');
+
+/*  流动层也给同一批元素（面板不在内，理由同上） */
+const LQ_FLOW_SEL = LQ_SEL;
+
+function lqMark(root){
+  const scope = root || document.body;
+  if(!scope || !scope.querySelectorAll) return;
+  let list;
+  try{
+    list = scope.querySelectorAll(LQ_SEL);
+  }catch(e){ return; }
+  list.forEach(el=>{
+    if(!el.classList.contains('lq')) el.classList.add('lq');
+  });
+}
+
+/*  ── 给指定范围里的卡片补上流动层 ──
+    ★ 先查 `:not(:has(.lq-eff))` ——
+      没有新元素时 querySelectorAll 直接返回空，很便宜。
+      （`:has()` 在 WebView2/Chromium 105+ 都有，
+        这个项目用的 WebView2 是 153，没问题。） */
+function lqFlow(root){
+  if(!document.body) return;
+  const scope = root || document.body;
+
+  /*  ① 先保证类贴上了（s 写在前面，别调换顺序） */
+  lqMark(scope);
+
+  /*  ② 再补流动层 */
+  let list;
+  try{
+    list = scope.querySelectorAll(LQ_FLOW_SEL);
+  }catch(e){ return; }
+
+  list.forEach(el=>{
+    /*  已经有过就跳过 —— 幂等，重复调用不会插两个 */
+    if(el.querySelector(':scope > .lq-eff')) return;
+    const eff = document.createElement('i');
+    eff.className = 'lq-eff';
+    eff.setAttribute('aria-hidden', 'true');
+    el.appendChild(eff);
+  });
+
+  /*  ③ 挂随动监听（幂等） */
+  lqBindMove(scope);
+}
+
+/*  ── 鼠标随动（按窗口大小调强度）──
+   ★★ 读数 / 写值分离：
+      pointermove 一秒能上百次。如果每次都「读 getBoundingClientRect
+      → 写 style」，浏览器每帧都得先算完样式才能给出准确尺寸 ——
+      每帧一次强制同步重排。
+      所以移动时只**记坐标**，真正的写放到 rAF 里，一帧一次。
+
+   ★ 只给面积大的元素挂（卡片 / 统计块）。
+     按钮不挂：28x26 的框里那点光斑几乎看不见，
+     白付一份监听开销。
+
+   ★ 反光**强度**不在这里算 ——
+     它随窗口宽度变化，用 CSS 的 @media + calc() 写在 app.css 里，
+     比 JS 监听 resize 更准也更省（浏览器自己重算，不用我们介入）。 */
+const LQ_MOVE_SEL = ['.card', '.grow', '.tm-item', '.stat'].join(',');
+
+let _lqEl = null, _lqX = 0, _lqY = 0, _lqQueued = false;
+
+/*  移动：只记坐标，写值交给 rAF */
+function lqMove(e){
+  const el = e.currentTarget;
+  _lqEl = el;
+  _lqX = e.clientX;
+  _lqY = e.clientY;
+  if(_lqQueued) return;
+  _lqQueued = true;
+  requestAnimationFrame(lqFlush);
+}
+
+function lqFlush(){
+  _lqQueued = false;
+  const el = _lqEl;
+  if(!el) return;
+  try{
+    const r = el.getBoundingClientRect();
+    if(!r.width || !r.height) return;
+    /*  写成百分比 —— 窗口大小变了也不用重算 */
+    const x = ((_lqX - r.left) / r.width * 100).toFixed(1) + '%';
+    const y = ((_lqY - r.top) / r.height * 100).toFixed(1) + '%';
+    el.style.setProperty('--mx', x);
+    el.style.setProperty('--my', y);
+  }catch(err){}
+}
+
+/*  离开：把内联变量**删掉** ——
+    删掉后 CSS 里 `.lq` 上的默认值（26% / -8%）接管。
+    ★ 因为 --mx 注册过 @property，这个「回到默认位置」
+      也走 transition，是**滑**回去的，不是跳回去。 */
+function lqLeave(e){
+  const el = e.currentTarget;
+  if(el === _lqEl) _lqEl = null;
+  el.style.removeProperty('--mx');
+  el.style.removeProperty('--my');
+}
+
+/*  给元素挂监听（幂等） */
+function lqBindMove(root){
+  const scope = root || document.body;
+  if(!scope || !scope.querySelectorAll) return;
+  let list;
+  try{
+    list = scope.querySelectorAll(LQ_MOVE_SEL);
+  }catch(e){ return; }
+  list.forEach(el=>{
+    if(el.dataset.lqMove) return;
+    el.dataset.lqMove = '1';
+    el.addEventListener('pointermove', lqMove, {passive:true});
+    el.addEventListener('pointerleave', lqLeave, {passive:true});
+  });
+}
+
+/*  ── 缩放期间停掉流动 ──
+   `html.resizing` 这个类在窗口尺寸变化时会被挂上（见 app.js 后面
+   「最大化流畅性」那一段）。这里用 CSS 的动画播放控制来处理，
+   不碰 DOM —— 改 style 会让浏览器重算样式，缩放期间正好最怕这个。
+   所以真正生效的是 CSS 里的一条规则，这里只负责在
+   缩放开始时给流动层打个标记（其实是 CSS 自己判断的，见 app.css：
+     html.resizing .lq-eff{animation-play-state:paused}
+   ）
+   → 这个函数因此**什么都不用做**，留着是为了说明设计意图，
+     免得后来的人以为是漏了。 */
+/* ══════════ 液态玻璃 v2：启动 ══════════
+   首屏先补一遍；之后每次 render() 完成后由 render 尾部再补一遍
+   （新任务卡是那时长出来的）。不做 MutationObserver：
+   那个太吵，实测在资料页那种一次插几十个节点的地方不划算。 */
+(function lqFlowBoot(){
+  const go = ()=>{ try{ lqFlow(document.body); }catch(e){} };
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', go);
+  }else{
+    setTimeout(go, 0);
+  }
+  /*  双保险：数据回来得晚（首屏要等 get_data），
+      那之后再补一次。 */
+  setTimeout(go, 900);
+  setTimeout(go, 2600);
+})();
+
+
+/* ══════════════ 今日新获得（成绩 / 作业）══════════════
+   用户要求：「新增今日新获得成绩作业项目，紧随代办作业之后」。
+
+   ★ 数据从哪来
+     `DATA.today_new` —— 后端 `app/today_new.py` 维护的
+     **按天累积台账**，不是「跟上一轮比」。
+
+     为什么不跟上一轮比：快照每次抓取都被覆盖，
+     中午新出的一条作业到晚上再抓一次就比不出来了。
+     详见 app/today_new.py 的模块说明。
+
+   ★ 为什么复用 taskCards()
+     视觉上和「全部待办」完全一致，用户不用学新东西。
+     连分数都已经由 taskCards 自己渲染成 `.tag.grade` 了
+     （形如「A 100 / 100 pts」），所以这里不用再加徽章。
+
+   ★ 为什么空时不渲染
+     大部分时候都是空的。空区块会让界面天天挂一块
+     「今日无新增」的废话，那正是最烦人的设计。
+     所以没有就什么都不画，连 section 都不建。
+   ────────────────────────────────────────────────────── */
+function todayNewBlock(){
+  const tn = (DATA || {}).today_new;
+  if(!tn) return '';
+  const grades = tn.grades || [];
+  const tasks  = tn.tasks  || [];
+  if(!grades.length && !tasks.length) return '';
+
+  let inner = '';
+  if(grades.length){
+    inner += `<div class="tn-group">
+      <div class="tn-h"><span class="tn-tag">新成绩</span>
+        <span class="tn-n">${grades.length}</span></div>
+      ${taskCards(grades, {showMark:false})}
+    </div>`;
+  }
+  if(tasks.length){
+    inner += `<div class="tn-group">
+      <div class="tn-h"><span class="tn-tag task">新作业</span>
+        <span class="tn-n">${tasks.length}</span></div>
+      ${taskCards(tasks, {showMark:false})}
+    </div>`;
+  }
+
+  const total = grades.length + tasks.length;
+  return section('todaynew',
+    `${icon('i-sparkle','sm inl')}今日新获得`,
+    `<span class="cnt">${total}</span>`,
+    inner);
+}
+
+/* ══════════════ 测试注入点（仅网页版）══════════════
+   ★ 为什么需要它
+
+     `DATA` / `lastSig` 这些是顶层 `let`，**不会**变成
+     `window.DATA` —— `let` 只活在脚本的词法作用域里。
+     所以自动化测试里写 `window.DATA = {...}` 是没用的，
+     真正的 DATA 还是 null，render() 第一行就返回了。
+
+     实测踩到过：测试报告「区块顺序 = []」「0/0 张卡」，
+     看着像界面坏了，其实是注入没生效。
+
+   ★ 为什么只在网页版挂
+     桌面版有 pywebview，数据从后端来。
+     这个钩子只在测试页（没有 pywebview）里才有用，
+     所以加个判断 —— 正式运行时它根本不会被创建，
+     也就不存在「被别的东西误用」的可能。
+
+   ★ 名字带 __ 前缀，不会被任何业务代码碰到。
+   ────────────────────────────────────────────────── */
+if(!window.pywebview){
+  window.__mbTest = {
+    /*  塞一份假数据，然后走真实的 render() ——
+        这样测的是真渲染路径，不是自己拼一份 HTML。 */
+    setData(d){
+      DATA = d;
+      lastSig = '';
+      lastEmptySig = '';
+      try{ render(); }catch(e){ return String(e); }
+      return null;
+    },
+    /*  只清签名，便于「同一份数据再渲一次」 */
+    resetSig(){ lastSig = ''; lastEmptySig = ''; },
+    getData(){ return DATA; }
+  };
+}

@@ -9,8 +9,9 @@ import threading
 import time
 from datetime import datetime
 
-from . import cdp, config, digest, httpclient, manual_done, store
-from .lock import scrape_lock
+from . import (cdp, config, digest, httpclient, manual_done,
+               store, today_new)
+from .lock import scrape_lock_ex
 from .models import Course, Schedule, Task
 from .scraper import Scraper, summarize_courses
 
@@ -22,8 +23,21 @@ log = logging.getLogger(__name__)
 FETCH_MODE = "http"
 
 _lock = threading.Lock()
+
+#  状态取值（0.5.2 从五个扩到七个）
+#    idle         还没抓过
+#    running      正在抓
+#    ok           正常，有数据
+#    empty        本次**成功**但确实没内容（任务与课程都是 0）
+#    partial      部分读到（少数课程没抓到，其余已更新）
+#    unread       本次**没读到**（限速 / 网络错 / 解析失败），显示的是上次数据
+#    need_login   需要重新登录
+#
+#  ★ 「本次没有内容」与「本次没读到」必须分开。
+#    前者是「数据是新的，就是没任务」，后者是「这次白跑了」。
+#    显示成同一句话，用户看到「没有待办」时不知道能不能信。
 _state: dict = {
-    "status": "idle",        # idle | running | ok | need_login | error
+    "status": "idle",
     "message": "",
     "updated": "",
     "tasks": [],
@@ -35,7 +49,25 @@ _state: dict = {
     "refreshing": False,
     "last_run_ts": 0.0,        # 上次抓取完成的时刻
     "next_run_ts": 0.0,        # 下次计划抓取的时刻
+    # ---- 双时间轴（0.5.2）----
+    #  「最近一次尝试」与「最近一次有内容」是两回事。
+    #  分开记，界面才能说清楚「什么时候试过、为什么没成、现在看的是什么时候的数据」。
+    "last_attempt_ts": 0.0,    # 最近一次尝试（不论成败）
+    "last_attempt_ok": True,
+    "last_attempt_error": "",
+    # ---- 覆盖范围（0.5.2）----
+    "coverage": {},
 }
+
+
+def _fmt_ts(ts: float) -> str:
+    """时间戳 → 'YYYY-MM-DD HH:MM:SS'（给界面用，空值给空串）。"""
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
 
 
 def snapshot() -> dict:
@@ -75,15 +107,38 @@ def snapshot() -> dict:
             "refreshing": _state["refreshing"],
             "login_error": _state.get("login_error", ""),
             "server_time": datetime.now().isoformat(timespec="seconds"),
+            #  今日新增（成绩 / 作业）—— 界面紧随「全部待办」之后用
+            "today_new": _today_new_safe(),
             #  给首次运行引导页用：学校网址（默认值）
             #   前端用它预填输入框，用户大多不用改
             "host": _host_of(config.BASE_URL),
+            # ── 双时间轴 + 覆盖范围（0.5.2）──
+            "last_attempt_at": _fmt_ts(_state["last_attempt_ts"]),
+            "last_attempt_ok": bool(_state["last_attempt_ok"]),
+            "last_attempt_error": _state["last_attempt_error"],
+            "coverage": dict(_state["coverage"]),
         }
 
 
 def _set(**kw) -> None:
     with _lock:
         _state.update(kw)
+
+
+def _today_new_safe() -> dict:
+    """读今日新增台账，失败时返回空结构。
+
+    ★ 不能让它拖垮 snapshot() ——
+      snapshot 每秒被前端调一次，这里出异常就是整个界面白屏。
+    """
+    empty = {"ok": True, "date": "", "grades": [], "tasks": [],
+             "n_grades": 0, "n_tasks": 0}
+    try:
+        from . import today_new
+        return today_new.current()
+    except Exception as e:
+        log.debug("读今日新增失败：%s", e)
+        return empty
 
 
 def _host_of(url: str) -> str:
@@ -206,20 +261,178 @@ def load_from_cache() -> bool:
 
 # ---------------------------------------------------------------- 抓取
 
+def refresh_courses_only(
+    names: list[str] | None = None,
+    workers: int = 3,
+) -> dict:
+    """按需强制重抓指定课程的成绩（None = 全部课程）。
+
+    【为什么需要】
+      搜索是「我现在要确认这条作业到底多少分」的动作。老师登分之后还会改分，
+      拿缓存回答就可能给出一个已经被改掉的旧分数。所以搜索前要把
+      相关课程**重新抓一遍**。
+
+      指定科目时只重抓那一门 —— 一门课约 2–3 秒，用户等得起；
+      重抓全部则是 10–15 秒，所以没指定科目时才这么做。
+
+    【为什么不另写一条取数路径】
+      `_fetch_courses_parallel` 里已经包含了重试、限速冷却、成绩册与任务
+      分开判断这些逻辑。搜索若自己再写一遍 HTTP 请求，两条路径迟早会漂移
+      —— 到时又是「搜索页的成绩跟成绩页对不上」这种没人能查的 bug。
+
+    【为什么重抓之后要重建 _state["tasks"]】
+      课程对象是被就地更新的，任务列表却是另一份数据。不重建的话，
+      界面上其他页签仍是旧分数，只有搜索结果新 —— 同一屏里两个数字打架。
+
+    返回：{"ok", "courses": [...], "changed": [...], "cooldown": 秒, "took_ms"}
+    """
+    with _lock:
+        courses = [c for c in _state["courses"] if isinstance(c, Course)]
+        if names:
+            want = {(n or "").strip().casefold()
+                    for n in names if (n or "").strip()}
+            targets = [c for c in courses
+                       if (c.name or "").strip().casefold() in want]
+        else:
+            targets = list(courses)
+        old_msg = _state.get("message", "")
+
+    if not targets:
+        try:
+            if load_from_cache():
+                with _lock:
+                    courses = [c for c in _state["courses"]
+                               if isinstance(c, Course)]
+                    if names:
+                        targets = [
+                            c for c in courses
+                            if (c.name or "").strip().casefold()
+                            in {(n or "").strip().casefold()
+                                for n in names if (n or "").strip()}
+                        ]
+                    else:
+                        targets = list(courses)
+                if targets:
+                    log.info("内存里没有课程数据，已从缓存载入 %d 门", len(targets))
+        except Exception as e:
+            log.debug("按需刷新前载入缓存失败：%s", e)
+
+    if not targets:
+        return {
+            "ok": False, "courses": [], "changed": [], "cooldown": 0,
+            "took_ms": 0,
+            "error": "没有匹配的课程可刷新（课程列表可能还没读到）",
+        }
+
+    t0 = time.time()
+    log.info("按需刷新成绩：%d 门课程（%s）", len(targets),
+             "、".join(c.name for c in targets[:4])
+             + ("…" if len(targets) > 4 else ""))
+
+    before = {}
+    for c in targets:
+        before[c.name] = {(t.title or ""): (t.score or "") for t in c.tasks}
+
+    try:
+        _fetch_courses_parallel(targets, workers=workers)
+    except Exception as e:
+        log.warning("按需刷新失败：%s", e)
+        with _lock:
+            _state["message"] = old_msg
+        return {
+            "ok": False, "courses": [], "changed": [], "cooldown": 0,
+            "took_ms": int((time.time() - t0) * 1000),
+            "error": str(e),
+        }
+
+    with _lock:
+        all_tasks = []
+        for c in _state["courses"]:
+            if not isinstance(c, Course):
+                continue
+            all_tasks.extend(c.tasks)
+        _state["tasks"] = all_tasks
+        _state["message"] = old_msg
+
+    apply_manual_marks()
+    save_cache_now()
+
+    changed = []
+    for c in targets:
+        old = before.get(c.name, {})
+        for t in c.tasks:
+            title = t.title or ""
+            new_score = t.score or ""
+            if old.get(title, "") == new_score:
+                continue
+            changed.append({"course": c.name, "title": title,
+                            "score": new_score})
+
+    took = int((time.time() - t0) * 1000)
+    cooldown = 0
+    try:
+        cooldown = int(httpclient.cooldown_remaining())
+    except Exception:
+        pass
+
+    log.info("按需刷新完成：%d 门课程，%d 条分数有变化，%d 毫秒",
+             len(targets), len(changed), took)
+    return {
+        "ok": True, "courses": [c.name for c in targets],
+        "changed": changed[:40], "cooldown": cooldown,
+        "took_ms": took, "error": "",
+    }
+
+
+#  本进程当前是否正在刷新（用于区分「自己还在跑」和「另一个窗口在跑」）
+_refreshing = False
+
+
 def _run_refresh() -> None:
     """执行一次完整抓取。
 
     用文件锁保证同一时刻只有一个进程在驱动 Edge
     （桌面小组件与网页版看板可能同时开着）。
     抢不到锁时改为直接读缓存，避免两边互抢导致失败。
+
+    ★ 抢不到锁有两种性质完全不同的原因，必须分开说：
+        · 别的进程正在抓 → 正常竞争，读缓存是对的，界面可以说「另一窗口正在抓取」
+        · 锁文件本身开不了/写不了（权限、盘满、安全软件）→ **真故障**，
+          以前这里也按「另一窗口正在抓取」处理，并且把状态置成 ok，
+          于是界面显示一切正常、却永远停在旧数据上 —— 用户和日志都看不到问题。
     """
-    with scrape_lock(config.DATA_DIR / "scrape.lock") as got:
-        if not got:
+    global _refreshing
+    with scrape_lock_ex(config.DATA_DIR / "scrape.lock") as lk:
+        if not lk.acquired:
+            if lk.last_error:
+                log.warning("抓取锁不可用，本次没抓到数据：%s", lk.last_error)
+                load_from_cache()
+                _set(
+                    status="unread",
+                    message="本地锁文件不可用，本次没抓到数据，显示的是上次数据",
+                )
+                _set(
+                    last_attempt_ts=time.time(),
+                    last_attempt_ok=False,
+                    last_attempt_error=f"抓取锁不可用：{lk.last_error}",
+                )
+                return
+            if _refreshing:
+                #  ★ 是本进程自己的刷新还在跑，**不要动状态** ★
+                #    否则界面会以为这一轮已经结束（状态变 ok），
+                #    实际还在抓，进度就从「刷新中」跳回正常，看着像没反应。
+                log.info("本进程正在刷新，忽略这次重复请求")
+                return
             log.info("另一个进程正在抓取，本次改为读取缓存")
             load_from_cache()
             _set(status="ok", message="另一窗口正在抓取，已显示最近数据")
             return
-        _run_refresh_locked()
+
+        _refreshing = True
+        try:
+            _run_refresh_locked()
+        finally:
+            _refreshing = False
 
 
 def _retry(fn, label: str, tries: int = 3, default=None, delay: float = 1.2):
@@ -265,17 +478,39 @@ def _fetch_courses_parallel(courses: list[Course], workers: int = 3) -> list[Tas
     log.info("并行抓取 %d 门课程（%d 线程）……", len(courses), workers)
 
     def one(course: Course) -> list[Task]:
-        """抓一门课。失败重试一次（网络抖动时很常见）。
+        """抓一门课。失败重试（网络抖动时很常见）。
 
-         每次重试都用**全新**的 HttpSession —— 因为 scraper 会把结果
-          写进 course 对象，复用可能残留半截数据。
+         每次重试都用**全新**的 HttpSession 与全新 probe —— 因为 scraper 会把
+           结果写进 course 对象，复用可能残留半截数据。
+
+        ★★ 门槛修正（重要）★★
+          这里原来写的是：
+
+              sc.fetch_course_detail(probe)
+              if probe.tasks:                      # ← 必须拿到任务
+                  course.tasks = probe.tasks
+                  course.categories = probe.categories or course.categories
+                  if probe.overall_level: ...      # ← 分类与总评都在这道门内
+                  if probe.overall_percent is not None: ...
+
+          后果：**/units 成功、分类与总评都解出来了，只要任务页没抓到，
+          这些成绩就被整段丢掉。** 实测 ELA（class 11511734）就是这样：
+          它的 /units 能解出 Overall B 82.31%，但主页与 /core_tasks 双双
+          SSL 超时 → probe.tasks 为空 → 成绩被丢 → 界面上那门课一直没有
+          成绩，GPA 自然算不出来。而失败只往 report["notes"] 里写一行，
+          用户完全看不到。
+
+          「有没有任务」和「有没有成绩」是**两件独立的事**：
+          一门课可以抓不到任何任务，但成绩册读得到（反之亦然）。
+          所以改成分别判断：各自有数据就各自写回。
 
         注意：部分课程**本来就没有 core task**（例如 Politics、
         IDS Big History）—— 返回 0 属于正常，这里不打 WARNING，
         只记 DEBUG，避免日志里出现误导性的「失败」。
         """
         last: Exception | None = None
-        for attempt in (1, 2):
+        attempts = (1, 2, 3)
+        for attempt in attempts:
             # 已经进冷却了就别再开新会话 —— 只会继续 429
             if httpclient.cooldown_remaining() > 0:
                 log.debug("%s：限速冷却中，跳过", course.name)
@@ -284,21 +519,36 @@ def _fetch_courses_parallel(courses: list[Course], workers: int = 3) -> list[Tas
             try:
                 s.open()
                 if s.rate_limited:
-                    return []              # 冷却标记已置，交给上层收尾
+                    return []
                 sc = Scraper(s)
-                probe = Course(name=course.name, url=course.url,
-                               class_id=course.class_id)
+                probe = Course(
+                    name=course.name,
+                    url=course.url,
+                    class_id=course.class_id,
+                )
                 sc.fetch_course_detail(probe)
+                #  任务拿到了就并入；成绩册可能同时带回来，所以下面几项单独判
                 if probe.tasks:
                     course.tasks = probe.tasks
                     course.teacher = probe.teacher or course.teacher
-                    course.categories = probe.categories or course.categories
-                    if probe.overall_level:
-                        course.overall_level = probe.overall_level
-                    if probe.overall_percent is not None:
-                        course.overall_percent = probe.overall_percent
+                if probe.categories:
+                    course.categories = probe.categories
+                    if (probe.submitted_count or probe.late_count
+                            or probe.pending_count):
+                        course.submitted_count = probe.submitted_count
+                        course.late_count = probe.late_count
+                        course.pending_count = probe.pending_count
+                if probe.overall_level:
+                    course.overall_level = probe.overall_level
+                if probe.overall_percent is not None:
+                    course.overall_percent = probe.overall_percent
+                if probe.tasks:
                     return course.tasks
-                last = RuntimeError("返回 0 个任务")
+                #  ★ 没任务但成绩册有数据：不算失败，返回空表 ★
+                if probe.categories:
+                    log.debug("%s：没抓到任务，但拿到了成绩册", course.name)
+                    return []
+                last = RuntimeError("任务与成绩册都没拿到")
             except Exception as e:
                 last = e
             finally:
@@ -306,11 +556,12 @@ def _fetch_courses_parallel(courses: list[Course], workers: int = 3) -> list[Tas
                     s.close()
                 except Exception:
                     pass
-            if attempt == 1 and httpclient.cooldown_remaining() <= 0:
-                log.debug("%s 首次返回空，重试……", course.name)
-                time.sleep(1.5)
-
-        log.debug("%s 最终 0 个任务（该课可能本就没有 core task）", course.name)
+            if attempt < len(attempts) and httpclient.cooldown_remaining() <= 0:
+                log.debug("%s 第 %d 次没拿到数据（%s），重试……",
+                          course.name, attempt, last)
+                time.sleep(1.5 * attempt)
+        if last is not None:
+            log.debug("%s 最终没拿到数据：%s", course.name, last)
         return []
 
     tasks: list[Task] = []
@@ -454,8 +705,12 @@ def _run_refresh_locked() -> None:
     cd = httpclient.cooldown_remaining()
     if cd > 0:
         load_from_cache()
-        _set(status="ok",
-             message=f"站点限速冷却中（还剩 {int(cd)} 秒），显示上次数据")
+        #  ★ 这是「本次没读到」，不是「有新内容」——
+        #    归 unread（不是 ok），并且**不更新 updated**。
+        _set(status="unread",
+             message=f"站点限速中（还剩 {int(cd)} 秒），显示的是上次数据")
+        _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+             last_attempt_error=f"限速冷却中（{int(cd)} 秒）")
         _set(next_run_ts=time.time() + min(cd + 5, 300))
         return
 
@@ -481,8 +736,10 @@ def _run_refresh_locked() -> None:
                 # 被限速 —— 保留旧数据，等冷却结束再自动重试
                 load_from_cache()
                 cd = httpclient.cooldown_remaining()
-                _set(status="ok",
-                     message=f"站点限速冷却中（还剩 {int(cd)} 秒），显示上次数据")
+                _set(status="unread",
+                     message=f"站点限速中（还剩 {int(cd)} 秒），显示的是上次数据")
+                _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+                     last_attempt_error=f"限速冷却中（{int(cd)} 秒）")
                 _set(next_run_ts=time.time() + min(cd + 5, 300))
                 return
 
@@ -517,13 +774,16 @@ def _run_refresh_locked() -> None:
                     _set(message="已自动重新登录，正在读取课程列表……")
                     # 继续往下走（不 return）
                 else:
-                    _set(status="error",
-                         message="自动登录后仍然读取不到数据，请稍后重试")
+                    _set(status="need_login",
+                         message="自动登录后仍然读取不到数据，稍后会再试一次",
+                         login_error="自动登录后会话仍无效")
                     return
             else:
                 # 自动登录失败 → 给用户一个「点一下就能登」的入口
                 friendly = _friendly_login_msg(msg)
                 _set(status="need_login", message=friendly, login_error=msg)
+                _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+                     last_attempt_error=str(msg)[:200])
                 return
 
         if not logged:
@@ -531,20 +791,27 @@ def _run_refresh_locked() -> None:
 
         scraper = Scraper(session)
         _set(message="正在读取课程列表……")
-        courses = _retry(lambda: scraper.fetch_courses(), "课程列表", tries=3)
+        #  ★ _retry 在三次都失败时返回 None ★
+        #    以前下一行直接 len(courses) → TypeError: NoneType has no len()
+        #    （实测 2026-11-07 08:02 DNS 失败时崩过，整轮抓取直接抛异常）
+        courses = list(_retry(lambda: scraper.fetch_courses(),
+                              "课程列表", tries=3) or [])
         log.info("课程 %d 门", len(courses))
 
         if not courses:
             # 抓不到课程通常是页面还没加载完 / 登录态异常 —— 保留旧缓存
             load_from_cache()
-            _set(status="error",
-                 message="未读取到课程列表（可能是页面未加载完）。已保留上次数据，稍后会自动重试。")
+            _set(status="unread",
+                 message="本次没读到课程列表（可能是页面未加载完），显示的是上次数据。")
+            _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+                 last_attempt_error="课程列表为空")
             return
 
         all_tasks: list[Task] = []
         if FETCH_MODE == "http" and len(courses) > 1:
             # ---- 并行抓取（HTTP 模式）：9 门课同时抓，约 8 倍提速 ----
-            all_tasks = _fetch_courses_parallel(courses)
+            #  同样防一手：并行抓取若整段失败，这里必须拿到列表而不是 None
+            all_tasks = list(_fetch_courses_parallel(courses) or [])
         else:
             for i, c in enumerate(courses, 1):
                 _set(message=f"正在读取 {c.name[:28]}（{i}/{len(courses)}）……")
@@ -557,8 +824,10 @@ def _run_refresh_locked() -> None:
             if httpclient.cooldown_remaining() <= 0:
                 httpclient.set_cooldown(60, "抓取返回 0 任务")
             load_from_cache()
-            _set(status="ok",
-                 message="未读取到任务，已显示上次数据，稍后会自动重试。")
+            _set(status="unread",
+                 message="本次没读到任务，显示的是上次数据，稍后会自动重试。")
+            _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+                 last_attempt_error="任务列表为空")
             return
 
         #  完整性校验：若某门课这次 0 任务、但上轮有任务，说明是网络抖动
@@ -575,12 +844,17 @@ def _run_refresh_locked() -> None:
         #  限速导致的「大面积变空」→ 别浪费时间补抓，直接保留旧数据
         cd = httpclient.cooldown_remaining()
         if cd > 0 and len(suspect) * 2 > len(courses):
-            log.info("限速冷却中（还剩 %.0f 秒），放弃本轮，保留旧数据", cd)
+            log.info("限速冷却中，还剩 %.0f 秒，放弃本轮，保留旧数据", cd)
             load_from_cache()
-            _set(status="ok",
-                 message=f"站点限速冷却中（还剩 {int(cd)} 秒），显示上次数据")
+            _set(status="unread",
+                 message=f"站点限速中（还剩 {int(cd)} 秒），显示的是上次数据")
+            _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+                 last_attempt_error=f"限速冷却中（{int(cd)} 秒）")
             _set(next_run_ts=time.time() + min(cd + 5, 300))
             return
+
+        #  本次「读到了但没读到内容」的课程名（用于覆盖范围说明）
+        partial_courses: list[str] = []
 
         if suspect:
             log.info("%d 门课程上轮有任务、本轮为空，补抓：%s",
@@ -599,11 +873,15 @@ def _run_refresh_locked() -> None:
                 # 失败比例过半 → 整轮不可靠，保留旧数据
                 if len(still) * 2 > len(courses):
                     load_from_cache()
-                    _set(status="error",
-                         message=f"{len(still)}/{len(courses)} 门课程未抓到，"
-                                 f"已保留上次数据，稍后会自动重试。")
+                    _set(status="unread",
+                         message=f"{len(still)}/{len(courses)} 门课程未读到，"
+                                 f"显示的是上次数据，稍后会自动重试。")
+                    _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+                         last_attempt_error=f"{len(still)} 门课程未读到")
                     return
+                #  少数几门没到 → 本次算「部分读取」，如实报出名字
                 _set(message=f"注意：{names} 未取到，其余已更新")
+                partial_courses = [c.name for c in still]
 
         scraper.save_report()
         summary = summarize_courses(courses,
@@ -612,7 +890,7 @@ def _run_refresh_locked() -> None:
         #  应用「我已完成，不再提示」的手动标记
         n_manual = manual_done.apply(all_tasks)
         if n_manual:
-            log.info("手动标记命中 %d 个任务（已从待办移除）", n_manual)
+            log.info("手动标记命中 %d 个任务，已从待办移除", n_manual)
 
         #  探测哪些任务有附件（决定是否显示下载键）
         #   卡片里若已能看出附件就直接用；看不出的按需抓详情页确认。
@@ -620,9 +898,9 @@ def _run_refresh_locked() -> None:
         try:
             n_att = detect_attachments(all_tasks)
             if n_att:
-                log.info("%d 个任务确认有附件（显示下载键）", n_att)
+                log.info("%d 个任务确认有附件，显示下载键", n_att)
         except Exception as e:
-            log.warning("附件探测失败（不影响主流程）：%s", e)
+            log.warning("附件探测失败，不影响主流程：%s", e)
 
         # 课表：独立抓取（失败不影响成绩数据）
         schedule = _fetch_schedule()
@@ -641,23 +919,80 @@ def _run_refresh_locked() -> None:
         except Exception as e:
             log.warning("写入历史库失败：%s", e)
 
+        try:
+            #  ★ 记下「当天界面显示的数字」★
+            #    历史段由成绩反推，但反推的聚合方式与界面显示并不相同，
+            #    同一天会出现两个数。所以每天额外记一条：一天一条，只记不推。
+            store.record_daily_gpa(
+                percent=summary.get("mean_percent"),
+                value=summary.get("gpa_estimated")
+                if summary.get("gpa_estimated") is not None
+                else summary.get("gpa"),
+            )
+        except Exception as e:
+            log.warning("写入每日记录失败：%s", e)
+
+
         #  成绩历史（修复：以前 record_grades 定义了但从未被调用，
         #   所以 grades 表一直是空的）
         try:
             n_g = store.record_grades(courses)
+            #  ★ 成绩被学校收回时，把「今日新增」里对应的条目也撤掉，
+            #    否则界面会一直挂着一条已经不存在的成绩。
+            try:
+                _recalled = list(getattr(store, "LAST_RECALLED", []) or [])
+                if _recalled:
+                    today_new.drop_recalled(_recalled)
+            except Exception as _e:
+                log.debug("撤下已收回成绩失败：%s", _e)
             if n_g:
                 log.info("成绩历史已更新 %d 条", n_g)
         except Exception as e:
             log.warning("写入成绩历史失败：%s", e)
 
+        #  数据清理（0.5.2）：历史库只增不减，一学期下来会积几万行。
+        #   每天清一次就够了 —— 用「上次清理日期」判，不靠定时器。
+        try:
+            from . import cleanup
+            cleanup.maybe_daily()
+        except Exception as e:
+            log.debug("数据清理跳过：%s", e)
+
+        #  ── 覆盖范围（0.5.2）──
+        #    把「到底读到了多少」摆出来。这些数字本来就在手上，
+        #    以前只写进日志，界面上看不到。
+        #    ★ 口径：只统计**本次成功读到**的量，不拿缓存里的填。
+        cov = {
+            "courses": len(courses),
+            "courses_partial": partial_courses,
+            "tasks": len(all_tasks),
+            "graded": sum(1 for t in all_tasks if t.graded),
+            "with_attachment": sum(1 for t in all_tasks if t.has_attachment),
+            "schedule_lessons": len(schedule.lessons) if schedule.ready else 0,
+            "schedule_ready": bool(schedule.ready),
+            "schedule_periods": len(schedule.periods or []),
+        }
+
         msg = f"已更新：{len(all_tasks)} 个任务 / {len(courses)} 门课程"
         if schedule.ready:
             msg += f" / 课表 {len(schedule.lessons)} 节"
+
+        #  「本次成功，但确实什么都没有」要单独说 ——
+        #   不然用户看到「已更新： 0 个任务」会以为是读取出错了。
+        if all_tasks:
+            st = "partial" if partial_courses else "ok"
+        else:
+            st = "empty"
+            msg = f"本次读取成功：没有待办，也没有课程（已读到 {len(courses)} 门课）"
+
         _set(tasks=all_tasks, courses=courses, summary=summary,
             schedule=schedule.to_dict(),
-            updated=payload["updated"], status="ok", message=msg,
+            updated=payload["updated"], status=st, message=msg,
+            coverage=cov,
+            last_attempt_ts=time.time(), last_attempt_ok=True,
+            last_attempt_error="",
         )
-        log.info("抓取完成")
+        log.info("抓取完成（%s）", st)
 
         # ── 晚报（用户要求）──
         #  每次抓取完成后：
@@ -675,7 +1010,18 @@ def _run_refresh_locked() -> None:
                 log.info("晚报已生成：%s", made.get("date"))
             digest.save_snapshot(snapshot_data)
         except Exception as e:
-            log.warning("晚报生成失败（不影响主流程）：%s", e)
+            log.warning("晚报生成失败，不影响主流程：%s", e)
+
+        # ── 今日新增（用户要求「今日新获得成绩作业」）──
+        #  台账要**按天累积** —— 不能只看「跟上一轮比」，
+        #  否则早上看得到、下午就看不到了（快照被覆盖）。
+        #  详细理由见 app/today_new.py 的模块说明。
+        try:
+            from . import today_new
+
+            today_new.update(snapshot_data)
+        except Exception as e:
+            log.warning("今日新增台账更新失败，不影响主流程：%s", e)
 
         # ── 详情页预取（用户要求「点开详情要快」）──
         #  在**后台**把待办任务的详情先抓好，用户点开就是读缓存（<5ms）。
@@ -687,10 +1033,34 @@ def _run_refresh_locked() -> None:
             if prefetch.start_async(all_tasks):
                 log.info("已在后台开始预取任务详情")
         except Exception as e:
-            log.warning("启动预取失败（不影响主流程）：%s", e)
+            log.warning("启动预取失败，不影响主流程：%s", e)
+
+        # ── EC 名单扫描（用户要求「每回出名单自动扫描」）──
+        #  用户在引导页填过「可能出现在 EC 名单里的名字」，
+        #  这里每次抓取完都扫一遍最近 36 小时的 EC PDF 文字，
+        #  命中了就在界面上挂红点（不弹系统通知）。
+        #
+        #  ★ 放在抓取流程的最后、且包在 try 里：
+        #    它只是「附加提醒」，失败了不能影响主数据的呈现。
+        #    而且它是**纯本地读文件**，不发网络请求，很快。
+        try:
+            from . import ec_watch
+
+            r = ec_watch.scan_recent()
+            if r.get("found"):
+                log.info("★ EC 名单命中：%s，扫了 %d 份",
+                         "、".join(r["found"]), r.get("scanned", 0))
+                _set(message=(msg + "  ·  EC 名单里有你")
+                     if msg else "EC 名单里有你")
+        except Exception as e:
+            log.warning("EC 名单扫描失败，不影响主流程：%s", e)
     except Exception as e:
         log.exception("抓取失败")
-        _set(status="error", message=f"抓取失败：{e}")
+        #  ★ 本次没读到 —— 保留上次数据在界面上，并记下失败原因
+        #    （以前这里是 status="error"，界面跟「限速」「空结果」长一样）
+        _set(status="unread", message=f"本次没读到：{e}")
+        _set(last_attempt_ts=time.time(), last_attempt_ok=False,
+             last_attempt_error=str(e)[:200])
     finally:
         try:
             session.close()

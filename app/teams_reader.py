@@ -37,7 +37,13 @@ from . import cdp, config, teams
 
 log = logging.getLogger("teams.reader")
 
-TEAMS_URL = "https://teams.microsoft.com/"
+TEAMS_URL = "https://teams.cloud.microsoft/"
+
+#  ★ 域名说明（实测出来的）：
+#    `teams.microsoft.com/v2/` 现在会**重定向**到 `teams.cloud.microsoft`。
+#    用旧地址也能进，但中途要跳一次，加载慢、也容易在跳转期间抓错页面。
+#    所以直接开新域名。两个都认，兼容旧书签。
+TEAMS_HOSTS = ("teams.cloud.microsoft", "teams.microsoft.com")
 
 # ══════════════════════════════════════════════════════════════════
 #  注入到页面的读取脚本
@@ -49,7 +55,7 @@ READ_JS = r"""
 (function(){
   try{
     const OUT = {ok:false, reason:'', url:location.href, title:document.title,
-                 channel:'', messages:[]};
+                 channel:'', messages:[], sessions:[], partial:false};
 
     /* ① 先确认真的在 Teams 上 */
     const host = location.hostname.toLowerCase();
@@ -185,8 +191,41 @@ READ_JS = r"""
       });
     });
 
+    /*  ⑥ 顺手把左侧「会话列表」读出来 ——
+        用于「同步全部会话」：一个一个点过去，把每个会话的消息都收下来。
+        读不到不算失败（Teams 改版可能换选择器），只是同步范围受限。 */
+    try{
+      const LIST_SEL = [
+        '[data-tid="chat-list-item"]',
+        '[data-tid="channel-list-item"]',
+        '[data-tid="conversation-list-item"]',
+        '[role="treeitem"]',
+        '[role="listitem"][data-tid*="list"]'
+      ].join(',');
+      const rows = Array.prototype.slice.call(document.querySelectorAll(LIST_SEL));
+      const seen = {};
+      rows.forEach(function(r){
+        if(r.closest('[hidden]')) return;
+        const rects = r.getClientRects ? r.getClientRects() : [];
+        if(!rects.length) return;
+        const t = rd(r).split('\n')[0].trim();
+        if(!t || t.length > 80) return;
+        /*  会话名重复的（同一个会话在列表里可能出现多次）只留一个 */
+        if(seen[t]) return;
+        seen[t] = 1;
+        OUT.sessions.push({name: t, active: !!r.getAttribute('aria-selected')});
+      });
+    }catch(e2){}
+
     if(OUT.messages.length === 0){
-      OUT.reason = '页面上没有识别到消息。可能还在加载，或需要打开具体频道。';
+      OUT.reason = '页面上没有识别到消息。可能还在加载，或需要打开具体会话。';
+      /*  消息读不到但会话列表读到了 → 也算部分成功，
+          调用方可以据此提示「打开某个会话再同步」 */
+      if(OUT.sessions.length){
+        OUT.ok = true;
+        OUT.partial = true;
+        return JSON.stringify(OUT);
+      }
       return JSON.stringify(OUT);
     }
 
@@ -195,9 +234,67 @@ READ_JS = r"""
 
   }catch(e){
     return JSON.stringify({ok:false, reason:'读取脚本出错：' + String(e),
-                           messages:[]});
+                           messages:[], sessions:[]});
   }
 })()
+"""
+
+
+#  点开会话列表里的第 N 项（「同步全部」时逐个点过去用）。
+#  返回点了哪个、会话名是什么，方便调用方判断有没有前进。
+#
+#  ⚠ 零调用：`sync()` 从不调用它，注入 JS 产出的 `sessions` 字段
+#    在 Python 侧也没有任何消费者（全项目检索确认）。
+#    也就是说「同步全部会话」这个能力**只做到 JS 层，没有接线**。
+#
+#    这不是删不删的问题，而是**必须标出来**：
+#    否则读代码的人会以为「会话列表同步」已经能用，
+#    而实际上它从来没被触发过。要补完（把 sessions 用起来）
+#    还是删掉，是一个功能决定，不是清理决定。
+CLICK_SESSION_JS = r"""
+(function(idx){
+  try{
+    const LIST_SEL = [
+      '[data-tid="chat-list-item"]',
+      '[data-tid="channel-list-item"]',
+      '[data-tid="conversation-list-item"]',
+      '[role="treeitem"]',
+      '[role="listitem"][data-tid*="list"]'
+    ].join(',');
+    let rows = Array.prototype.slice.call(document.querySelectorAll(LIST_SEL));
+    rows = rows.filter(function(r){
+      if(r.closest('[hidden]')) return false;
+      const rects = r.getClientRects ? r.getClientRects() : [];
+      return rects.length > 0;
+    });
+    /*  去重：同一个会话名只算一次，否则点来点去都在原地 */
+    const seen = {};
+    const uniq = [];
+    rows.forEach(function(r){
+      const t = (r.innerText || r.textContent || '').trim().split('\n')[0];
+      if(!t || t.length > 80) return;
+      if(seen[t]) return;
+      seen[t] = 1;
+      uniq.push(r);
+    });
+
+    if(idx < 0 || idx >= uniq.length){
+      return JSON.stringify({ok:false, reason:'会话下标越界',
+                             total: uniq.length});
+    }
+    const el = uniq[idx];
+    const name = (el.innerText || el.textContent || '').trim().split('\n')[0];
+    /*  真的去点它 —— Teams 是 React 应用，派发真实鼠标事件才有效 */
+    el.scrollIntoView({block:'nearest'});
+    ['mousedown','mouseup','click'].forEach(function(t){
+      el.dispatchEvent(new MouseEvent(t, {bubbles:true, cancelable:true,
+                                          view:window}));
+    });
+    return JSON.stringify({ok:true, name:name, total: uniq.length});
+  }catch(e){
+    return JSON.stringify({ok:false, reason:String(e), total:0});
+  }
+})
 """
 
 
@@ -371,24 +468,16 @@ def _scroll_up(rounds: int = 8, budget_sec: int = 90) -> dict:
     返回 {ok, atTop, rounds, grew, messages_before/after, ...}。
     读不到滚动区时返回 ok=False，调用方按「只读当前屏」继续，不算失败。
     """
-    from . import browser
-
-    try:
-        sess = browser.open_login_window(TEAMS_URL)
-    except Exception as e:
-        return {"ok": False, "reason": f"无法启动浏览器：{e}", "atTop": False}
-
-    page = _pick_page(sess)
+    page = _get_page()
     if page is None:
-        return {"ok": False, "reason": "没有 Teams 标签页", "atTop": False}
+        return {"ok": False, "reason": "连不上 Teams 页面", "atTop": False}
 
-    opts = {"rounds": int(rounds), "budgetMs": int(budget_sec * 1000)}
+    opts = json.dumps({"rounds": int(rounds),
+                       "budgetMs": int(budget_sec * 1000)})
 
     try:
-        #  Playwright 的 evaluate 会自动等待 Promise 解析完，
-        #  所以 SCROLL_JS 那个 async 函数可以直接调用。
-        #  参数用「函数 + 参数」形式传，别拼字符串（避免注入问题）。
-        raw = page.evaluate(SCROLL_JS, opts)         # type: ignore[attr-defined]
+        #  SCROLL_JS 是个 async 函数 —— CDP 的 awaitPromise 会等它跑完。
+        raw = page.eval(f"({SCROLL_JS})({opts})", await_promise=True)
     except Exception as e:
         return {"ok": False, "reason": f"滚动失败：{e}", "atTop": False}
 
@@ -403,74 +492,291 @@ def _scroll_up(rounds: int = 8, budget_sec: int = 90) -> dict:
     return d
 
 
-def _pick_page(sess) -> "cdp.Page | None":
-    """在已打开的所有标签里找一个 Teams 页面。"""
+# ══════════════════════════════════════════════════════════════════
+#  浏览器连接
+#
+#  ★ 为什么不用 Playwright：
+#    Playwright 启动 Edge 时会自动加约 40 个开关，其中两个足以
+#    让 Teams 卡死：
+#      --disable-sync                 禁用数据同步
+#      --disable-background-networking 禁用后台网络
+#    Teams 是重度依赖后台同步的应用 —— 被禁掉之后会一直停在
+#    「我们正在为你设置内容...」，永远加载不出消息列表。
+#
+#    所以改成：直接用 app/edge.py 起一个**原生 Edge**
+#    （零自动化开关，和用户自己双击打开的完全一样），
+#    再通过 CDP 连上去读页面。
+#
+#  ★ 关于「不干扰用户自己的 Edge」：
+#    用的是独立 profile（data/browser-profile），
+#    Edge 原生支持多个实例用不同 user-data-dir 并存 ——
+#    你照常开自己的 Edge，两边互不影响。
+#
+#  ★ 关于登录：
+#    首次需要你在弹出的窗口里登录一次；登录态由 Edge 自己
+#    持久化在这个 profile 里，之后（包括开机预热）都不再需要。
+# ══════════════════════════════════════════════════════════════════
+
+#  进程内缓存 CDP 连接，避免每次读都重连（重连要几秒）
+_CDP_CACHE: dict = {"cdp": None, "port": 0, "at": 0.0}
+_CDP_TTL = 120.0        # 连接缓存 2 分钟
+
+
+def _connect(force_new: bool = False):
+    """连到我们自己的 Edge，返回 (CDP 对象, 端口)。
+
+    没在跑就启动一个（原生 Edge，不是 Playwright）。
+    """
+    from . import cdp as _cdp
+    from . import config, edge, teams_guard
+
+    prof = config.BROWSER_PROFILE_DIR
+
+    #  ① 复用缓存
+    now = time.time()
+    if (not force_new and _CDP_CACHE["cdp"]
+            and now - _CDP_CACHE["at"] < _CDP_TTL):
+        return _CDP_CACHE["cdp"], _CDP_CACHE["port"]
+
+    running = bool(edge.read_devtools_port(prof)) and edge.is_edge_running(prof)
+
+    #  ② 已经在跑 → 直接连
+    if running:
+        port = edge.read_devtools_port(prof)
+        try:
+            c = _cdp.CDP(port)
+            _CDP_CACHE.update(cdp=c, port=port, at=now)
+            return c, port
+        except Exception as e:
+            log.debug("连已有 Edge 失败（%s），尝试重启", e)
+
+    #  ③ 没在跑 → 启动前先拉黑 Teams 协议。
+    #     必须在启动**之前**写：该配置只在浏览器启动时读一次，
+    #     而且 Edge 运行中退出时会把内存里的旧值写回去。
+    if not running:
+        try:
+            r = teams_guard.harden_profile(prof)
+            if not r.get("ok"):
+                log.debug("写协议黑名单没成功：%s", r.get("why"))
+        except Exception as e:
+            log.debug("协议黑名单异常：%s", e)
+
+    #  ④ 启动原生 Edge
+    edge.launch_edge(prof, headless=False, url=TEAMS_URL, debug_port=True)
+    port = edge.wait_for_devtools(prof, timeout=60)
+    c = _cdp.CDP(port)
+    _CDP_CACHE.update(cdp=c, port=port, at=now)
+    return c, port
+
+
+def _pick_page(cdp_obj=None):
+    """在已打开的标签里找一个 Teams 页面，返回 Page 句柄。
+
+    注意 CDP.attach() 返回的是 **session_id**（字符串），
+    要自己包成 Page 才能调 eval。这一步以前漏了 ——
+    表现为「拿到了对象但没有 eval 方法」。
+    """
+    from .cdp import Page as _Page
     try:
-        tgts = sess._cdp.list_targets()          # type: ignore[attr-defined]
-    except Exception:
+        c = cdp_obj or _connect()[0]
+        tgts = c.targets()
+    except Exception as e:
+        log.debug("列出标签失败：%s", e)
         return None
     for t in tgts:
+        #  只认真正的页面 —— service_worker / worker 也有 teams 域名，
+        #  之前误选过它，导致 eval 报「Uncaught」什么都读不到。
+        if t.get("type") != "page":
+            continue
         url = (t.get("url") or "").lower()
-        if "teams.microsoft.com" in url or "teams.cloud.microsoft" in url:
+        if any(h in url for h in TEAMS_HOSTS):
             try:
-                return sess._cdp.attach(t["id"])   # type: ignore[attr-defined]
+                sid = c.attach(t["targetId"])
+                return _Page(c, sid, t["targetId"])
             except Exception:
                 continue
     return None
 
 
-def open_teams(headless: bool = False) -> bool:
-    """打开 Teams 页面（复用已开的；没有就新开一个）。
+def _get_page(wait_ready_sec: int = 90):
+    """拿到一个可用的 Teams 页面（必要时打开/等待）。"""
+    _connect()
+    page = _pick_page()
+    if page is not None:
+        return page
 
-    headless=False 让用户能看见并登录。
+    #  没有 Teams 标签 → 新开一个。
+    #  CDP.create() 返回 (target_id, session_id)，
+    #  但这里统一走 _pick_page 拿 Page 句柄（保持一致）。
+    try:
+        c, _port = _connect()
+        c.create(TEAMS_URL)
+        time.sleep(2.5)             # 等标签建好、URL 就位
+        return _pick_page(c)
+    except Exception as e:
+        log.warning("打开 Teams 标签失败：%s", e)
+        return None
+
+
+def open_teams(headless: bool = False) -> bool:
+    """打开 Teams 窗口（复用已开的；没有就新开一个）。
+
+    用的是原生 Edge，和你自己双击打开的一模一样。
     """
     try:
-        from . import browser
-        sess = browser.open_login_window(TEAMS_URL)
-        return bool(sess)
+        return _get_page() is not None
     except Exception as e:
         log.warning("打开 Teams 失败：%s", e)
         return False
+
+
+def wait_teams_ready(timeout: int = 90, quiet: bool = False) -> dict:
+    """等 Teams 界面**真的**出来（消息列表可读）。
+
+    Teams 首次加载或换 profile 后要重建索引，可能要 1~2 分钟。
+    返回 {ok, waited, reason}。
+    """
+    from . import teams_guard
+
+    t0 = time.time()
+    last_log = 0.0
+    guard_at = 0.0
+    while time.time() - t0 < timeout:
+        page = _pick_page()
+        if page is not None:
+            #  ★ 每 4 秒清一次场 —— 中转页退回、横幅点掉。
+            #    不清的话「等界面就绪」会一直等不到东西，看着就像卡死。
+            now = time.time()
+            if now - guard_at > 4:
+                guard_at = now
+                try:
+                    g = teams_guard.guard(page, TEAMS_URL, quiet=quiet)
+                    if g.get("recovered") and not quiet:
+                        log.info("检测到桌面版中转页，已退回网页版")
+                except Exception:
+                    pass
+
+            try:
+                n = page.eval(
+                    "document.querySelectorAll("
+                    "'[data-tid=\"chat-pane-message\"],"
+                    "[data-tid=\"channel-post\"],"
+                    "[data-tid=\"channel-pane-message\"],"
+                    "[role=\"listitem\"],"
+                    "[contenteditable=\"true\"]').length"
+                ) or 0
+                if isinstance(n, (int, float)) and n > 0:
+                    return {"ok": True, "waited": int(time.time() - t0)}
+            except Exception:
+                pass
+        el = time.time() - t0
+        if not quiet and el - last_log > 15:
+            last_log = el
+            log.info("等待 Teams 界面就绪…（%.0f 秒）", el)
+        time.sleep(2)
+    return {"ok": False, "waited": int(time.time() - t0),
+            "reason": "等待超时，Teams 界面还没加载出来"}
 
 
 def read_page(wait_sec: int = 6) -> dict:
     """读当前 Teams 页面里的消息。
 
     返回：
-        {ok, reason, channel, messages:[...], url}
+        {ok, reason, channel, messages:[...], sessions:[...]}
     """
-    from . import browser
-
-    try:
-        sess = browser.open_login_window(TEAMS_URL)
-    except Exception as e:
-        return {"ok": False, "reason": f"无法启动浏览器：{e}", "messages": []}
-
-    page = _pick_page(sess)
+    page = _get_page()
     if page is None:
-        # 没有 Teams 标签 → 开一个
-        try:
-            page = sess.page
-            page.goto(TEAMS_URL)             # type: ignore[attr-defined]
-        except Exception as e:
-            return {"ok": False, "reason": f"打不开 Teams：{e}", "messages": []}
+        return {"ok": False, "reason": "连不上 Teams 页面", "messages": [],
+                "sessions": []}
 
-    # 等页面渲染（Teams 是 SPA，DOM 出现需要时间）
+    #  ★ 清场：万一被「打开桌面版」弹窗挡着，或者被导到中转页，
+    #    这里先救回来。不做的话会一直读不到元素 —— 表现为「卡死」。
+    try:
+        from . import teams_guard
+        g = teams_guard.guard(page, TEAMS_URL)
+        if g.get("recovered"):
+            log.info("已从「打开桌面版」中转页退回网页版")
+        if g.get("dismissed"):
+            log.debug("点掉横幅：%s", g["dismissed"])
+    except Exception as e:
+        log.debug("清场跳过：%s", e)
+
+    # 等页面渲染（Teams 是 SPA）
     time.sleep(max(2, min(wait_sec, 15)))
 
     try:
-        raw = page.evaluate(READ_JS)         # type: ignore[attr-defined]
+        raw = page.eval(READ_JS)
     except Exception as e:
-        return {"ok": False, "reason": f"读取页面失败：{e}", "messages": []}
+        return {"ok": False, "reason": f"读取页面失败：{e}", "messages": [],
+                "sessions": []}
     if not raw:
-        return {"ok": False, "reason": "页面没有返回数据", "messages": []}
+        return {"ok": False, "reason": "页面没有返回数据", "messages": [],
+                "sessions": []}
 
     try:
         d = json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
-        return {"ok": False, "reason": "返回的数据格式不对", "messages": []}
+        return {"ok": False, "reason": "返回的数据格式不对", "messages": [],
+                "sessions": []}
 
     return d
+
+
+def _read_ec_via_crawl() -> dict | None:
+    """兜底：落到缓存里的 EC 频道，用全量爬取那套读法读当前屏。
+
+    ★ 为什么需要它：
+      ① 全量收取收尾会把浏览器带回 Teams 首页（_finish 回首页），
+        之后点「同步」读到的是首页，一条消息都没有；
+      ② 本模块的 READ_JS 是 v0.4 为聊天视图写的，认不得频道页的
+        data-tid="channel-pane-message" —— 所以落到频道后要改用
+        teams_crawl.JS_READ（全量收取每天在用的那套）来读。
+
+    返回 {ok, messages, channel, sessions} 或 None（落位/读取失败）。
+    消息已映射成 sync() 期望的形状。附件不在此处读 ——
+    附件由「取名单」流程专门处理。
+    """
+    try:
+        from . import ec_fetch, teams_crawl
+        loc = ec_fetch.find_channel()
+        cid = (loc.get("channel_id") or "").strip()
+        if not cid:
+            return None
+        page = _get_page(wait_ready_sec=30)
+        if page is None:
+            return None
+        page.goto(teams_crawl.CHANNEL_URL + cid, timeout=45000)
+        st = teams_crawl._wait_for_channel(page, tries=14)      # noqa: SLF001
+        if st.get("launcher"):
+            #  落到「加入对话」中转页 → 点「改用 Web 应用」拉回来
+            teams_crawl._guard(page)                            # noqa: SLF001
+            st = teams_crawl._wait_for_channel(page, tries=10)  # noqa: SLF001
+        if not (st.get("pane") or (st.get("msgs") or 0) > 0 or st.get("empty")):
+            return None
+        d = page.eval(teams_crawl.JS_READ) or {}
+        if not isinstance(d, dict) or not d.get("ok"):
+            return None
+        ch_name = (loc.get("channel") or d.get("channel") or "").strip()
+        msgs = []
+        for p in (d.get("posts") or []):
+            tm = (p.get("time") or "").strip()
+            msgs.append({
+                "title": (p.get("title") or "")[:200],
+                "text": (p.get("text") or "")[:16000],
+                "author": (p.get("author") or "")[:120],
+                "channel": ch_name,
+                "time": tm[:10],
+                "timeLabel": tm[:80],
+                "attachments": [],
+                "attachCount": 0,
+            })
+        log.info("已自动落到 EC 频道并读出 %d 帖：%s / %s",
+                 len(msgs), loc.get("team", ""), ch_name)
+        return {"ok": True, "messages": msgs, "channel": ch_name,
+                "sessions": []}
+    except Exception as e:
+        log.debug("EC 兜底读取失败：%s", e)
+        return None
 
 
 def sync(scroll_rounds: int = 8, budget_sec: int = 90) -> dict:
@@ -489,6 +795,21 @@ def sync(scroll_rounds: int = 8, budget_sec: int = 90) -> dict:
         scrolled = _scroll_up(rounds=scroll_rounds, budget_sec=budget_sec)
 
     page = read_page()
+
+    #  Teams 加载波动大（约 1/5 的首次读取会空手），
+    #  读不到消息时等几秒再读一次，多半就回来了 —— 别一次就认输。
+    if not page.get("ok") and "没有识别到消息" in str(page.get("reason") or ""):
+        time.sleep(6)
+        page = read_page()
+
+    #  还是没读到 → 多半是全量收取收尾时把浏览器带回了 Teams 首页
+    #  （teams_crawl._finish 回首页），首页没打开任何频道，自然没消息。
+    #  而且 READ_JS 是 v0.4 为聊天视图写的，认不得频道页的
+    #  channel-pane-message —— 落到频道后要改用爬取那套读法。
+    if not page.get("ok") and "没有识别到消息" in str(page.get("reason") or ""):
+        fb = _read_ec_via_crawl()
+        if fb:
+            page = fb
 
     if not page.get("ok"):
         reason = page.get("reason") or "读取失败"

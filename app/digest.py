@@ -31,9 +31,10 @@ from datetime import date, datetime, timedelta
 from . import config
 
 try:  # 兼容两种入口（app.digest / digest）
-    from .gpa import LETTER_TO_GPA, percent_to_letter
+    from .gpa import LETTER_TO_GPA, percent_to_gpa, percent_to_letter
 except Exception:  # pragma: no cover
     LETTER_TO_GPA = {}
+    percent_to_gpa = lambda p: 0.0  # noqa: E731
     percent_to_letter = lambda p: ""  # noqa: E731
 
 log = logging.getLogger("digest")
@@ -91,32 +92,10 @@ def is_workday(d: date | None = None) -> bool:
 
 
 def gpa_of(percent: float | None) -> float | None:
-    """百分制 → 4.0 GPA（与 gpa.py 的换算表一致）。"""
+    """百分制 → 4.0 GPA（换算表的唯一权威在 gpa.py，这里只是转发）。"""
     if percent is None:
         return None
-    if percent >= 93:
-        return 4.0
-    if percent >= 90:
-        return 3.7
-    if percent >= 87:
-        return 3.3
-    if percent >= 83:
-        return 3.0
-    if percent >= 80:
-        return 2.7
-    if percent >= 77:
-        return 2.3
-    if percent >= 73:
-        return 2.0
-    if percent >= 70:
-        return 1.7
-    if percent >= 67:
-        return 1.3
-    if percent >= 63:
-        return 1.0
-    if percent >= 60:
-        return 0.7
-    return 0.0
+    return percent_to_gpa(percent)
 
 
 def letter_of(percent: float | None) -> str:
@@ -182,20 +161,35 @@ def _make_snapshot(data: dict) -> dict:
 # ---------------------------------------------------------------- 计算
 
 def _overall_gpa(courses: dict) -> dict:
-    """简单平均的总 GPA（用户要求：简单平均，不做加权）。"""
-    pcts = [c["percent"] for c in courses.values()
-            if c.get("percent") is not None]
-    if not pcts:
+    """总 GPA：逐门换算 grade points 再等权平均（主流口径）。
+
+    0.5.1 起：只有 IB 等级、没有百分比的课也计入（以前会漏）。
+    """
+    entries = [c for c in courses.values()
+               if c.get("percent") is not None or c.get("level")]
+    if not entries:
         return {"gpa": None, "percent": None, "letter": "—", "count": 0}
 
-    mean = sum(pcts) / len(pcts)
-    gpas = [gpa_of(p) for p in pcts]
-    gpas = [g for g in gpas if g is not None]
+    gpas, pcts = [], []
+    for c in entries:
+        g = gpa_of(c.get("percent"))
+        if g is None and c.get("level"):
+            from .gpa import course_points, gpa_to_percent
+            g = course_points(level=c.get("level"))
+            if g is not None and c.get("percent") is None:
+                pcts.append(gpa_to_percent(g))
+        if g is not None:
+            gpas.append(g)
+        if c.get("percent") is not None:
+            pcts.append(c["percent"])
+    if not gpas:
+        return {"gpa": None, "percent": None, "letter": "—", "count": 0}
+    mean = sum(pcts) / len(pcts) if pcts else None
     return {
-        "gpa": round(sum(gpas) / len(gpas), 2) if gpas else None,
-        "percent": round(mean, 2),
+        "gpa": round(sum(gpas) / len(gpas), 2),
+        "percent": round(mean, 2) if mean is not None else None,
         "letter": letter_of(mean),
-        "count": len(pcts),
+        "count": len(gpas),
     }
 
 

@@ -142,6 +142,29 @@ def count() -> int:
         return len(_load_nolock())
 
 
+def replace_all(marks: dict) -> int:
+    """**整份替换**标记表（备份导入用）。返回写入的条数。
+
+    ★ 为什么必须有这个入口，而不是让调用方直接写文件：
+
+      mark() / unmark() 都是「读 cache → 改 → 往下写」。
+      如果外面绕过去直接写文件，进程内的 _cache 还停在导入前的内容，
+      用户下一次点「标记完成」就会拿旧 cache 覆盖文件 ——
+      刚导入的记录被静默抹掉，而且这份数据**无法从 ManageBac 重抓**。
+      （实测：导入后文件是 [1,2,9]，一次 mark(3) 之后只剩 [1,2,3]。）
+
+      所以导入必须走这里：在锁内重置 _cache，再让 _save_locked()
+      走它本来那套「临时文件 + replace」的原子落盘。
+    """
+    global _cache
+    data = marks if isinstance(marks, dict) else {}
+    with _lock:
+        _cache = dict(data)
+        _save_locked()
+    log.info("手动标记已整份替换：%d 条", len(data))
+    return len(data)
+
+
 def all_marks() -> dict:
     with _lock:
         return dict(_load_nolock())

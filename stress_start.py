@@ -45,7 +45,7 @@ def ps(cmd: str) -> str:
     wrapped = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
         "$OutputEncoding=[System.Text.Encoding]::UTF8;" + cmd
     )
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", wrapped],
+    r = proc_mod.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", wrapped],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
         timeout=60,
     )
@@ -63,7 +63,7 @@ def kill_all() -> None:
       的作业被认为已结束（退出码 -1）。
       所以改成「按命令行里是否含 widget.py」来精确匹配，绝不误杀。
     """
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+    proc_mod.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
          "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
          "Get-CimInstance Win32_Process "
          "-Filter \"Name='python.exe' or Name='pythonw.exe'\" -EA SilentlyContinue "

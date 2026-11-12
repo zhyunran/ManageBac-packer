@@ -61,6 +61,17 @@ MOCK = {
     "message": "",
     "auto_refresh": True,
     "next_refresh_in": 24,
+    #  双时间轴与覆盖范围（预览页也要有，
+    #  否则界面上那几处新文案看不到）
+    "last_attempt_at": "2026-09-25 18:05:02",
+    "last_attempt_ok": True,
+    "last_attempt_error": "",
+    "coverage": {
+        "courses": 3, "courses_partial": [], "tasks": 12,
+        "graded": 5, "with_attachment": 2,
+        "schedule_lessons": 12, "schedule_ready": True,
+        "schedule_periods": 9,
+    },
     "courses": [
         {
             "class_id": "ids", "name": "IDS Big History",
@@ -382,6 +393,18 @@ window.pywebview = {{
     mark_done: () => Promise.resolve({{ok:true, total:1}}),
     unmark_done: () => Promise.resolve({{ok:true, total:0}}),
     manual_count: () => Promise.resolve({{total:0}}),
+    /*  目标模拟 —— 预览页里直接给一个算好的结果，
+        好确认那段界面真的能显示出来。 */
+    goal_sim: (course, target) => Promise.resolve({{
+      ok: true, course: course, target: target,
+      status: 'possible', held: 61.47, adjustable: 35,
+      required: 81.51, min: 61.47, max: 96.47,
+      known: [{{name:'Participation', weight:30, percent:95.0}},
+              {{name:'Assessments', weight:35, percent:78.9}}],
+      unknown: [{{name:'Final Project', weight:35}}],
+      reason: '剩下的类别合计占 35%，加权平均要拿到 81.51 分。',
+      formula: '已出分贡献 61.47 + 待出分类别均分 × 0.3500 = 课程总评',
+    }}),
     task_detail: () => new Promise(res => setTimeout(() => res(MOCK_DETAIL), 1500)),    /*  故意延迟，模拟真实网络 */
     files_list: () => Promise.resolve(MOCK_FILES),
     files_download: () => Promise.resolve({{ok:true, count:1, total:1, folder:'C:\\\\x'}}),

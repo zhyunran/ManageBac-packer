@@ -34,11 +34,14 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 
 from bs4 import BeautifulSoup
 
 from . import config
+from . import store
+from .gpa import aggregate as gpa_aggregate
 from .models import CategoryAverage, Course, Task
 
 log = logging.getLogger(__name__)
@@ -134,14 +137,31 @@ _LATE_WORDS = ("late", "overdue", "迟交", "逾期")
 def parse_status(card) -> tuple[str, bool, bool, bool]:
     """解析任务的提交状态。
 
-    依据（真实结构，见解析规则.md）：
-        <span class="badge color-box-green" data-bs-title="3 days early">
+    依据（真实结构，实测于 2026-10-08，见 _probe_out/报告.txt）：
+        <span class="badge color-box-orange" data-bs-title="1 hour late">
           <span class="badge-label">Submitted</span></span>
         <span class="badge color-box-gray" data-bs-title="Waiting">
           <span class="badge-label">Pending</span></span>
         <span class="cell not-submitted">Not Submitted</span>
 
     返回 (状态文本, 已提交, 待提交, 迟交)
+
+    ★★ 这里曾经写成一个「互斥分类器」，三个判断依次 return：
+
+        if 含 late 词   → return "迟交", False, ...      ← 先命中
+        if 含 pending   → return "待提交", False, ...
+        if 含 submitted → return "已提交", True, ...
+
+      后果：**迟交但确实交了的作业被报成「未提交」**。
+      实测「赤壁赋背诵视频」的徽章是
+          data-bs-title="1 hour late" + 文本 "Submitted"
+      拼成的 blob = "submitted | 1 hour late"，
+      第一个判断就命中 late 并直接 return，`submitted` 被硬写死成 False。
+      于是界面上那门已经交了的作业顶着一个「未提交」标签，
+      用户看到的就是「我明明交了，工具说我没交」。
+
+    「交没交」和「迟没迟」是**两件独立的事**，必须分别判定：
+      晚交 = 已提交 + 迟交，而不是二选一。
     """
     if card is None:
         return "", False, False, False
@@ -149,6 +169,8 @@ def parse_status(card) -> tuple[str, bool, bool, bool]:
     parts: list[str] = []
     for el in card.select(".labels-set .badge .badge-label"):
         parts.append(clean(el.get_text(" ")))
+    #  徽章的悬停提示是**关键信息**：迟交就是写在这里的
+    #  （实测：data-bs-title="1 hour late" 而徽章文字只有 "Submitted"）
     for el in card.select(".badge[data-bs-title]"):
         parts.append(clean(el.get("data-bs-title") or ""))
     for el in card.select(".assessment-cell .cell"):
@@ -156,17 +178,39 @@ def parse_status(card) -> tuple[str, bool, bool, bool]:
         if t:
             parts.append(t)
 
+    #  兜底信号：未提交单元格带 .not-submitted 类
+    #  （实测页面上确实存在这个类；徽章万一没渲染出来，这是另一个独立依据）
+    has_not_submitted_cell = card.select_one(".cell.not-submitted") is not None
+
     blob = " | ".join(p for p in parts if p).lower()
-    if not blob:
+    if not blob and not has_not_submitted_cell:
         return "", False, False, False
 
-    if any(w in blob for w in _LATE_WORDS):
-        return "迟交", False, False, True
-    if any(w in blob for w in _PENDING_WORDS):
-        return "待提交", False, True, False
-    if "submitted" in blob or "已提交" in blob:
-        return "已提交", True, False, False
-    return "", False, False, False
+    # ---- 两个独立事实 ----
+    is_late = any(w in blob for w in _LATE_WORDS)
+    is_pending = any(w in blob for w in _PENDING_WORDS) or has_not_submitted_cell
+    is_submitted = ("submitted" in blob and "not submitted" not in blob) \
+        or "turned in" in blob or "已提交" in blob
+
+    #  明确写着未提交时，不能让 is_submitted 的推断压过它
+    if has_not_submitted_cell:
+        is_submitted = False
+
+    #  没找到任何提交/待提交标记时**不要下结论**。
+    #  宁可如实说「未识别」，也不要把「我们没认出来」说成「你没交」。
+    if not is_submitted and not is_pending:
+        return "", False, False, is_late
+
+    #  展示用的状态：都成立时以「迟交」为准（信息量更大），
+    #  但 submitted 仍然为 True —— 这正是修复的关键。
+    if is_late and is_submitted:
+        status = "迟交"
+    elif is_submitted:
+        status = "已提交"
+    else:
+        status = "待提交"
+
+    return status, is_submitted, is_pending and not is_submitted, is_late
 
 
 # ---------------------------------------------------------------- 日期
@@ -334,25 +378,52 @@ class Scraper:
         except Exception as e:
             self.report["notes"].append(f"{course.name} 主页失败：{e}")
 
-        # ---- 2. /core_tasks 完整列表 ----
+        # ---- 2. /core_tasks 完整列表（新版 ManageBac 的成绩册也在这里）----
+        core_soup = None
         try:
             html = self.goto(course.url + "/core_tasks")
-            soup = BeautifulSoup(html, "html.parser")
-            self._merge_tasks(merged, self._parse_tasks(soup, course), course)
+            core_soup = BeautifulSoup(html, "html.parser")
+            self._merge_tasks(merged, self._parse_tasks(core_soup, course), course)
         except Exception as e:
             self.report["notes"].append(f"{course.name} /core_tasks 失败：{e}")
 
         course.tasks = list(merged.values())
 
-        # ---- 3. /units：分类成绩 + 完成统计 ----
-        try:
-            html = self.goto(course.url + "/units")
-            soup = BeautifulSoup(html, "html.parser")
-            course.categories = self._parse_categories(soup)
-            self._parse_completion(soup, course)
-            self._merge_overall(course)
-        except Exception as e:
-            self.report["notes"].append(f"{course.name} /units 失败：{e}")
+        # ---- 3. 成绩册：分类成绩 + 完成统计 + 总评 ----
+        #
+        #  ★★ 成绩册到底在哪个页面，会变 ★★
+        #    2026-10-13 实测：ManageBac 把「Task Category Averages」从 /units
+        #    搬到了 /core_tasks。于是所有课的总评同时变成空，GPA 一个数都算不出来
+        #    （用户看到的就是「GPA 计算系统炸了」）。
+        #    所以两个页面都试：先在已抓到的 /core_tasks 里找，没有再专门抓
+        #    /units（含重试，这一页的网络失败是瞬时的：SSL 握手超时、
+        #    响应读到一半中断、DNS 解析失败都实测到过）。
+        got_gradebook = False
+        if core_soup is not None:
+            got_gradebook = self._apply_gradebook(core_soup, course)
+
+        if not got_gradebook:
+            units_ok = False
+            last_err: Exception | None = None
+            for attempt in (1, 2, 3):
+                try:
+                    html = self.goto(course.url + "/units")
+                    soup = BeautifulSoup(html, "html.parser")
+                    if self._apply_gradebook(soup, course):
+                        units_ok = True
+                    else:
+                        #  拿到了页面但没解出分类：重试也解不出来，别浪费请求
+                        self.report["notes"].append(
+                            f"{course.name}：成绩册里没有分类成绩")
+                        units_ok = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 3:
+                        time.sleep(1.5 * attempt)
+            if not units_ok and last_err is not None:
+                self.report["notes"].append(
+                    f"{course.name} /units 失败（{last_err!r}）")
 
         self.report["courses"].append({
             "name": course.name, "id": course.class_id,
@@ -748,6 +819,31 @@ class Scraper:
 
     # ---- 总评：优先用网页显示的 Overall ----
 
+    def _apply_gradebook(self, soup, course: Course) -> bool:
+        """从一份页面里解析成绩册（分类成绩 + 完成统计 + 总评）。
+
+        返回是否解出了分类。
+
+        ★ 为什么抽成方法：ManageBac 会调整「成绩册放在哪个页面」。
+          实测 2026-10-13：它从 /units 搬到了 /core_tasks，
+          结果 /units 一个分类都解不出来、界面上所有课的总评同时变空、
+          GPA 直接没有数据。两个页面都试着解析，就不会因为一次改版而全灭。
+        """
+        try:
+            cats = self._parse_categories(soup)
+        except Exception as e:
+            log.debug("解析分类成绩失败：%s", e)
+            return False
+        if not cats:
+            return False
+        course.categories = cats
+        try:
+            Scraper._parse_completion(soup, course)
+        except Exception as e:
+            log.debug("解析完成统计失败：%s", e)
+        self._merge_overall(course)
+        return True
+
     @staticmethod
     def _merge_overall(course: Course) -> None:
         overall = next((c for c in course.categories
@@ -804,50 +900,63 @@ class Scraper:
     # ============================ 汇总 ============================
 
     def save_report(self) -> None:
-        config.ensure_dirs()
-        import json
-        (config.DATA_DIR / "scrape_report.json").write_text(json.dumps(self.report, ensure_ascii=False, indent=2), encoding="utf-8")
+        """把本轮抓取的诊断报告写到 data/scrape_report.json。
+
+        ★ 这是**纯诊断产物**（几十字节，用来排查解析问题），
+          绝不能因为它写不出来就让整轮抓取失败。
+
+          修之前这里没有任何 try：而调用点在 `store.save_cache()` **之前**，
+          所以磁盘满 / 权限问题 / 文件被杀软锁住时，异常会一路上抛到
+          pipeline 的总 except，把**已经抓到手的数据**整轮丢掉
+          （状态变成「本次没读到」）。一个诊断文件的代价不该这么大。
+
+          现在：写失败只记 debug，主流程继续。
+        """
+        try:
+            config.ensure_dirs()
+            p = config.DATA_DIR / "scrape_report.json"
+            store.write_json_atomic(p, self.report, backup=False)
+        except Exception as e:
+            log.debug("写抓取报告失败（不影响本轮结果）：%s", e)
 
 
 # ---------------------------------------------------------------- 汇总统计
 
 def summarize_courses(courses: list[Course],
                       official_gpa: dict | None = None) -> dict:
-    """按网页给出的百分比计算跨课程平均（仅作参考，不改写单科数值）。
+    """汇总跨课程统计（官方 GPA 与本机估算分开，互不覆盖）。
 
      借鉴 CampusDesk：**把「官网公布的 GPA」和「我们估算的」分开**。
         官方值来自页面明确标注的行（如 "Cumulative GPA: 3.85 / 4.0"），
         我们的估算值只作为补充，且界面上要标明「估算」。
 
-    估算规则（简单等权，与 digest.py 的换算表一致）：
-        93+ → 4.0, 90+ → 3.7, 87+ → 3.3, 83+ → 3.0,
-        80+ → 2.7, 77+ → 2.3, 73+ → 2.0, 70+ → 1.7,
-        67+ → 1.3, 63+ → 1.0, 60+ → 0.7, 其余 0
+    估算规则（0.5.1 重编，主流口径，细节见 gpa.py 文件头）：
+        · 逐门换算成 grade points 再平均（不是先平均百分比再换算）
+        · 百分制切段：93/90/87/83/80/77/73/70/67/65 → 4.0~0.0（65 以下 F）
+        · 只有 IB 等级、没有百分比的课**也计入**（以前会整门漏掉）
+        · 另算一个加权参考值：课程名带 AP/IB/HL +1.0，Honors/SL +0.5
+        · 另附等比参考 gpa_linear（分数÷100×4 再平均；非通行算法，仅供对照）
     """
     pcts = [c.overall_percent for c in courses if c.overall_percent is not None]
     levels = [c.overall_level for c in courses if c.overall_level]
     mean = round(sum(pcts) / len(pcts), 2) if pcts else None
 
-    # —— 估算 GPA（简单等权）——
-    def _est(p: float) -> float:
-        for lo, g in ((93, 4.0), (90, 3.7), (87, 3.3), (83, 3.0), (80, 2.7),
-                      (77, 2.3), (73, 2.0), (70, 1.7), (67, 1.3), (63, 1.0),
-                      (60, 0.7)):
-            if p >= lo:
-                return g
-        return 0.0
-
-    est = None
-    if pcts:
-        est = round(sum(_est(p) for p in pcts) / len(pcts), 2)
+    # —— 估算 GPA（逐门换算；percent 优先，level 兜底）——
+    agg = gpa_aggregate([
+        {"name": c.name, "percent": c.overall_percent,
+         "level": c.overall_level or None}
+        for c in courses
+    ])
 
     return {
         "course_count": len(courses),
         "graded_count": len(pcts),
-        "mean_percent": mean,
+        "mean_percent": mean if mean is not None else agg["mean_percent"],
         "levels": levels,
         #  两个字段分开，不混为一谈
         "gpa_official": official_gpa,            # 页面公布的（可能为 None）
-        "gpa_estimated": est,                    # 我们估算的
-        "gpa_estimated_count": len(pcts),
+        "gpa_estimated": agg["gpa"],             # 我们估算的（未加权）
+        "gpa_estimated_weighted": agg["gpa_weighted"],  # 加权参考值
+        "gpa_estimated_linear": agg["gpa_linear"],      # 等比参考值（仅供对照）
+        "gpa_estimated_count": agg["count"],
     }

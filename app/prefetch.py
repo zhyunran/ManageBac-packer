@@ -108,7 +108,7 @@ def prefetch_all(tasks, max_n: int = MAX_PREFETCH,
     pending.sort(key=_priority)
     batch = pending[:max_n]
 
-    log.info("开始预取任务详情：%d 个（共 %d 个待确认）",
+    log.info("开始预取任务详情：%d 个，共 %d 个待确认",
              len(batch), len(pending))
 
     started = time.time()
@@ -116,7 +116,7 @@ def prefetch_all(tasks, max_n: int = MAX_PREFETCH,
     for i, t in enumerate(batch, 1):
         # 时间预算用完就停
         if time.time() - started > budget:
-            log.info("预取到达时间预算（%.0fs），已抓 %d 个，停止",
+            log.info("预取到达时间预算 %.0fs，已抓 %d 个，停止",
                      budget, ok_n)
             break
         # 中途被限速就立刻停（保护账号与配额）
@@ -140,7 +140,7 @@ def prefetch_all(tasks, max_n: int = MAX_PREFETCH,
         if i < len(batch):
             time.sleep(gap)
 
-    log.info("预取完成：%d/%d 个（耗时 %.0fs）",
+    log.info("预取完成：%d/%d 个，耗时 %.0fs",
              ok_n, len(batch), time.time() - started)
     return ok_n
 

@@ -64,16 +64,25 @@ def _looks_like_login(html: str) -> bool:
     """
     if not html:
         return True
-    head = html[:8000]
+
+    #  ★ 必须查**整页**，不能只看开头 ★
+    #    实测登录页的 `session_form` 出现在第 89,320 字符处
+    #    （前面全是 New Relic 脚本和内联样式）。
+    #    只查前 8000 字符的结果是：登录页被判成正常详情页，
+    #    fetch() 返回 ok=True 但 title/description/attachments 全是空的，
+    #    日志里只写「任务详情：（附件 0 个）」—— 静默丢失，谁都看不出来。
+    low = html.lower()
+
     # 登录页特征
-    if "session_form" in head:
+    if "session_form" in low:
         return True
-    if re.search(r'<form[^>]+action=["\'][^"\']*/sessions?["\']', head):
+    if re.search(r'<form[^>]+action=["\'][^"\']*/sessions?["\']', html, re.I):
         return True
-    if re.search(r'<input[^>]+name=["\']password["\']', head):
+    if re.search(r'<input[^>]+name=["\']password["\']', html, re.I):
         return True
+
     # 反向确认：正常页面应该有 ManageBac 的特征元素
-    return "fusion" not in html.lower() and "managebac" not in html.lower()
+    return "fusion" not in low and "managebac" not in low
 
 
 def parse_detail(html: str, url: str = "") -> dict:
@@ -95,6 +104,9 @@ def parse_detail(html: str, url: str = "") -> dict:
         "description": "",
         "attachments": [],
         "grade": {},
+        #  教师评语（空字符串 = 没有评语，界面上不显示这张卡片）
+        "comment": "",
+        "comment_author": "",
         "due_text": "",
         "category": "",
         "kind": "",
@@ -107,6 +119,26 @@ def parse_detail(html: str, url: str = "") -> dict:
                 ".modal", "#cookie-preferences-modal"):
         for el in soup.select(sel):
             el.decompose()
+
+    # ---- 教师评语 ----
+    #  ★ 为什么单独一段：评语在 .assessment-comments 里，
+    #    和「描述」是两个完全不同的区块；描述常常是空的，
+    #    而评语恰恰是家长/学生最想看的那句话。
+    #    没有评语时保持空字符串，前端据此决定不渲染卡片。
+    box = soup.select_one(".assessment-comments")
+    if box is not None:
+        body = (box.select_one(".redactor-styles")
+                or box.select_one(".fr-view")
+                or box.select_one(".cell"))
+        if body is not None:
+            txt = _clean(body.get_text(" "))
+            if txt:
+                out["comment"] = txt
+        au = box.select_one(".author")
+        if au is not None:
+            #  data-bs-title 形如
+            #    "Yushan (Nina) Lai | 赖雨杉 left a comment on Nov 8, 2026"
+            out["comment_author"] = _clean(au.get("data-bs-title") or "")
 
     # ---- 任务名：卡片里的 .h4.title ----
     card = soup.select_one(".fusion-card-item.short-assignment") \
@@ -276,7 +308,14 @@ def _read_cache(tid: str) -> dict | None:
             return None
         if time.time() - f.stat().st_mtime > CACHE_TTL:
             return None
-        return json.loads(f.read_text(encoding="utf-8"))
+        data = json.loads(f.read_text(encoding="utf-8"))
+        #  ★ 缓存版本检查 ★
+        #    新增字段（教师评语）之前写下的缓存里没有 "comment" 键，
+        #    直接复用就永远看不到评语 —— 而且用户完全无法理解为什么。
+        #    缺字段就当作过期，强制重抓一次（只发生一次）。
+        if isinstance(data, dict) and "comment" not in data:
+            return None
+        return data
     except Exception:
         return None
 

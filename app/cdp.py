@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -29,44 +30,22 @@ from typing import Any
 
 import websocket
 
-from . import config
+from . import config, proc
 
 log = logging.getLogger(__name__)
-
-_EDGE_CANDIDATES = [
-    Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-    Path(r"C:\Program Files\Microsoft\EdgeCore\msedge.exe"),
-]
-
-# 真实 Edge 的 UA 前缀（headless 时用于覆盖掉 HeadlessChrome 标记）
-_EDGE_UA_TEMPLATE = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/{ver} Safari/537.36 Edg/{ver}"
-)
 
 
 # ============================ Edge 进程 ============================
 
 def find_edge() -> Path | None:
-    for p in _EDGE_CANDIDATES:
-        if p.exists():
-            return p
-    found = shutil.which("msedge")
-    return Path(found) if found else None
+    """定位可用的 Chromium 浏览器。
 
-
-def _edge_version(exe: Path) -> str:
-    """读取 Edge 主版本号，用于构造真实 UA。"""
-    try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command",
-             f"(Get-Item '{exe}').VersionInfo.ProductVersion"],
-            capture_output=True, text=True, timeout=15,
-        ).stdout.strip()
-        if out:
-            return ".".join(out.split(".")[:4])
-    except Exception:
-        pass
-    return "153.0.0.0"
+    ★ 名字保留是为了不惊动一堆调用点，但**不再只认 Edge**：
+      默认浏览器（Chrome/Edge/Brave/Chromium 任一）都可以。
+      见 app/browser.py 与 config.BROWSER。
+    """
+    from . import browser as _browser
+    return _browser.find()
 
 
 def read_devtools_port(profile_dir: Path) -> int | None:
@@ -91,10 +70,66 @@ def is_running(profile_dir: Path) -> bool:
         return False
 
 
+# ── 日常浏览器的 User Data 目录（复用登录态时用）──
+_USER_DATA_DIRS = {
+    "msedge.exe": ("Microsoft", "Edge", "User Data"),
+    "chrome.exe": ("Google", "Chrome", "User Data"),
+    "brave.exe": ("BraveSoftware", "Brave-Browser", "User Data"),
+}
+
+
+def _user_data_dir_of(exe: Path) -> Path | None:
+    """这个浏览器装在哪，它的日常 User Data 目录就在哪。"""
+    name = exe.name.lower()
+    parts = _USER_DATA_DIRS.get(name)
+    if not parts and "chromium" in str(exe).lower():
+        parts = ("Chromium", "User Data")
+    if not parts:
+        return None
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    d = Path(base).joinpath(*parts)
+    return d if d.is_dir() else None
+
+
+def _profile_in_use(profile_dir: Path) -> bool:
+    """这个 user-data-dir 是否已被某个在跑的浏览器占用。"""
+    try:
+        return bool(list_profile_pids(profile_dir))
+    except Exception:
+        return False
+
+
+def _effective_profile(profile_dir: Path, exe: Path) -> Path:
+    """决定本次用哪个 user-data-dir。
+
+    默认用自己的独立 profile；
+    开了 reuse 且日常浏览器没在跑 → 用日常的（直接继承登录态）。
+    """
+    try:
+        reuse = bool(getattr(config, "BROWSER_REUSE_PROFILE", False))
+    except Exception:
+        reuse = False
+    if not reuse:
+        return profile_dir
+
+    real = _user_data_dir_of(exe)
+    if real is None:
+        log.info("复用登录态：找不到日常浏览器的 User Data 目录，改用独立 profile")
+        return profile_dir
+    if _profile_in_use(real):
+        #  ★ 这时候硬用会失败：浏览器会把新进程转交给已开实例，CDP 端口起不来。
+        log.info("复用登录态：%s 正在运行，先退回独立 profile"
+                 "（关掉它之后下次自动继承登录态）", real)
+        return profile_dir
+    log.info("复用登录态：使用日常浏览器的数据目录 %s", real)
+    return real
+
+
 def launch(profile_dir: Path,
     headless: bool = False,
     url: str | None = None,
-    spoof_headless_ua: bool = True,
 ) -> subprocess.Popen:
     """启动一个**真实**的 Edge 进程（指纹与手动打开一致）。
 
@@ -113,8 +148,22 @@ def launch(profile_dir: Path,
     if exe is None:
         raise FileNotFoundError("未找到 msedge.exe，请确认已安装 Microsoft Edge")
 
+    #  ★ 先决定用哪个 user-data-dir ★
+    #    开了「复用日常浏览器登录」且那个浏览器没在跑时，直接用它的真实目录，
+    #    这样 Chrome 里登录过的 Teams，程序拿来就能用，不用再登一次。
+    profile_dir = _effective_profile(profile_dir, exe)
+
     profile_dir.mkdir(parents=True, exist_ok=True)
     if not is_running(profile_dir):
+        #  ★ 同 edge.py 的坑：旧实例正在退出时立刻起新的，
+        #    单实例锁会让新进程「转手即退」，端口永远不来。
+        #    先确认同 profile 的旧进程退干净再启动。
+        try:
+            if list_profile_pids(profile_dir):
+                log.info("旧 Edge 实例还没退完，先收掉再起新的")
+                close_profile_browser(profile_dir)
+        except Exception as e:
+            log.debug("清旧实例失败（不挡启动）：%s", e)
         try:
             (profile_dir / "DevToolsActivePort").unlink(missing_ok=True)
         except OSError:
@@ -127,11 +176,27 @@ def launch(profile_dir: Path,
         "--disable-blink-features=AutomationControlled",
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-features=msEdgeSidebarV2,msEdgeLaunchOnLogin,msShowFeatureSplash",
-        # 减少后台节流，保证长时间抓取稳定
+        #  关掉各种边栏 / 首次运行引导 / 「打开桌面应用」类提示
+        "--disable-features=msEdgeSidebarV2,msEdgeLaunchOnLogin,"
+        "msShowFeatureSplash,msEdgeAppLauncher,"
+        "EdgeOpenExternalProtocolPrompt",
+        #  减少后台节流，保证长时间抓取稳定
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
     ]
+
+    #  ★★ 不走系统代理 ★★
+    #    和 httpclient.no_proxy_handler() 同一个理由，但这里容易漏：
+    #    Python 的网络请求绕开了代理，浏览器却仍然读系统设置。
+    #    实测后果不是"慢"，而是**页面直接残废** ——
+    #    希悦登录页是 React SPA，静态资源加载失败后只剩未编译模板：
+    #        buttons: "<% $t('登录') %>"
+    #        inputs : 只有 school_id，没有用户名/密码框
+    #    于是自动填表永远 "no input"，课表永远空白。
+    #    需要走代理时设 MBPK_USE_SYSTEM_PROXY=1。
+    _use_proxy = (os.environ.get("MBPK_USE_SYSTEM_PROXY") or "").strip().lower()
+    if _use_proxy not in ("1", "true", "yes", "on"):
+        flags.append("--no-proxy-server")
 
     if headless:
         flags += [
@@ -160,12 +225,16 @@ def wait_for_port(profile_dir: Path, timeout: float = 45.0) -> int:
     raise TimeoutError("等待 Edge 调试端口超时（浏览器可能未成功启动）")
 
 
-def terminate(proc: subprocess.Popen | None) -> None:
-    if proc is None:
+def terminate(popen_obj: subprocess.Popen | None) -> None:
+    """正常结束一个我们启动的进程。
+
+    ★ 参数名不要叫 `proc` —— 会遮蔽本模块导入的 `app.proc`。
+    """
+    if popen_obj is None:
         return
     try:
-        if proc.poll() is None:
-            proc.terminate()
+        if popen_obj.poll() is None:
+            popen_obj.terminate()
     except Exception:
         pass
 
@@ -183,7 +252,9 @@ def list_profile_pids(profile_dir: Path) -> list[int]:
         "| Select-Object -ExpandProperty ProcessId"
     )
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+        #  ★ 必须走 proc.run —— 直接 subprocess 会弹控制台黑框，
+        #    而这里在循环里被反复调用（0.5.1 的「狂跳黑框」就是这么来的）
+        out = proc.run(["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=30,
         ).stdout
     except Exception:
@@ -205,10 +276,11 @@ def close_profile_browser(profile_dir: Path, timeout: float = 25.0) -> int:
     if not pids:
         return 0
     log.info("关闭本数据目录的 Edge 进程：%s", pids)
+    #  ★ 用 ctypes 直接杀，不用 taskkill —— 后者是外部程序，
+    #    每个 pid 都要 spawn 一个（会闪黑框，且在某些场景会卡）。
     for pid in pids:
         try:
-            subprocess.run(["taskkill", "/PID", str(pid)],
-                           capture_output=True, timeout=10)
+            proc.kill_pid(pid, force=False)
         except Exception:
             pass
 
@@ -222,8 +294,7 @@ def close_profile_browser(profile_dir: Path, timeout: float = 25.0) -> int:
     # 仍未退出 → 强制
     for pid in list_profile_pids(profile_dir):
         try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           capture_output=True, timeout=10)
+            proc.kill_pid(pid, force=True)
         except Exception:
             pass
     time.sleep(0.6)
@@ -234,6 +305,38 @@ def close_profile_browser(profile_dir: Path, timeout: float = 25.0) -> int:
 
 class CDPError(RuntimeError):
     pass
+
+
+#  通用点击：派发一整套真实鼠标事件。
+#  React / Teams 这类应用只认 pointer 序列，单发一个 click 会被忽略。
+_JS_CLICK = r"""
+(sel, idx) => {
+  const els = document.querySelectorAll(sel);
+  if (els.length <= idx) return false;
+  const e = els[idx];
+  try { e.scrollIntoView({block: 'center', inline: 'center'}); } catch (x) {}
+  const r = e.getBoundingClientRect();
+  const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+  const mk = t => new MouseEvent(t, {
+    bubbles: true, cancelable: true, view: window,
+    clientX: cx, clientY: cy, button: 0, buttons: 1,
+  });
+  try { e.focus && e.focus(); } catch (x) {}
+  for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    try { e.dispatchEvent(mk(t)); } catch (x) {}
+  }
+  return true;
+}
+"""
+
+_JS_SCROLL_INTO = r"""
+(sel, idx) => {
+  const els = document.querySelectorAll(sel);
+  if (els.length <= idx) return false;
+  try { els[idx].scrollIntoView({block: 'center'}); } catch (x) { return false; }
+  return true;
+}
+"""
 
 
 class CDP:
@@ -253,7 +356,85 @@ class CDP:
     # ---- 底层收发 ----
 
     def send(self, method: str, params: dict | None = None,
-             session_id: str | None = None) -> Any:
+             session_id: str | None = None,
+             timeout: float | None = None) -> Any:
+        """发一条 CDP 命令，等它的响应。
+
+        ★ 参数 ``timeout``：临时改这次等待的 socket 超时。
+          为什么要这个 ——
+
+          ``recv()`` 会把**事件**（没有 id 的那些）存进缓冲，
+          然后 `continue` 继续读，直到读到自己的响应为止。
+          正常情况下没问题，但有些命令会**引发大量事件**
+          （实测：`Input.dispatchMouseEvent` 发一次 mouseWheel，
+          Teams 的虚拟列表会跟着吐出一堆 DOM/滚动事件）。
+          事件越多，`recv()` 被调用的次数越多 ——
+          如果 socket 超时是默认那 60 秒，而且事件偏偏很密，
+          就有可能在「还没读到响应」时被 WebSocket 判超时：
+
+              WebSocketTimeoutException: Connection timed out
+
+          给一个短一点的超时（比如 8 秒），
+          失败得快，调用方也好重试。
+        """
+        self._id += 1
+        msg: dict = {"id": self._id, "method": method}
+        if params:
+            msg["params"] = params
+        if session_id:
+            msg["sessionId"] = session_id
+
+        old_to = None
+        if timeout is not None:
+            try:
+                old_to = self.ws.gettimeout()
+                self.ws.settimeout(timeout)
+            except Exception:
+                old_to = None
+
+        try:
+            self.ws.send(json.dumps(msg))
+
+            while True:
+                raw = self.ws.recv()
+                if not raw:
+                    raise CDPError("CDP 连接已关闭")
+                data = json.loads(raw)
+                if data.get("id") != self._id:
+                    # 是事件 → 存入缓冲，供 drain_events 取用
+                    if "method" in data:
+                        self.events.append(data)
+                    continue
+                if "error" in data:
+                    raise CDPError(f"{method}: {data['error'].get('message')}")
+                return data.get("result", {})
+        finally:
+            if old_to is not None:
+                try:
+                    self.ws.settimeout(old_to)
+                except Exception:
+                    pass
+
+    def fire(self, method: str, params: dict | None = None,
+             session_id: str | None = None) -> int:
+        """发一条 CDP 命令，**不等响应**，立刻返回。
+
+        ★ 什么时候需要这个 ——
+          有些命令会引发**非常多的事件**，而 ``send()`` 的循环是
+          「recv → 不是我的响应就继续 recv」，事件一多就容易在
+          读到响应前被 socket 超时打断：
+
+              WebSocketTimeoutException: Connection timed out
+
+          实测 `Input.dispatchMouseEvent` 发一次 mouseWheel
+          就会碰上（Teams 的虚拟列表会跟着吐一堆事件）。
+
+          这类命令**本来就不需要响应** —— 要的是「把输入塞进去」，
+          效果看后面的 DOM 变化就行。所以用 fire 发出去就走，
+          socket 上的事件留给下一次 send / pump 顺手清掉。
+
+        返回这次用的消息 id（便于在 events 里对号）。
+        """
         self._id += 1
         msg: dict = {"id": self._id, "method": method}
         if params:
@@ -261,20 +442,7 @@ class CDP:
         if session_id:
             msg["sessionId"] = session_id
         self.ws.send(json.dumps(msg))
-
-        while True:
-            raw = self.ws.recv()
-            if not raw:
-                raise CDPError("CDP 连接已关闭")
-            data = json.loads(raw)
-            if data.get("id") != self._id:
-                # 是事件 → 存入缓冲，供 drain_events 取用
-                if "method" in data:
-                    self.events.append(data)
-                continue
-            if "error" in data:
-                raise CDPError(f"{method}: {data['error'].get('message')}")
-            return data.get("result", {})
+        return self._id
 
     def drain_events(self, method_filter: str | None = None) -> list[dict]:
         """取出并清空已缓冲的事件。"""
@@ -349,8 +517,53 @@ class Page:
 
     # ---- 基础 ----
 
-    def eval(self, expression: str, await_promise: bool = False) -> Any:
-        r = self.cdp.send("Runtime.evaluate",
+    def _exc(self, r: dict, what: str) -> None:
+        if "exceptionDetails" not in r:
+            return
+        d = r["exceptionDetails"]
+        ex = d.get("exception") or {}
+        extra = ""
+        if isinstance(ex, dict):
+            extra = str(ex.get("description") or ex.get("value") or "")
+        raise CDPError(f"JS 异常({what})：{d.get('text','')} {extra[:300]}".strip())
+
+    #  统一包装：求值 → 是函数就调 → 是 Promise 就等。
+    #  为什么要这么绕：Runtime.evaluate 只认「表达式」，且 returnByValue 打开后
+    #  函数拿不到 objectId，没法再补调。包一层 async IIFE 就一次到位。
+    _WRAP = (
+        "(async () => {"
+        "  let __r = (EXPR);"
+        "  if (typeof __r === 'function') { __r = __r(); }"
+        "  if (__r && typeof __r.then === 'function') { __r = await __r; }"
+        "  return __r;"
+        "})()"
+    )
+
+    def eval(self, expression: str, await_promise: bool = True) -> Any:
+        """求值一个 JS 表达式并取回值。
+
+        自动兼容三种写法（都是踩过的坑）：
+            ``() => 2``        函数 —— 替它调一次
+            ``async () => 2``  Promise —— 等它落地
+            ``1 + 1``          普通表达式 —— 直接取值
+        """
+        #  末尾分号会让 `let __r = (EXPR)` 变成语法错误，先剥掉
+        expr = expression.strip().rstrip(";").strip()
+        src = self._WRAP.replace("EXPR", f"\n{expr}\n")
+        r = self._raw_eval(src, await_promise=True)
+        self._exc(r, "eval")
+        return (r.get("result") or {}).get("value")
+
+    def call(self, fn_source: str, *args: Any) -> Any:
+        """调用带参数的 JS 函数：``p.call("(a,b)=>a+b", 1, 2)``。
+
+        参数走 JSON，不用操心引号转义。
+        """
+        payload = json.dumps(list(args), ensure_ascii=False)
+        return self.eval(f"({fn_source}).apply(null, {payload})")
+
+    def _raw_eval(self, expression: str, await_promise: bool = False) -> dict:
+        return self.cdp.send("Runtime.evaluate",
             {
                 "expression": expression,
                 "returnByValue": True,
@@ -359,10 +572,13 @@ class Page:
             },
             session_id=self.sid,
         )
-        if "exceptionDetails" in r:
-            desc = r["exceptionDetails"].get("text", "")
-            raise CDPError(f"JS 异常：{desc}")
-        return r.get("result", {}).get("value")
+
+    def click(self, selector: str, index: int = 0) -> bool:
+        """用真实鼠标事件点第 ``index`` 个匹配元素。"""
+        return bool(self.call(_JS_CLICK, selector, index))
+
+    def scroll_to(self, selector: str, index: int = 0) -> bool:
+        return bool(self.call(_JS_SCROLL_INTO, selector, index))
 
     @property
     def url(self) -> str:

@@ -231,7 +231,14 @@ def extract_pdf_text(path: Path, max_pages: int = MAX_PDF_PAGES) -> dict:
       优先用 pypdf（体积小、纯 Python）。
       没装的话返回「未安装解析库」，功能降级但不报错。
     """
-    out = {"ok": False, "text": "", "pages": 0, "note": ""}
+    out = {"ok": False, "text": "", "pages": 0, "note": "",
+           #  ★ 语义边界（0.5.2）—— 提取到文字 ≠ 读懂了内容。
+           #    页面上的「Shelley Rong / William Wang」抽出来是一串字，
+           #    “它在名单里”这件事要人来判断（或只当参考）。
+           #    这两个字段一直报，免得调用方拿它当结构化数据用。
+           "text_only": True,
+           "semantic_verified": False,
+           }
 
     if not path.exists():
         out["note"] = "文件不存在"
@@ -321,6 +328,48 @@ def status() -> dict:
         "note": d.get("note") or "",
         "ready": bool(d.get("updated")),
     }
+
+
+def all_messages(keyword: str = "", date: str = "",
+                 channel: str = "") -> list:
+    """列出**所有**消息 —— EC 与其它（作业通知、班级消息）一起。
+
+    为什么要这个接口：
+      原来的 ec_list 只给 EC。但 Teams 里的消息远不止 EC ——
+      老师发的通知、作业提醒、班级群消息都在同一个地方。
+      「Teams」这个标签页应该能看到全部，EC 只是其中一类。
+
+    返回按时间倒序（新的在前）的合并列表。
+    """
+    d = load()
+    items: list = []
+    for key in ("ec", "posts"):
+        for it in (d.get(key) or []):
+            if isinstance(it, dict):
+                items.append(it)
+
+    out = []
+    for it in items:
+        if date and not (it.get("date") or "").startswith(date):
+            continue
+        if channel and (it.get("channel") or "").strip() != channel.strip():
+            continue
+        if keyword:
+            atts = " ".join((a.get("name") or "")
+                            for a in (it.get("attachments") or []))
+            blob = (str(it.get("title", "")) + str(it.get("text", ""))
+                    + str(it.get("file_text", ""))
+                    + str(it.get("channel", ""))
+                    + str(it.get("author", ""))
+                    + str(it.get("date", "")) + atts)
+            if keyword.lower() not in blob.lower():
+                continue
+        out.append(it)
+
+    #  日期倒序；没日期的排最后
+    out.sort(key=lambda x: ((x.get("date") or "")[:10] == "",
+                            (x.get("date") or "")[:10]), reverse=True)
+    return out
 
 
 def ec_list(keyword: str = "", date: str = "") -> list:

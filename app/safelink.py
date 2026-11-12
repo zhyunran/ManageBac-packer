@@ -75,6 +75,20 @@ ALLOWED_QUERY = {
 # ── 允许的协议 ──
 ALLOWED_SCHEMES = {"https", "http"}
 
+# ──  路径穿越与畸形转义（0.5.2 补）──
+#   `../` 与它的百分号编码 `%2e%2e/` 能绕过只看「路径开头」的检查；
+#    `%zz` 这类畸形转义会让不同解析器得出不同路径 ——
+#    两种都在这里直接拒掉，不依赖上层解析成什么样。
+_BAD_PATH_RE = re.compile(r"(?:^|/)(?:\.|%2e){1,2}(?:/|$)", re.I)
+_BAD_ESCAPE_RE = re.compile(r"%(?![0-9a-fA-F]{2})")
+
+#  敏感参数（在 query 和 hash 里都要查）
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?:^|[_\-])(?:token|sign|signature|auth|authkey|key|secret|"
+    r"credential|session|assertion|code|password|passwd)(?:$|[_\-])",
+    re.I,
+)
+
 
 def _host_ok(host: str) -> bool:
     host = (host or "").lower().strip()
@@ -87,6 +101,28 @@ def _is_local(host: str) -> bool:
     """本地地址（我们自己的预览页 / 看板服务）。"""
     h = (host or "").lower()
     return h in ("localhost", "127.0.0.1", "::1", "")
+
+
+def _sensitive_params(url: str) -> str:
+    """URL 里有没有敏感参数（返回命中的参数名，没有则空串）。
+
+    ★ 一定要连 **hash 里的 query** 一起查 ——
+      Teams / SharePoint 这类 SPA 会把参数放在 `#` 后面，
+      只看 `?` 会漏掉一半。
+    """
+    try:
+        u = urlparse(url)
+        groups = [u.query]
+        frag = u.fragment or ""
+        if "?" in frag:
+            groups.append(frag.split("?", 1)[1])
+        for g in groups:
+            for k in parse_qs(g, keep_blank_values=True).keys():
+                if _SENSITIVE_KEY_RE.search(k):
+                    return k
+    except Exception:
+        return ""
+    return ""
 
 
 def check(url: str, *, allow_local: bool = True) -> tuple[bool, str]:
@@ -120,12 +156,26 @@ def check(url: str, *, allow_local: bool = True) -> tuple[bool, str]:
     if u.username or u.password:
         return False, "链接里包含账号密码信息"
 
+    # ③b 路径穿越与畸形转义（0.5.2）
+    #     只看「路径以 / 开头」是不够的：`/a/../b` 与 `/a/%2e%2e/b`
+    #     都可能算出别的路径。这里直接拒，不依赖上层怎么解析。
+    if _BAD_PATH_RE.search(url):
+        return False, "链接里有路径穿越（已阻止）"
+    if _BAD_ESCAPE_RE.search(url):
+        return False, "链接里的百分号转义不完整（已阻止）"
+
     # ④  危险路径（最重要的一条）
     path = u.path or ""
     m = _BAD_WORD_RE.search(path)
     if m:
         word = m.group(0).strip("/.?")
         return False, f"这是「{word}」类操作，不是查看页面（已阻止）"
+
+    # ④b 敏感参数 —— 连 hash 里的 query 一起查（0.5.2）
+    #     Teams / SharePoint 这类 SPA 会把参数放在 # 后面。
+    hit = _sensitive_params(url)
+    if hit:
+        return False, f"链接带有敏感参数：{hit}"
 
     # ⑤ 查询参数白名单 —— 剔除可疑参数
     if u.query:

@@ -32,6 +32,7 @@ import urllib.request
 from pathlib import Path
 
 from . import config
+from . import store
 
 log = logging.getLogger("httpclient")
 
@@ -61,6 +62,28 @@ COOLDOWN_SEC = 240
 _cooldown_lock = threading.Lock()
 
 
+def no_proxy_handler() -> urllib.request.ProxyHandler:
+    """返回一个「不走系统代理」的 ProxyHandler。
+
+    ★ 为什么默认禁用系统代理 ★
+      本机常挂本地加速器（127.0.0.1:8086 之类）用于外网。
+      加速器一关，**系统代理设置却还留着** —— 于是 requests 先连
+      127.0.0.1:8086，没人监听 → WinError 10061「积极拒绝」。
+      表现是「网站打不开 / 成绩加载不出来」，但站点其实完全正常
+      （实测直连 HTTP 200，耗时 0.7 秒；TLS 证书也有效）。
+
+      ManageBac 在国内直连即可，不需要代理，所以这里显式清空。
+
+      确实需要走代理时：设置环境变量 MBPK_USE_SYSTEM_PROXY=1。
+    """
+    import os
+
+    flag = (os.environ.get("MBPK_USE_SYSTEM_PROXY") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return urllib.request.ProxyHandler()      # 沿用系统代理
+    return urllib.request.ProxyHandler({})        # 显式不走代理
+
+
 def set_cooldown(seconds: float = COOLDOWN_SEC, reason: str = "429") -> None:
     """记录一次限速，让**所有进程**在冷却期内不再发请求。"""
     global _cooldown_mem
@@ -69,10 +92,11 @@ def set_cooldown(seconds: float = COOLDOWN_SEC, reason: str = "429") -> None:
         _cooldown_mem = until
         try:
             config.ensure_dirs()
-            COOLDOWN_FILE.write_text(json.dumps({"until": until, "reason": reason,
-                            "at": time.strftime("%Y-%m-%d %H:%M:%S")}),
-                encoding="utf-8",
-            )
+            store.write_json_atomic(COOLDOWN_FILE, {
+                "until": until,
+                "reason": reason,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
         except Exception as e:
             log.warning("写入冷却标记失败：%s", e)
         log.warning("已进入 %.0f 秒冷却（%s）", seconds, reason)
@@ -268,12 +292,16 @@ def login(login_id: str, password: str, timeout: int = REQ_TIMEOUT) -> tuple[boo
       （连续 5 次失败会锁定账号）。
     """
     # 冷却期内绝不尝试登录 —— 登录也是请求，只会加重限速
+    #  ★ 学校网址还没填 → 直接说清楚，不要去请求一个不存在的域名
+    if getattr(config, "BASE_URL_IS_PLACEHOLDER", False):
+        return False, "还没有填学校网址（设置里填一次就行）"
+
     cd = cooldown_remaining()
     if cd > 0:
         return False, f"站点限速冷却中（还剩 {int(cd)} 秒），稍后再试"
 
     cj = http.cookiejar.CookieJar()
-    op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), NoRedirect()
+    op = urllib.request.build_opener(no_proxy_handler(), urllib.request.HTTPCookieProcessor(cj), NoRedirect()
     )
     op.addheaders = [  # type: ignore[attr-defined]
         ("User-Agent", UA),
@@ -354,7 +382,7 @@ def auto_login() -> tuple[bool, str]:
     if has_saved_session() and cooldown_remaining() <= 0:
         cj = http.cookiejar.CookieJar()
         _json_to_cookies(cj, load_cookies())
-        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), NoRedirect()
+        op = urllib.request.build_opener(no_proxy_handler(), urllib.request.HTTPCookieProcessor(cj), NoRedirect()
         )
         op.addheaders = [("User-Agent", UA)]  # type: ignore[attr-defined]
         try:
@@ -448,7 +476,7 @@ class HttpSession:
     # ---- 内部 ----
 
     def _make_opener(self) -> urllib.request.OpenerDirector:
-        op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cj)
+        op = urllib.request.build_opener(no_proxy_handler(), urllib.request.HTTPCookieProcessor(self._cj)
         )
         op.addheaders = [  # type: ignore[attr-defined]
             ("User-Agent", UA),
@@ -551,7 +579,9 @@ class HttpSession:
         raw = load_cookies()
         if raw:
             n = _json_to_cookies(self._cj, raw)
-            log.info("已装载 %d 个会话 Cookie", n)
+            #  ★ 降噪 ★ 每次 open() 都打一条 —— 实测一天 3855 条，
+            #    把真正有用的日志全淹了。这是调试信息，不该进常规日志。
+            log.debug("已装载 %d 个会话 Cookie", n)
 
         if verify:
             self.logged_in = self.check_login()

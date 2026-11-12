@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -30,6 +31,41 @@ log = logging.getLogger(__name__)
 DESKTOP_NAME = "ManageBac 资料"
 
 _SAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _progress():
+    """延迟导入进度模块（避免循环依赖，也省得没下载时加载）。"""
+    from . import dlprogress
+    return dlprogress
+
+
+def _human(n: float) -> str:
+    """字节数转人话，只用于日志。"""
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _cleanup(tmp: Path) -> None:
+    """删掉没下完的 .part，别让它被当成完整文件。"""
+    try:
+        if tmp.exists():
+            tmp.unlink()
+    except OSError as e:
+        log.debug("清理未完成文件失败：%s（%s）", tmp, e)
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """下载用的 opener：与 httpclient 一致，默认不走系统代理。
+
+    ★ 同一个坑：系统代理指向已关闭的本地加速器时，
+      urllib 的默认 opener 会把请求送去那个死端口。
+    """
+    from . import httpclient as _hc
+    return urllib.request.build_opener(_hc.no_proxy_handler())
 
 
 def desktop_dir() -> Path:
@@ -145,9 +181,34 @@ def download_direct(url: str, dest: Path, cookies: dict[str, str] | None = None,
 
     相比浏览器内 fetch，直连不受 CORS 限制，
     因此能处理 ``/attachments/...`` 这类跨域重定向的下载链接。
+
+    三点改进（针对「重复下载 203 MB」那次的教训）：
+      ① **边下边报进度**：以前是 ``r.read()`` 一次性读完，界面拿不到任何进度，
+         用户以为没成功就又点了一次，于是同一份 203 MB 的文件被下了两遍
+         （实测两份 SHA256 完全相同）。
+      ② **同大小就跳过**：目标已存在且字节数与远端一致时不重复下载；
+         大小不同才覆盖。以前是发现同名就默默改名成 ``(1)``，越下越多。
+      ③ **原子落盘**：先写 ``.part`` 再改名，中途失败不会留下半截文件
+         被当成完整文件（那份 ``(1)`` 副本就是这么来的）。
     """
     import urllib.error
     import urllib.request
+
+    progress = _progress()
+    dest = Path(dest)
+
+    #  ★ 自己没会话就自己开一个。
+    #    本函数只负责「参与」进度；正常路径由 download_one / download_all 开会话，
+    #    但万一有别的调用方直接调它，也要能看到进度（否则界面又是一片空白）。
+    #    begin() 已有会话时返回 False，所以这里不会把批量的进度打乱。
+    owner = progress.begin(1)
+
+    if not progress.claim(dest):
+        log.info("跳过重复请求（正在下载）：%s", dest.name)
+        if owner:
+            progress.end()
+        return {"ok": False, "busy": True,
+                "error": "这个文件正在下载中，请等它完成"}
 
     req = urllib.request.Request(url, headers={
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -159,16 +220,62 @@ def download_direct(url: str, dest: Path, cookies: dict[str, str] | None = None,
     if cookies:
         req.add_header("Cookie", "; ".join(f"{k}={v}" for k, v in cookies.items()))
 
+    tmp = dest.with_name(dest.name + ".part")
+    t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-        return {"ok": True, "path": str(dest), "size": len(data)}
+        with _opener().open(req, timeout=timeout) as r:
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+
+            #  ② 已存在且大小一致 → 跳过，不浪费流量
+            if total > 0 and dest.exists():
+                try:
+                    if dest.stat().st_size == total:
+                        progress.note_skipped()
+                        log.info("已存在且大小一致，跳过：%s（%s）",
+                                 dest.name, _human(total))
+                        return {"ok": True, "path": str(dest), "size": total,
+                                "skipped": True}
+                except OSError:
+                    pass
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            progress.file_begin(dest.name, size=total)
+
+            done = 0
+            with tmp.open("wb") as f:
+                while True:
+                    chunk = r.read(64 * 1024)      # 64 KB 一块，够细也够快
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    progress.add(len(chunk))
+
+        #  ③ 原子改名
+        tmp.replace(dest)
+
+        dur = max(0.001, time.monotonic() - t0)
+        log.info("下载完成：%s（%s，用时 %.1f 秒，%.1f MB/s）",
+                 dest.name, _human(done), dur, done / dur / 1024 / 1024)
+        return {"ok": True, "path": str(dest), "size": done}
     except urllib.error.HTTPError as e:
+        progress.note_failed()
+        log.warning("下载失败（HTTP %s）：%s", e.code, dest.name)
+        _cleanup(tmp)
         return {"ok": False, "error": f"HTTP {e.code}"}
     except Exception as e:
+        progress.note_failed()
+        log.warning("下载失败（%s）：%s —— %s", type(e).__name__, dest.name, e)
+        _cleanup(tmp)
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        progress.release(dest)
+        if owner:
+            st = progress.snapshot()
+            progress.end(ok=st.get("failed", 0) == 0)
 
 
 def download_via_browser(url: str, dest: Path, timeout_ms: int = 120000) -> dict:
@@ -223,19 +330,39 @@ def download_via_browser(url: str, dest: Path, timeout_ms: int = 120000) -> dict
 
 def download_one(url: str, dest: Path,
                  cookies: dict[str, str] | None = None) -> dict:
-    """统一入口：先直连，失败再退回浏览器内 fetch。"""
-    r = download_direct(url, dest, cookies)
-    if r.get("ok"):
-        return r
-    # 直连失败（如需要特定会话头）→ 退回浏览器方式
-    r2 = download_via_browser(url, dest)
-    if r2.get("ok"):
-        return r2
-    return {"ok": False, "error": f"{r.get('error')} / {r2.get('error')}"}
+    """统一入口：先直连，失败再退回浏览器内 fetch。
+
+    进度会话在这里按需开启：单独调用时由它管首尾；被 download_all 包着调用时
+    begin() 会返回 False（说明批量已经开了），这里就**不**去 end()，
+    免得把整批的进度提前结掉。
+    """
+    progress = _progress()
+    owner = progress.begin(1)
+    try:
+        r = download_direct(url, dest, cookies)
+        if r.get("ok"):
+            return r
+        if r.get("busy"):
+            return r                    # 正在下同一个文件，不重复起
+        # 直连失败（如需要特定会话头）→ 退回浏览器方式
+        progress.file_begin(Path(dest).name, size=0)   # 浏览器方式无进度可报
+        r2 = download_via_browser(url, dest)
+        if r2.get("ok"):
+            return r2
+        return {"ok": False, "error": f"{r.get('error')} / {r2.get('error')}"}
+    finally:
+        if owner:
+            progress.end()
 
 
 def download_all(items: list[dict], subdir: str = "") -> list[dict]:
-    """批量下载（自动读取 Cookie，复用同一会话）。"""
+    """批量下载（自动读取 Cookie，复用同一会话）。
+
+    整批共用一个进度会话：界面上会显示「(3/8) 文件名 · 45% · 1.2 MB/s · 剩余 8 秒」。
+    """
+    progress = _progress()
+    todo = [it for it in items if (it.get("url") or "").strip()]
+    owner = progress.begin(len(todo))
     root = download_root()
     if subdir:
         root = root / safe_name(subdir)
@@ -245,27 +372,27 @@ def download_all(items: list[dict], subdir: str = "") -> list[dict]:
     results: list[dict] = []
     used: set[str] = set()
 
-    for it in items:
-        url = (it.get("url") or "").strip()
-        if not url:
-            continue
-        name = safe_name(it.get("name") or guess_name(url, it.get("text", "")))
-        stem, dot, ext = name.rpartition(".")
-        base = stem if dot else name
-        ext = ("." + ext) if dot else ""
-        cand, i = name, 1
-        while cand.lower() in used:
-            cand = f"{base} ({i}){ext}"
-            i += 1
-        used.add(cand.lower())
+    try:
+        for it in items:
+            url = (it.get("url") or "").strip()
+            if not url:
+                continue
+            name = safe_name(it.get("name") or guess_name(url, it.get("text", "")))
+            stem, dot, ext = name.rpartition(".")
+            base = stem if dot else name
+            ext = ("." + ext) if dot else ""
+            cand, i = name, 1
+            while cand.lower() in used:
+                cand = f"{base} ({i}){ext}"
+                i += 1
+            used.add(cand.lower())
 
-        dest = root / cand
-        r = download_one(url, dest, cookies)
-        r["name"] = cand
-        r["url"] = url[:120]
-        results.append(r)
-        log.info("下载 %s -> %s", cand, "OK" if r["ok"] else r.get("error"))
-
+            dest = root / cand
+            results.append({"name": cand, **download_one(url, dest, cookies)})
+    finally:
+        if owner:
+            st = progress.snapshot()
+            progress.end(ok=st.get("failed", 0) == 0)
     return results
 
 

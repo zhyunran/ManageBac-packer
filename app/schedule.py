@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -382,58 +383,136 @@ def fetch_periods(token: str, rid: str) -> list[dict]:
       比如数学是 P2、化学是 P4，那 P3 应该显示一行「自习」，
       而不是让化学直接接在数学后面 —— 那样看不出中间是空的。
 
-      要知道「P3 是几点到几点」，就需要这份节次表。
+      还用于自编课的「时刻 ↔ P几」联动换算。
+      抓不到不影响主流程 —— 返回空列表，前端退回「只能用节次名」。
+    """
+    params = {
+        "reflection_id": str(rid),
+        "resolve_most_used_timetable_id_by_week": "true",
+    }
 
-     这个接口不需要 date 参数（传了也行），返回固定的节次结构。
-      抓不到不影响主流程 —— 返回空列表，前端会退回「不填空档」的行为。
+    #  ★ 这个接口**必须**带 date（实测缺了直接 400）：
+    #      {"message":"The required query parameter: 'date' is required"}
+    #    取今天即可 —— 返回的是整份节次结构，跟具体哪一天无关。
+    for path, extra in (
+        ("/scms/timetable/structure", {"date": date.today().isoformat()}),
+        ("/scms/timetable/structure", {
+            "date": date.today().isoformat(),
+            "resolve_most_used_timetable_id_by_week": "false",
+        }),
+        #  有些版本把 date 写成 datetime
+        ("/scms/timetable/structure", {
+            "date": f"{date.today().isoformat()} 00:00:00",
+        }),
+    ):
+        try:
+            st, text = api_get(path, token, {**params, **extra}, timeout=20)
+            if st != 200:
+                continue
+            items = _parse_periods(text)
+            if items:
+                log.info("节次表：%d 节，空档可填充", len(items))
+                return items
+        except Exception as e:
+            log.debug("节次表试探失败（%s）：%s", extra.get("date"), e)
+            continue
+
+    log.warning("节次表接口没取到数据，跳过空档填充与时间换算")
+    return []
+
+
+def _parse_periods(text: str) -> list[dict]:
+    """把节次表响应解析成 [{period, start, end}]。
+
+    响应结构在不同学校版本里不一样，这里做多格式兼容：
+      · 直接是 list
+      · {data: [...]} / {items: [...]} / {result: [...]}
+      · 嵌套 {data: {periods: [...]}}
+      · 字段名 name / title / period / label 之一
+      · 时间可能是 "08:00" / "08:00:00" / "2026-09-22T08:00"
     """
     try:
-        status, text = api_get("/scms/timetable/structure",
-            token,
-            {
-                "reflection_id": str(rid),
-                "resolve_most_used_timetable_id_by_week": "true",
-            },
-            timeout=20,
-        )
-        if status != 200:
-            log.warning("节次表接口 HTTP %s，跳过空档填充", status)
-            return []
         data = json.loads(text)
-    except Exception as e:
-        log.warning("节次表抓取失败（不影响课表）：%s", e)
+    except Exception:
         return []
 
-    # 响应结构可能是 list 或 {data: list} / {items: list}
-    items = data
-    if isinstance(data, dict):
-        for k in ("data", "items", "result", "list"):
-            v = data.get(k)
+    def pick_list(obj) -> list | None:
+        """从各种包装里挖出列表。"""
+        if isinstance(obj, list):
+            return obj
+        if not isinstance(obj, dict):
+            return None
+        for k in ("data", "items", "result", "list", "periods",
+                  "timetable", "structures", "sections"):
+            v = obj.get(k)
             if isinstance(v, list):
-                items = v
-                break
-    if not isinstance(items, list):
+                return v
+            if isinstance(v, dict):
+                got = pick_list(v)
+                if got is not None:
+                    return got
+        return None
+
+    items = pick_list(data)
+    if not items:
         return []
 
     out: list[dict] = []
     for it in items:
         if not isinstance(it, dict):
             continue
-        name = _s(it.get("name") or it.get("title")
-                  or it.get("period") or it.get("label"))
-        start = _norm_time(it.get("start_time") or it.get("startTime")
-                           or it.get("start"))
-        end = _norm_time(it.get("end_time") or it.get("endTime")
-                         or it.get("end"))
+
+        #  节次名：可能是 name / title / period / label，
+        #  也可能在更深的节点里（有些版本套了层 node / structure）
+        src = it
+        for k in ("node", "structure", "period", "section"):
+            v = it.get(k)
+            if isinstance(v, dict):
+                src = {**it, **v}
+                break
+
+        name = _s(src.get("name") or src.get("title")
+                  or src.get("period") or src.get("label")
+                  or src.get("period_name") or src.get("section_name"))
+        #  ★ 实测这个学校返回的是 start_at / end_at（不是 start_time）
+        start = _norm_time(src.get("start_at") or src.get("start_time")
+                           or src.get("startTime")
+                           or src.get("start") or src.get("begin_time")
+                           or src.get("begin"))
+        end = _norm_time(src.get("end_at") or src.get("end_time")
+                         or src.get("endTime")
+                         or src.get("end") or src.get("finish_time")
+                         or src.get("finish"))
+
+        #  名字不是 "P1" 这种的，试着从序号拼出来
+        if not name:
+            idx = src.get("index") or src.get("order") or src.get("no")
+            try:
+                if idx is not None:
+                    name = "P" + str(int(idx))
+            except Exception:
+                name = ""
+
         if not name or not start:
             continue
-        out.append({"period": name, "start": start, "end": end})
+        #  只收 P1..P20 这种规整名字，避免把别的结构混进来
+        if not re.match(r"^[Pp]?\d{1,2}$", str(name).strip()):
+            if not str(name).strip().upper().startswith("P"):
+                continue
+        out.append({"period": str(name).strip().upper()
+                    if str(name).strip().upper().startswith("P")
+                    else "P" + str(name).strip(),
+                    "start": start, "end": end})
 
-    # 按开始时间排序（保证 P1..P9 顺序正确）
-    out.sort(key=lambda x: x["start"])
-    if out:
-        log.info("节次表：%d 节（空档可填充）", len(out))
-    return out
+    # 按开始时间去重 + 排序（保证 P1..P9 顺序正确）
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for p in sorted(out, key=lambda x: x["start"]):
+        if p["period"] in seen:
+            continue
+        seen.add(p["period"])
+        uniq.append(p)
+    return uniq
 
 
 def add_evening_study(lessons: list[Lesson]) -> list[Lesson]:

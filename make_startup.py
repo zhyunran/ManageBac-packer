@@ -63,7 +63,10 @@ def pythonw() -> Path:
 
 def make_shortcut(target: Path, lnk: Path, args: str = "",
                   workdir: Path | None = None) -> None:
-    """用 PowerShell 的 WScript.Shell 创建 .lnk。"""
+    """用 PowerShell 的 WScript.Shell 创建 .lnk。
+
+    ★ 走 app.proc.run：直接 subprocess 会弹一个 PowerShell 黑框。
+    """
     wd = str(workdir or ROOT)
     ps = (f"$W = New-Object -ComObject WScript.Shell; "
         f"$s = $W.CreateShortcut('{lnk}'); "
@@ -75,7 +78,9 @@ def make_shortcut(target: Path, lnk: Path, args: str = "",
         f"$s.Save(); "
         f"Write-Output 'created'"
     )
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+    #  ★ 走 app.proc.run —— 直接 subprocess 会弹 PowerShell 黑框
+    from app import proc as _proc
+    _proc.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
         check=True, capture_output=True, text=True,
     )
 

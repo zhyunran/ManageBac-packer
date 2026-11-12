@@ -247,13 +247,17 @@ def _backup_current() -> Path | None:
 
 
 def _write_manual_marks(marks: dict) -> int:
+    """把导入的标记写回去。
+
+    ★ 走 manual_done.replace_all()，**不要**直接写文件：
+      直接写文件不会更新进程内的 _cache，用户下一次点「标记完成」
+      就会用旧 cache 覆盖掉刚导入的内容（P-01，已实测复现）。
+      那条路径还顺带解决了「导入后 count()/面板仍显示旧值」和
+      「导入后立刻导出得到空备份」两个连带问题。
+    """
     try:
         from . import manual_done
-        with manual_done._lock:              # noqa: SLF001（同包内使用）
-            manual_done.FILE.write_text(json.dumps(marks, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-        return len(marks)
+        return manual_done.replace_all(marks)
     except Exception as e:
         log.warning("写入手动标记失败：%s", e)
         return 0
@@ -383,12 +387,24 @@ def _self_test() -> int:
     print("\n[2]  安全检查（备份里绝不能有凭据）")
     txt = p.read_text(encoding="utf-8")
     bad = {
-        "密码字段": ("password", '"pw"', "zongheng"),
+        "密码字段": ("password", '"pw"'),
         "Cookie": ("_managebac_session", "cookies", "session_cookies"),
         "课表 token": ("access_token", "schedule_token", "eyJ"),
-        "邮箱": ("@", ""),          # 只检查 @ 符号，不写具体域名
-        "手机号": ("18519776629",),
+        "邮箱": ("@",),           # 只检查 @ 符号，不写具体域名
+                                  # （旧写法带了空串 ""，"" in txt 恒真，误报）
     }
+    # 动态检查：credentials.json 里实际填的账号/密码绝不能出现在备份里。
+    # （这里曾经写死了一个真实手机号/姓名做测试 —— 那等于把 PII 又散播
+    #   了一份进源码，改成从本机配置里现读，源码里不留任何真人信息。）
+    dyn: list[str] = []
+    for section in (config.CREDENTIALS or {}).values():
+        if isinstance(section, dict):
+            for k in ("login", "password", "username"):
+                v = str(section.get(k) or "").strip()
+                if len(v) >= 4:      # 太短会误报，跳过
+                    dyn.append(v)
+    if dyn:
+        bad["凭据明文（读自你的 credentials.json）"] = tuple(dyn)
     for name, keys in bad.items():
         hits = [k for k in keys if k in txt]
         if hits:

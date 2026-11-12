@@ -224,7 +224,7 @@ def probe_login() -> bool:
         finally:
             s.close()
     except Exception as e:
-        log.info("HTTP 登录探测异常（保守认为有效）：%s", e)
+        log.info("HTTP 登录探测异常，保守认为有效：%s", e)
         return True
 
 

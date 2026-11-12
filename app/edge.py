@@ -1,4 +1,4 @@
-"""Edge 真实浏览器引擎 —— 关键设计。
+"""真实浏览器引擎（任意 Chromium 内核：Edge / Chrome / Brave / Chromium）。
 
 【为什么不用 Playwright 启动浏览器】
     Playwright 启动的浏览器带自动化特征（``--enable-automation``、
@@ -12,8 +12,12 @@
        没有任何自动化开关。你在里面正常输入账号密码 —— 对网站来说
        这 100% 是一次普通的人类登录。
        **登录过程中绝不连接 CDP。**
-    2. **取数**：需要读数据时，Playwright 通过 CDP **连接**到已存在的
+    2. **取数**：需要读数据时，由 ``app/cdp.py`` 通过 CDP **连接**到已存在的
        Edge（或另起一个无头实例），只做页面读取，从不参与登录。
+
+    （历史说明：取数会话曾经也住在这里、走 Playwright；v0.5 已整体迁到
+    ``app/cdp.py`` 的纯 WebSocket CDP 实现，Playwright 依赖随之移除。
+    本模块现在只剩一件事 —— 启动/探测真实的 Edge 进程。）
 
 这样做的直接好处：
     * 不需要你再关闭日常使用的 Edge（用的是独立数据目录）
@@ -22,8 +26,8 @@
 """
 from __future__ import annotations
 
-import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -31,34 +35,131 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from playwright.sync_api import Browser, Page, Playwright, sync_playwright
-
-from . import config
-
 log = logging.getLogger(__name__)
 
-_HOME = f"{config.BASE_URL}/student/home"
+#  ★ 浏览器定位统一在 app/browser.py（任意 Chromium 内核浏览器都可）。
+#    以前只有三行硬编码，落空时 find_edge() 返回 None，
+#    于是「点击跳转原网页」静默退回系统默认浏览器（要重新登录一次），
+#    而 Teams / EC 名单 / 附件下载会**一起失效**且界面上没有任何提示。
+def find_edge() -> Path | None:
+    """定位可用的 Chromium 浏览器（不再写死 msedge.exe）。
 
-# 判定为"未登录"的 URL 特征
-_LOGIN_HINTS = ("/login", "/sign_in", "/signin", "/users/sign_in", "/sso", "saml", "oauth")
+    见 app/browser.py：自动挑系统默认浏览器，也可用 config.BROWSER 指定。
+    """
+    from . import browser as _browser
+    return _browser.find()
 
-_EDGE_CANDIDATES = [
-    Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-    Path(r"C:\Program Files\Microsoft\EdgeCore\msedge.exe"),
-]
+
+def find_webview2() -> Path | None:
+    """定位 WebView2 运行时（界面渲染用的 msedgewebview2.exe）。
+
+    ★ WebView2 与 Edge 浏览器是**两个独立组件**：企业机器上完全可能
+      「有 WebView2 没有 Edge」—— 此时界面照常打开、不报任何错，
+      但跳转与 Teams/EC 全部失灵。所以要分开检测。
+    """
+    for base in (os.environ.get("PROGRAMFILES(X86)"),
+                 os.environ.get("PROGRAMFILES"),
+                 os.environ.get("LOCALAPPDATA")):
+        if not base:
+            continue
+        p = (Path(base) / "Microsoft" / "EdgeWebView" / "Application"
+             / "msedgewebview2.exe")
+        try:
+            if p.is_file():
+                return p
+        except OSError:
+            continue
+    #  注册表登记的 WebView2 版本目录（pv 值）
+    try:
+        import winreg
+        for root, sub in (
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"
+             r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r"SOFTWARE\Microsoft\EdgeUpdate\Clients"
+             r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+            (winreg.HKEY_CURRENT_USER,
+             r"SOFTWARE\Microsoft\EdgeUpdate\Clients"
+             r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+        ):
+            try:
+                with winreg.OpenKey(root, sub) as k:
+                    pv, _ = winreg.QueryValueEx(k, "pv")
+                if pv:
+                    for base in (os.environ.get("PROGRAMFILES(X86)"),
+                                 os.environ.get("PROGRAMFILES")):
+                        if not base:
+                            continue
+                        p = (Path(base) / "Microsoft" / "EdgeWebView"
+                             / "Application" / str(pv) / "msedgewebview2.exe")
+                        if p.is_file():
+                            return p
+            except OSError:
+                continue
+    except Exception as e:
+        log.debug("读注册表找 WebView2 失败：%s", e)
+    return None
+
+
+def browser_health(profile_dir: Path | None = None) -> dict:
+    """浏览器依赖体检 —— 缺什么就如实说，不静默降级。
+
+    返回 {ok, edge, edge_path, webview2, webview2_path, profile, profile_ready,
+          missing:[...], message}
+    """
+    try:
+        from . import config
+        prof = Path(profile_dir or config.BROWSER_PROFILE_DIR)
+    except Exception:
+        prof = Path(profile_dir) if profile_dir else None
+
+    exe = find_edge()
+    wv2 = find_webview2()
+    prof_ready = bool(prof and prof.is_dir())
+
+    #  ★ 只有「真的缺组件」才算不健康。
+    #    独立配置目录是**首次启动时自动创建**的，全新安装上它本来就不存在 ——
+    #    把它算进 missing 会让每个新用户开机就看到一条假告警。
+    #    （实测踩到：源码模式下 profile 不存在 → 误报。）
+    missing: list[str] = []
+    if exe is None:
+        missing.append("browser")
+    if wv2 is None:
+        missing.append("webview2")
+
+    from . import browser as _browser
+    bname = _browser.display_name(exe)
+
+    if not missing:
+        msg = f"浏览器依赖正常（{bname}）"
+    elif "browser" in missing:
+        #  缺浏览器的影响远不止「跳转」——必须说清楚，且不再点名 Edge
+        msg = ("没找到任何 Chromium 内核浏览器（Edge / Chrome / Brave / Chromium）："
+               "点击跳转、Teams、EC 名单、附件下载都会不可用（界面仍可打开）。"
+               "装其中任意一个即可，也可用 config.BROWSER / 环境变量 MBPK_BROWSER 指定")
+    else:
+        msg = "没找到 WebView2 运行时装（界面渲染需要它）"
+
+    return {
+        "ok": not missing,
+        #  兼容旧键名（外部脚本可能在用），但语义已是「任意 Chromium 浏览器」
+        "edge": exe is not None,
+        "edge_path": str(exe) if exe else "",
+        "browser": exe is not None,
+        "browser_name": bname,
+        "browser_path": str(exe) if exe else "",
+        "webview2": wv2 is not None,
+        "webview2_path": str(wv2) if wv2 else "",
+        "profile": str(prof) if prof else "",
+        #  仅作诊断：False 不代表有问题（首次运行前就是 False）
+        "profile_ready": prof_ready,
+        "missing": missing,
+        "message": msg,
+    }
 
 
 # ======================== Edge 进程管理 ========================
-
-def find_edge() -> Path | None:
-    """定位 msedge.exe。"""
-    for p in _EDGE_CANDIDATES:
-        if p.exists():
-            return p
-    found = shutil.which("msedge")
-    return Path(found) if found else None
-
 
 def _port_file(profile_dir: Path) -> Path:
     return profile_dir / "DevToolsActivePort"
@@ -104,6 +205,23 @@ def launch_edge(profile_dir: Path,
         raise FileNotFoundError("未找到 msedge.exe，请确认已安装 Microsoft Edge")
 
     profile_dir.mkdir(parents=True, exist_ok=True)
+
+    #  ★ 启动前先把「正在退出但没退完」的旧实例送走完。
+    #    踩过的坑：上一批操作（如全量收取）的 Edge 正在退出时立刻
+    #    起新实例 —— 新进程看见同 profile 的单实例锁还在旧进程手里，
+    #    会把启动参数转手递过去然后自己退出，调试端口文件永远
+    #    写不出来 → 「等待 Edge 调试端口超时」。
+    #    close_profile_browser 只认本 profile 的命令行，
+    #    用户日常在用的 Edge 不受影响。
+    if not is_edge_running(profile_dir):
+        try:
+            from app import cdp
+            if cdp.list_profile_pids(profile_dir):
+                log.info("旧 Edge 实例还没退完，先收掉再起新的")
+                cdp.close_profile_browser(profile_dir)
+        except Exception as e:
+            log.debug("清旧实例失败（不挡启动）：%s", e)
+
     # 清掉上一次可能残留的端口文件，避免误判
     try:
         _port_file(profile_dir).unlink(missing_ok=True)
@@ -115,7 +233,10 @@ def launch_edge(profile_dir: Path,
         "--no-first-run",
         "--no-default-browser-check",
         # 避免登录了微软账号后跳出多余的引导
-        "--disable-features=msEdgeSidebarV2,msEdgeLaunchOnLogin,msShowFeatureSplash",
+        # （EdgeOpenExternalProtocolPrompt：不再询问「是否用外部应用打开」）
+        "--disable-features=msEdgeSidebarV2,msEdgeLaunchOnLogin,"
+        "msShowFeatureSplash,msEdgeAppLauncher,"
+        "EdgeOpenExternalProtocolPrompt",
     ]
     if debug_port:
         flags.append("--remote-debugging-port=0")
@@ -147,164 +268,3 @@ def wait_for_devtools(profile_dir: Path, timeout: float = 45.0) -> int:
                 return port
         time.sleep(0.4)
     raise TimeoutError("等待 Edge 调试端口超时")
-
-
-# ======================== 登录（真人操作） ========================
-
-def open_login_browser() -> subprocess.Popen:
-    """打开真实 Edge 供你**手动登录**。
-
-    注意：这里只启动浏览器，**不连接 CDP、不注入脚本**，
-    确保登录过程与人类操作完全一致。
-    """
-    config.ensure_dirs()
-    return launch_edge(config.BROWSER_PROFILE_DIR, headless=False, url=_HOME, debug_port=True
-    )
-
-
-def close_browser(proc: subprocess.Popen | None) -> None:
-    if proc is None:
-        return
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-    except Exception:
-        pass
-
-
-# ======================== 取数会话 ========================
-
-class Session:
-    """取数会话：连接到一个真实 Edge 实例，只读页面。
-
-    与之前接口保持一致（open / page / close），方便上层直接调用。
-    """
-
-    def __init__(self, headless: bool = True, profile_dir: Path | None = None) -> None:
-        self.headless = headless
-        self.profile_dir = Path(profile_dir or config.BROWSER_PROFILE_DIR)
-        self._pw: Playwright | None = None
-        self._browser: Browser | None = None
-        self._proc: subprocess.Popen | None = None
-        self._owned = False          # 这个 Edge 是否由本会话启动
-
-    # ---------- 启动 ----------
-
-    def open(self) -> "Session":
-        config.ensure_dirs()
-
-        if is_edge_running(self.profile_dir):
-            log.info("复用已在运行的 Edge 实例")
-        else:
-            self._proc = launch_edge(self.profile_dir, headless=self.headless, debug_port=True
-            )
-            self._owned = True
-
-        port = wait_for_devtools(self.profile_dir)
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        return self
-
-    def close(self) -> None:
-        # 只断开连接；**绝不去关闭用户的浏览器**
-        try:
-            if self._pw is not None:
-                self._pw.stop()
-        except Exception:
-            pass
-        self._pw = None
-        self._browser = None
-        # 仅当我们自己启动的实例才回收
-        if self._owned:
-            close_browser(self._proc)
-        self._proc = None
-        self._owned = False
-
-    def __enter__(self) -> "Session":
-        self.open()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-    # ---------- 页面 ----------
-
-    def _context(self):
-        if self._browser is None:
-            raise RuntimeError("会话尚未打开")
-        if self._browser.contexts:
-            return self._browser.contexts[0]
-        return self._browser.new_context()
-
-    def page(self) -> Page:
-        ctx = self._context()
-        pages = [p for p in ctx.pages if not p.is_closed()]
-        return pages[0] if pages else ctx.new_page()
-
-    # ---------- 登录状态 ----------
-
-    def is_logged_in(self) -> bool:
-        return check_logged_in(self.page())
-
-
-def check_logged_in(page: Page, settle_ms: int = 1500) -> bool:
-    """访问学生首页并判断是否已登录。"""
-    try:
-        page.goto(_HOME, wait_until="domcontentloaded")
-        page.wait_for_timeout(settle_ms)
-    except Exception as e:
-        log.warning("访问首页失败：%s", e)
-        return False
-    return looks_logged_in(page)
-
-
-def looks_logged_in(page: Page) -> bool:
-    """仅根据当前 URL 与页面内容判断，不发起导航。"""
-    try:
-        url = (page.url or "").lower()
-        if any(h in url for h in _LOGIN_HINTS):
-            return False
-        if "/student/" not in url:
-            return False
-        return len(page.inner_text("body").strip()) > 150
-    except Exception:
-        return False
-
-
-# ======================== 诊断 ========================
-
-def diagnose() -> dict:
-    """检查浏览器环境，用于排查登录问题。"""
-    out: dict = {"edge": None, "running": False, "webdriver": None,
-                 "title": "", "url": "", "logged_in": False, "error": ""}
-    exe = find_edge()
-    out["edge"] = str(exe) if exe else None
-    if exe is None:
-        out["error"] = "未找到 msedge.exe"
-        return out
-
-    s = Session(headless=True)
-    try:
-        s.open()
-        out["running"] = True
-        page = s.page()
-        # 关键：确认自动化指纹为 false
-        try:
-            out["webdriver"] = page.evaluate("() => navigator.webdriver")
-            out["ua"] = page.evaluate("() => navigator.userAgent")
-        except Exception:
-            pass
-        page.goto(_HOME, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-        out["title"] = page.title()
-        out["url"] = page.url
-        out["logged_in"] = looks_logged_in(page)
-    except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
-    finally:
-        s.close()
-    return out
-
-
-def json_dumps(data) -> str:
-    return json.dumps(data, ensure_ascii=False, indent=2)

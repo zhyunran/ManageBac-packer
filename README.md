@@ -1,7 +1,7 @@
 # ManageBac-packer
 
 - 整合 ManageBac 与希悦校园数据的 Windows 桌面小组件，面向国际部 / 国际学校学生。
-- 如有 issues，欢迎提交至 zyr712zh123@gmail.com
+- 如有 issues，欢迎提交至 https://github.com/zhyunran/ManageBac-packer/issues
 - 如需 iOS 版本，见 [CampusDesk](https://github.com/xuanqiwang645/CampusDesk)
 
 ---
@@ -159,7 +159,6 @@ Teams 频道里的消息与附件。EC（English Corner）是频道里每天发�
 | 链接安全校验 | `app/safelink.py` |
 | 手动完成标记 | `app/manual_done.py` |
 | 数据备份导出/导入 | `app/backup.py` |
-| 本地网页版看板 | `app/server.py` |
 
 ### 界面
 
@@ -239,3 +238,11 @@ PyInstaller（GPL 2.0 + 例外条款）。
 - @hs89n5km86-coder 提供灵感、建议与支持
 - Teams 读取思路参考了 [teams-web-chat-exporter](https://github.com/gediz/teams-web-chat-exporter)
   与 [teams-api](https://github.com/Maxim-Mazurok/teams-api)
+
+---
+
+## 第三方组件
+
+- **KLineChart v10.0.3**（`web/vendor/klinecharts.min.js`）
+  Copyright (c) 2019 lihu · Apache License 2.0
+  用于「成绩走势」的蜡烛图绘制。许可证见 https://www.apache.org/licenses/LICENSE-2.0

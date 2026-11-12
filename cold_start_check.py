@@ -360,8 +360,9 @@ def main() -> int:
                      "可以手动建一个，或者直接双击 widget.py 所在目录")
         except ImportError:
             # 没有 pywin32 —— 用 PowerShell 代替
-            try:
-                ps = subprocess.run(["powershell", "-NoProfile", "-Command",
+            #  ★ 走 app.proc.run：直接 subprocess 会弹 PowerShell 黑框
+            _proc_run = __import__("app.proc", fromlist=["run"]).run
+            ps = _proc_run(["powershell", "-NoProfile", "-Command",
                      "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
                      "$s=New-Object -ComObject WScript.Shell;"
                      "Get-ChildItem \"$env:USERPROFILE\\Desktop\\*.lnk\" "
@@ -372,17 +373,17 @@ def main() -> int:
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace", timeout=30,
                 )
-                out = (ps.stdout or "").strip()
-                if out:
-                    for line in out.splitlines():
-                        parts = line.split("|")
-                        ok(f"{parts[0]}")
-                        if len(parts) > 1:
-                            ok(f"  目标  {parts[1]}")
-                else:
-                    warn("桌面没有小组件快捷方式")
-            except Exception as e:
-                warn(f"检查快捷方式失败：{e}")
+            out = (ps.stdout or "").strip()
+            if out:
+                for line in out.splitlines():
+                    parts = line.split("|")
+                    ok(f"{parts[0]}")
+                    if len(parts) > 1:
+                        ok(f"  目标  {parts[1]}")
+            else:
+                warn("桌面没有小组件快捷方式")
+        except Exception as e:
+            warn(f"检查快捷方式失败：{e}")
 
     # ── 9. 开机启动（Windows 特有）──
     head("9. 开机启动")

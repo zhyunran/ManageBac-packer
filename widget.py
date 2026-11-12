@@ -10,9 +10,11 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -31,13 +33,62 @@ import webview  # noqa: E402
 
 from app import config, pipeline  # noqa: E402
 
+#  打开链接的硬超时（秒）。卡住就返回「超时」，界面据此弹窗，
+#  而不是「点了三分钟什么都没有」。
+OPEN_TIMEOUT = 25.0
+
+#  「正在打开」的运行状态。js_api 是**分线程**派发的，
+#  所以调用 open_url 的同时界面还能轮询 open_progress 显示已耗时。
+_OPEN_LOCK = threading.Lock()
+_OPEN: dict = {
+    "seq": 0,
+    "running": False,
+    "url": "",
+    "started": 0.0,
+    "elapsed": 0.0,
+    "ok": None,
+    "how": "",
+    "error": "",
+    "fallback": False,
+    "note": "",
+    "busy_rejections": 0,
+}
+
 # ---------------- 日志 ----------------
 config.ensure_dirs()
+from logging.handlers import RotatingFileHandler  # noqa: E402
+
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.FileHandler(config.LOG_DIR / "widget.log", encoding="utf-8")],
+    handlers=[
+        RotatingFileHandler(
+            config.LOG_DIR / "widget.log",
+            maxBytes=1048576,
+            backupCount=5,
+            encoding="utf-8",
+        )
+    ],
 )
 log = logging.getLogger("mb")
+
+# ── 崩溃捕获 ──────────────────────────────────────────────
+#  ★ 必须尽早安装 ★
+#    装在创建窗口之前：组网、WebView2、浏览器启动任何一个环节崩，
+#    都能留下报告。装晚了就等于没装。
+from app import crashlog as _crash        # noqa: E402
+
+_crash.install(log)
+#  ★ 先读上次、再写本次 ★ begin_run() 内部保证顺序，
+#    直接调 previous_crash() 会读到刚写的自己（每次启动都误报）。
+_PREV_CRASH = _crash.begin_run()          # 上次是否异常退出（启动完再提示）
+
+#  单文件包每次启动都会解包到 %TEMP%/_MEIxxx，被强杀时不会自删。
+#  启动顺手清掉一小时以前的（跳过本进程自己的，否则会把自己删掉）。
+try:
+    from app import cleanup as _cleanup
+    _cleanup.prune_temp_extract()
+except Exception as _e:
+    log.debug("清理临时解包残留失败：%s", _e)
 
 # pywebview 在 Windows 上读取键盘修饰键状态时有个已知递归 bug，
 # 每当窗口获得焦点就会刷一大段 "maximum recursion depth exceeded" 噪音。
@@ -93,6 +144,30 @@ def _check_js_api_safe(api_obj: object) -> None:
             log.info("js_api 自检通过")
     except Exception as e:
         log.warning("js_api 自检异常：%s", e)
+
+
+def _digest_history(digest_mod) -> list:
+    """晚报历史列表（按日期从旧到新）。
+
+    界面上的「上一期 / 下一期 / 回到最新 / 往期按钮行」都靠它。
+    两个接口（最新一期、按日期取）必须返回**同一份**，
+    否则从最新切到往期之后导航就断了。
+    """
+    rows: list = []
+    try:
+        for x in digest_mod.list_all(60):
+            d = x.get("date")
+            if not d:
+                continue
+            rows.append({
+                "date": d,
+                "weekday": x.get("weekday") or "",
+                "counts": x.get("counts") or {},
+            })
+    except Exception:
+        return []
+    rows.sort(key=lambda r: r["date"])
+    return rows
 
 
 class Api:
@@ -543,13 +618,23 @@ class Api:
             return {"ok": False, "at": "", "nTeams": 0, "nChannels": 0,
                     "nPosts": 0, "nReplies": 0, "teams": [], "error": str(e)}
 
-    def tm_crawl(self, scroll=10):
+    def tm_crawl(self, scroll=10, deep=False):
         """全量抓取：所有团队 → 所有频道 → 消息。
 
         这个函数**不需要你在 Teams 里点任何东西** ——
         程序自己进每个团队收集频道，再用深度链接逐个频道取数。
 
         17 个频道实测约 280 秒，所以放后台线程跑，界面不卡。
+
+        ★ deep=True 是**深度归档**：
+          默认的抓取是增量的 —— 每个频道滚到「整屏都是抓过的消息」就停，
+          所以本地缓存只攒「程序运行时出现过的新消息」。
+          代价是老消息永远进不来：搜「林里」搜不到某条 9 月的老消息，
+          不是因为搜索坏了，是它从没被抓过。
+
+          deep 模式会一直滚到最早（每频道最多 160 轮 / 420 秒，
+          总预算 90 分钟），把历史补进缓存。抓完仍然是 merge，
+          只增不减。第一次用会很久，之后日常用默认增量即可。
         """
         if getattr(self, "_tm_crawling", False):
             return {"ok": True, "already": True}
@@ -567,12 +652,14 @@ class Api:
         box: dict = {}
 
         def progress(msg: str) -> None:
-            self._tm_progress = msg            # 供 tm_crawl_status 读取
+            #  供 tm_crawl_status 读取
+            self._tm_progress = ("深度归档：" + msg) if deep else msg
 
         def work() -> None:
             try:
                 from app import teams_crawl
-                r = teams_crawl.crawl_all(scroll_rounds=n, progress=progress)
+                r = teams_crawl.crawl_all(scroll_rounds=n, progress=progress,
+                                          deep=bool(deep))
                 teams_crawl.save({
                     "ok": True,
                     "partial": r.get("partial", False),
@@ -593,6 +680,27 @@ class Api:
         t.start()
         t.join(timeout=1500)
         return box or {"ok": False, "reason": "抓取超时"}
+
+    def tm_crawl_cancel(self):
+        """停止正在进行的 Teams 抓取。
+
+        深度归档最长要跑 90 分钟，以前完全停不下来。
+        这里只是置一个标志，抓取线程在下一个检查点（秒级）就会收工，
+        已经抓到的消息**照常保存**（crawl 的 merge 只增不减）。
+        """
+        try:
+            from app import teams_crawl
+        except Exception:
+            try:
+                import app.teams_crawl as teams_crawl
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+        try:
+            teams_crawl.request_cancel()
+            log.info("收到停止请求：正在让 Teams 抓取收工")
+            return {"ok": True, "message": "已请求停止，正在收尾…"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def tm_crawl_status(self):
         """全量抓取是否在跑 + 当前进度文字。"""
@@ -733,6 +841,48 @@ class Api:
             log.warning("晚报状态读取失败：%s", e)
             return {"ok": False, "unread": False, "has_any": False}
 
+    # ---- 成绩目标模拟（0.5.2）----
+    def goal_sim(self, course: str = "", target: float = 0):
+        """「这门课想考到 X 分，剩下的作业得拿多少」。
+
+        类别权重与成绩直接取自抓取结果（`CategoryAverage`），
+        不额外请求、不猜任何默认值。
+
+         ★ 只算「能算的」：权重合计不是 100%、或一个类别都没读到时，
+           如实返回算不了 —— 不拿个假数字糊弄。
+        """
+        try:
+            from app import goal
+
+            name = (course or "").strip()
+            if not name:
+                return {"ok": False, "reason": "没指定课程"}
+
+            snap = pipeline.snapshot()
+            hit = None
+            for c in (snap.get("courses") or []):
+                if str(c.get("name") or "").strip() == name:
+                    hit = c
+                    break
+            if hit is None:
+                return {"ok": False, "reason": f"没找到课程「{name}」"}
+
+            cats = []
+            for cat in (hit.get("categories") or []):
+                cats.append({
+                    "name": cat.get("name") or "",
+                    "weight": cat.get("weight"),
+                    "percent": cat.get("percent"),
+                    "graded": bool(cat.get("graded")),
+                })
+            r = goal.simulate(cats, target)
+            r["course"] = name
+            r["overall_percent"] = hit.get("overall_percent")
+            return r
+        except Exception as e:
+            log.warning("目标模拟失败：%s", e)
+            return {"ok": False, "reason": str(e)}
+
     def digest_latest(self):
         """打开晚报面板：返回最近一份（若已过 21:00 且今天还没生成，就现场生成）。"""
         try:
@@ -741,27 +891,45 @@ class Api:
             made = digest.ensure_today(data)
             cur = made or digest.latest()
             if not cur:
-                return {"ok": False, "error": "还没有晚报（工作日晚 9 点后自动生成）"}
+                return {"ok": False,
+                        "error": "还没有晚报（工作日晚 9 点后自动生成）"}
             cur = dict(cur)
             cur["ok"] = True
-            cur["history"] = [
-                {"date": x.get("date"), "weekday": x.get("weekday"),
-                 "counts": x.get("counts") or {}}
-                for x in digest.list_all(14)
-            ]
+            hist = _digest_history(digest)
+            cur["history"] = hist
+            cur["latest_date"] = (hist[-1]["date"] if hist
+                                  else cur.get("date", ""))
+            cur["is_latest"] = True
             return cur
         except Exception as e:
             log.warning("晚报读取失败：%s", e)
             return {"ok": False, "error": str(e)}
 
-    def digest_by_date(self, d: str = ""):
-        """按日期取某一期晚报（顶部可翻历史）。"""
+    def digest_by_date(self, d: str):
+        """按日期取某一期晚报（面板里可翻历史）。
+
+        ★★ 必须带上 history 与 latest_date ★★
+
+          这里原来只返回那一期本身，**不带 history**。
+          而界面上的「往期晚报」按钮行是靠 history 才渲染的 ——
+          于是点进往期之后那一行整块消失：既回不到最新，也换不到别的日期，
+          面板就此卡在某一期上。（用户反馈：「点击往次后无法跳转到其他时间 /
+          当前晚报。原因：无按钮。」）
+
+          现在把同一份完整列表一起返回，界面无论停在哪一期，
+          导航按钮都在。
+        """
         try:
             from app import digest
+            hist = _digest_history(digest)
             for x in digest.list_all(60):
                 if x.get("date") == d:
                     out = dict(x)
                     out["ok"] = True
+                    out["history"] = hist
+                    latest = hist[-1]["date"] if hist else ""
+                    out["latest_date"] = latest
+                    out["is_latest"] = bool(latest) and d == latest
                     return out
             return {"ok": False, "error": "找不到这一期的晚报"}
         except Exception as e:
@@ -777,6 +945,122 @@ class Api:
             return {"ok": False, "error": str(e)}
 
     # ---- 窗口 ----
+    # ── 浏览器选择（0.5.2）──────────────────────────────
+    #  ★ 原来只能手改 data/browser.json，普通用户根本不知道有这个文件。
+    #    现在设置界面里就能选：自动 / Edge / Chrome / Brave / Chromium，
+    #    以及「复用日常浏览器的登录态」。
+    def browser_get(self):
+        try:
+            #  widget.py 是顶层脚本（不是包），必须从 app 包导入
+            import app.browser as b              # noqa: F401
+        except Exception as _e:
+            return {"ok": False, "error": f"浏览器模块不可用：{_e}"}
+
+        inst = []
+        try:
+            inst = [{"key": k, "name": n, "path": str(p)}
+                    for k, n, p in b.installed()]
+        except Exception:
+            pass
+        cur = str(getattr(config, "BROWSER", "auto") or "auto")
+        reuse = bool(getattr(config, "BROWSER_REUSE_PROFILE", False))
+        try:
+            active = b.find()
+        except Exception:
+            active = None
+        #  ★ 复用登录能不能真生效，取决于那个浏览器有没有在运行 ★
+        #    在运行 → 它的 user-data-dir 被占用，我们只能退回独立 profile。
+        #    这件事以前只写在日志里，用户在界面上完全看不到，
+        #    只会觉得「我开了复用，怎么还要重新登录」。
+        reuse_note = ""
+        if reuse and active is not None:
+            try:
+                from app import cdp as _cdp
+                real = _cdp._user_data_dir_of(active)
+                if real and _cdp._profile_in_use(real):
+                    reuse_note = (f"{b.display_name(active)} 正在运行，"
+                                  "本次会退回独立 profile 并需要单独登录一次；"
+                                  "想直接复用登录，请先完全退出它")
+                elif real:
+                    reuse_note = f"会直接使用 {b.display_name(active)} 的登录态"
+                else:
+                    reuse_note = "没找到日常浏览器的数据目录，会退回独立 profile"
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "browser": cur,
+            "reuse": reuse,
+            "reuse_note": reuse_note,
+            "installed": inst,
+            "active": b.display_name(active) if active else "",
+            "active_path": str(active) if active else "",
+            "default": b.default_browser_key() if hasattr(b, "default_browser_key") else "",
+        }
+
+    def browser_set(self, browser="auto", reuse=False):
+        """写 data/browser.json 并立即生效（下一轮抓取就换浏览器）。"""
+        import json
+        try:
+            key = str(browser or "auto").strip() or "auto"
+            val = bool(reuse)
+            p = config.DATA_DIR / "browser.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"browser": key, "reuse_profile": val},
+                                    ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+            #  运行时立刻生效，不用重启
+            config.BROWSER = key
+            config.BROWSER_REUSE_PROFILE = val
+            log.info("浏览器设置已保存：%s / 复用登录=%s", key, val)
+            return {"ok": True, "browser": key, "reuse": val}
+        except Exception as e:
+            log.warning("保存浏览器设置失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+    # ── 崩溃诊断（0.5.2）────────────────────────────────
+    def crash_status(self):
+        """有没有崩溃报告、上次是否异常退出。"""
+        try:
+            rep = _crash.latest_report()
+            #  ★ 必须用启动时捕获的结果（_PREV_CRASH），不能现读 ★
+            #    运行期间标记文件是「本进程」写的，现读会恒为 True ——
+            #    设置面板就会一直显示「上次运行是异常退出」，
+            #    而实际上程序好端端地开着。
+            prev = _PREV_CRASH
+            return {
+                "ok": True,
+                "dir": str(_crash.crash_dir()),
+                "latest": str(rep) if rep else "",
+                "latest_name": rep.name if rep else "",
+                "latest_size": rep.stat().st_size if rep else 0,
+                "previous_crash": prev is not None,
+                "previous_at": (prev or {}).get("at", ""),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def crash_make(self):
+        """手动生成一份诊断报告（没崩但想让作者看看到底哪里不对）。"""
+        try:
+            p = _crash.make_now("用户手动生成")
+            if not p:
+                return {"ok": False, "error": "生成失败，可能没有写权限"}
+            log.info("已生成诊断报告：%s", p)
+            return {"ok": True, "path": str(p), "name": p.name,
+                    "size": p.stat().st_size}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def crash_open(self):
+        """打开崩溃报告所在文件夹。"""
+        try:
+            _open_crash_dir()
+            return {"ok": True, "dir": str(_crash.crash_dir())}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def minimize(self):
         try:
             self._window.minimize()
@@ -812,8 +1096,7 @@ class Api:
                 FormWindowState, Screen)
             cur = getattr(FormWindowState, "Maximized")
             if n.WindowState == cur:
-                n.WindowState = getattr(FormWindowState, "Normal")
-                return "normal"
+                return "max"
             #  无边框窗最大化默认铺满整屏（连任务栏一起盖）——
             #  先把边界框到工作区。和 win_effects.maximize 同一副药。
             try:
@@ -858,6 +1141,9 @@ class Api:
         except Exception:
             pass
         try:
+            #  ★ os._exit 不跑 atexit，必须自己清掉「未正常结束」标记，
+            #    否则下次启动会误报「上次异常退出」★
+            _crash.mark_clean()
             os._exit(0)          # noqa: SLF001  界面都关了，直接走
         except Exception:
             return {"ok": True}
@@ -928,8 +1214,9 @@ class Api:
         #  ── 切形态 ──
         if key == "shape":
             shape = str(value or "full")
-            if shape not in _WINDOW_PRESETS:
-                return {"ok": False, "error": f"没有这个形态：{shape}"}
+            if shape != "full":
+                return {"ok": False,
+                        "error": "小浮窗形态已在 0.5.2 移除，窗口只有最大化与最小化两种状态"}
             self._shape = shape
             sizes = _window_sizes(shape)
 
@@ -1153,57 +1440,91 @@ class Api:
 
     # ---- 跳转：用**组件自己的** Edge（已经登录过）----
     def open_url(self, url: str):
-        """打开链接 ——  先过安全校验，阻止「退出/删除/上传/提交」类操作。
+        """打开链接 —— 带进度、防重复、超时会如实报错。
 
-        参考 CampusDesk 的做法：只允许「查看页面」类链接通过。
-        这不是防坏人，是**防解析出错** —— 页面结构一变，
-        可能顺手抓到旁边的「删除」按钮链接，用户点下去就出事了。
+        【为什么现在需要这一套】
+          点击之后界面原本没有任何反馈：成功与否、要等多久，全不知道。
+          人遇到「点了没反应」的第一反应就是再点几次 —— 实测一次操作里
+          同一个链接被打开了十几次，Edge 被拖出一屏进程。
+          而如果里面的 PowerShell 枚举恰好卡住，调用会一直不返回，
+          界面就是「点了三分钟什么都没有」。
+
+          现在：
+            · 状态记在 _OPEN 里，界面用 open_progress() 轮询，能显示
+              「正在打开…… 已耗时 N 秒」
+            · 上一次还没结束，新的请求直接拒绝并告诉界面「请稍候」
+            · 真正的工作放在线程里，主线程带 25 秒硬超时 ——
+              卡住就返回「超时」，界面据此弹窗，而不是无限等待
 
         ★ 用组件自己的 Edge profile 打开（不是系统默认浏览器）：
           抓数据用的就是那个 profile，登录态在里面 ——
           所以点进去直接就是登录状态，不用再输一遍账号密码。
-
-          自己的 Edge 仍然照常能用：两个实例用不同的 user-data-dir，
-          Edge 原生支持并存。
         """
         if not url:
-            return {"ok": False}
+            return {"ok": False, "error": "没有可打开的链接"}
 
-        try:
-            from app import safelink
+        with _OPEN_LOCK:
+            if _OPEN["running"]:
+                _OPEN["busy_rejections"] += 1
+                waited = round(time.time() - _OPEN["started"], 1)
+                log.info("打开被拒：上一次还没结束（已耗时 %.1f 秒）", waited)
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "elapsed": waited,
+                    "error": f"正在打开上一个链接，请稍候（已 {waited:.0f} 秒）",
+                }
+            _OPEN.update(
+                seq=_OPEN["seq"] + 1,
+                running=True,
+                url=url,
+                started=time.time(),
+                elapsed=0.0,
+                ok=None,
+                how="",
+                error="",
+                fallback=False,
+                note="",
+            )
+            seq = _OPEN["seq"]
 
-            safe = safelink.sanitize(url)
-        except Exception as e:
-            log.warning("链接校验异常：%s", e)
-            safe = url                      # 校验器本身出错时不拦（保功能）
+        box: dict = {}
 
-        if not safe:
-            log.warning("已阻止打开不安全链接：%s", url[:160])
-            return {"ok": False, "blocked": True,
-                    "error": "这个链接可能是「退出/删除」类操作，为安全起见没有打开"}
+        def _work() -> None:
+            try:
+                box["r"] = self._do_open(url)
+            except Exception as e:
+                box["r"] = {"ok": False, "error": str(e)}
 
-        #  ① 首选：组件自己的 Edge（带登录态）
-        try:
-            from app import opener
-            r = opener.open_in_own_profile(safe, reuse=True)
-            if r.get("ok"):
-                log.info("打开（%s）：%s", r.get("how"), safe[:140])
-                return {"ok": True, "how": r.get("how")}
-            log.warning("自带 profile 打开失败（%s），退回系统浏览器",
-                        r.get("error") or r.get("how"))
-        except Exception as e:
-            log.warning("自带 profile 打开异常，退回系统浏览器：%s", e)
+        th = threading.Thread(target=_work, name="open-url", daemon=True)
+        th.start()
+        th.join(OPEN_TIMEOUT)
 
-        #  ② 兜底：系统默认浏览器（至少能打开，虽然要重新登录）
-        try:
-            webbrowser.open(safe, new=2)
-            log.info("打开（系统浏览器）：%s", safe[:140])
-            return {"ok": True, "how": "system"}
-        except Exception as e:
-            log.warning("打开失败：%s", e)
-            return {"ok": False, "error": str(e)}
+        if th.is_alive():
+            result = {
+                "ok": False,
+                "timeout": True,
+                "elapsed": OPEN_TIMEOUT,
+                "error": f"打开超时：{OPEN_TIMEOUT:.0f} 秒没有响应。可能是浏览器或系统调用卡住了。",
+            }
+            log.warning("打开超时（%.0f 秒）：%s", OPEN_TIMEOUT, url[:120])
+        else:
+            result = box.get("r") or {"ok": False, "error": "没有拿到结果"}
 
-    # ---- 数据与备份（导出 / 导入）----
+        with _OPEN_LOCK:
+            _OPEN.update(
+                running=False,
+                elapsed=round(time.time() - _OPEN["started"], 1),
+                ok=bool(result.get("ok")),
+                how=result.get("how", ""),
+                error=result.get("error", ""),
+                fallback=bool(result.get("fallback")),
+                note=result.get("note", ""),
+            )
+            result["seq"] = seq
+            result["elapsed"] = _OPEN["elapsed"]
+        return result
+
     def backup_status(self):
         """给「数据与备份」面板用：当前有多少可备份的数据。"""
         try:
@@ -1394,6 +1715,8 @@ class Api:
         return {"ok": True, "started": True}
 
     def _dl_file_item(self, item: dict) -> None:
+        from app import dlprogress
+        owner = dlprogress.begin(1)
         try:
             from app import files
 
@@ -1412,7 +1735,9 @@ class Api:
             if res.get("ok"):
                 size = res.get("size") or 0
                 self._notify({"ok": True, "count": 1, "total": 1,
-                              "folder": str(root)}, res.get("name", ""),
+                              "folder": str(root),
+                              "skipped": bool(res.get("skipped"))},
+                             res.get("name", ""),
                              extra=f"{size/1024:.0f} KB")
             else:
                 self._notify({"ok": False, "count": 0, "total": 1,
@@ -1422,6 +1747,9 @@ class Api:
             log.exception("下载文件项失败")
             self._notify({"ok": False, "count": 0, "total": 1,
                           "folder": "", "error": str(e)}, item.get("name", ""))
+        finally:
+            if owner:
+                dlprogress.end()
 
     def files_download_all(self, cid: str, fid: str = "",
                            cls_name: str = "", folder: str = ""):
@@ -1445,6 +1773,8 @@ class Api:
 
     def _dl_items_all(self, items: list, cls_name: str,
                       folder: str) -> None:
+        from app import dlprogress
+        owner = dlprogress.begin(len(items))
         try:
             from app import files
 
@@ -1456,23 +1786,29 @@ class Api:
                         root = root / files.safe_name(part)
 
             ok = 0
+            skipped = 0
             for it in items:
                 try:
                     r = files.download_item(it, dest_dir=root)
                     if r.get("ok"):
                         ok += 1
+                        if r.get("skipped"):
+                            skipped += 1
                 except Exception as e:
                     log.warning("下载 %s 失败：%s", it.get("name"), e)
 
             self._notify({"ok": ok > 0, "count": ok, "total": len(items),
-                          "folder": str(root)},
+                          "folder": str(root),
+                          "skipped": skipped},
                          folder or cls_name or "资料")
         except Exception as e:
             log.exception("批量下载失败")
             self._notify({"ok": False, "count": 0, "total": len(items),
                           "folder": "", "error": str(e)}, "资料")
+        finally:
+            if owner:
+                dlprogress.end()
 
-    # ---- 下载 ----
     def download_task(self, cid: str, tid: str, title: str = ""):
         """下载某任务的全部附件（后台线程，避免卡住界面）。"""
         threading.Thread(target=self._dl_task, args=(cid, tid, title), daemon=True
@@ -1605,7 +1941,376 @@ class Api:
 #    （不能用网页提示 —— 那也需要 WebView2 才能显示。）
 # ══════════════════════════════════════════════════════════════════
 
+    def browser_health(self):
+        """浏览器依赖体检：Edge / WebView2 / 独立配置目录。
+
+        ★ 为什么值得单独一个接口：`msedge.exe`（抓取与跳转）和 WebView2
+          运行时装（界面渲染）是**两个独立组件**。企业机器上「有 WebView2
+          没有 Edge」很常见 —— 此时界面照常打开、什么都不报错，但跳转、
+          Teams、EC 名单、附件下载会一起静默失灵。
+        """
+        try:
+            from app import edge
+            return edge.browser_health()
+        except Exception as e:
+            log.warning("浏览器体检失败：%s", e)
+            return {"ok": False, "error": str(e), "missing": []}
+
+    def search(self, query: str = "", course: str = "",
+               force: bool = False):
+        """搜索作业与成绩。
+
+        不区分大小写；多个关键词用空格分开表示「全部命中」。
+
+        force=True 时会**先按需重抓一次成绩**再返回 —— 老师登分之后会改分，
+        搜索给出的分数必须是当下的，不能是上一次抓取的缓存。
+        指定了科目就只重抓那一门（快），没指定就重抓全部（慢但完整）。
+        界面在连续输入时会用 force=False 复用它已有的数据，
+        避免每敲一个字母都往站点打一轮请求。
+        """
+        try:
+            from app import search as searchmod
+            return searchmod.run(
+                query=query, course=course,
+                force=bool(force),
+            )
+        except Exception as e:
+            log.warning("搜索失败：%s", e)
+            return {"ok": False, "error": str(e), "groups": [],
+                    "total": 0, "courses_total": 0, "refresh": {},
+                    "took_ms": 0}
+
+    def open_progress(self):
+        """给界面轮询的「正在打开」状态。
+
+        pywebview 的 js_api 调用是**分线程**派发的，所以调用 open_url
+        的同时还能再调这个接口 —— 界面因此能在等待期间显示已耗时。
+        """
+        with _OPEN_LOCK:
+            st = dict(_OPEN)
+        if st.get("running"):
+            st["elapsed"] = round(time.time() - st["started"], 1)
+        st["timeout"] = OPEN_TIMEOUT
+        st["ok"] = True
+        return st
+
+    def download_progress(self):
+        """当前的下载进度快照 —— 界面用轮询读它画进度条。
+
+        为什么要有这个接口：所有下载都是「起后台线程立刻返回」，
+        界面拿不到任何过程信息，于是用户以为没成功、反复点，造成重复下载
+        （实测同一份 203 MB 的 PDF 被下了两遍，SHA256 完全相同）。
+        """
+        try:
+            from app import dlprogress
+            dlprogress.abort_if_idle()
+            st = dlprogress.snapshot()
+            st["text"] = dlprogress.text_of(st)
+            return st
+        except Exception as e:
+            log.warning("读取下载进度失败：%s", e)
+            return {"running": False, "error": str(e), "text": ""}
+
+    def history_series(self, course: str = "", start: str = "",
+                       end: str = "", grain: str = "day"):
+        """逐日 GPA 序列（K 线 / 曲线用）。
+
+        · 横轴单位固定为「日」，可给起止日期；grain="week" 时按 ISO 周聚合
+        · course 为空表示总览；给了课程名则只看那一门
+        · 返回的每个点带 ``source``：``record``（真实快照）或
+          ``recalc``（按作业截止日期的回算值）—— 两者口径不同，界面必须区分
+        """
+        try:
+            from app import history
+            if (grain or "day").lower().startswith("w"):
+                return history.weekly_series(course or None, start, end)
+            return history.daily_series(course or None, start, end)
+        except Exception as e:
+            log.warning("读成绩历史失败：%s", e)
+            return {"ok": False, "error": str(e), "points": [],
+                    "course_names": [], "total": 0}
+
+    def db_stats(self):
+        """成绩历史库的规模：多大、多少条、覆盖到哪一天。
+
+        ★ 这个能力以前是「写好了但没人调」——`store.size_info()` 定义了
+          却零调用，属于最容易被误判成死代码的那种：其实它脚手架了一个
+          真实用途（让用户知道本地攒了多少历史、最早能回溯到哪天）。
+          现在接到界面上，并在库不健康时如实说明。
+        """
+        try:
+            from app import store
+            out = dict(store.size_info() or {})
+            health = dict(getattr(store, "DB_HEALTH", {}) or {})
+            out["ok"] = health.get("ok", True) is not False
+            if not out["ok"]:
+                out["note"] = health.get("note") or "成绩库异常"
+            out["exists"] = bool(config.DB_FILE.exists())
+            return out
+        except Exception as e:
+            return {"ok": False, "note": f"读不到历史库统计：{e}",
+                    "bytes": 0, "grades": 0, "snapshots": 0,
+                    "oldest": "", "newest": ""}
+
+    def _do_open(self, url):
+        """真正去打开一个链接（由 open_url 放进线程里调用）。
+
+        失败路径全部返回结构化结果，让界面能弹出具体原因，
+        而不是只留一个「没反应」。
+        """
+        try:
+            from app import safelink
+            safe = safelink.sanitize(url)
+        except Exception as e:
+            log.warning("链接校验异常：%s", e)
+            safe = url
+
+        if not safe:
+            log.warning("已阻止打开不安全链接：%s", url[:160])
+            return {"ok": False, "blocked": True,
+                    "error": "这个链接可能是「退出/删除」类操作，为安全起见没有打开"}
+
+        no_edge = False
+        try:
+            from app import opener
+            r = opener.open_in_own_profile(safe, reuse=True)
+            if r.get("ok"):
+                log.info("打开（%s）：%s", r.get("how"), safe[:140])
+                return {"ok": True, "how": r.get("how")}
+            no_edge = r.get("how") == "no_edge"
+            log.warning("自带 profile 打开失败（%s），退回系统浏览器",
+                        r.get("error") or r.get("how"))
+        except Exception as e:
+            log.warning("自带 profile 打开异常，退回系统浏览器：%s", e)
+
+        try:
+            webbrowser.open(safe, new=2)
+            log.info("打开（系统浏览器）：%s", safe[:140])
+            return {
+                "ok": True, "how": "system", "fallback": True,
+                "no_edge": no_edge,
+                "note": ("没找到 Microsoft Edge，已在系统默认浏览器打开，需要重新登录"
+                         if no_edge else
+                         "已在系统默认浏览器打开，需要重新登录"),
+            }
+        except Exception as e:
+            log.warning("打开失败：%s", e)
+            return {"ok": False, "how": "error", "error": str(e)}
+
+
+    def db_health(self):
+        """本地关键状态的体检：成绩历史库 + 凭据文件。
+
+        ★ 为什么要把这两样单独暴露：
+          · grades.db 是成绩历史的**唯一副本**（坏了就画不了趋势、
+            也回不到过去某天的分数）；
+          · credentials.json 一旦读不出来，用户会莫名其妙回到首次引导页，
+            看起来像「账号丢了」。
+          两处以前都只写 debug 日志或干脆静默，用户看不到任何解释。
+          现在启动时问一次，坏了就用 toast 明说。
+        """
+        out = {"ok": True, "note": "", "db": {}, "cred": {}}
+        try:
+            from app import store
+            db = dict(getattr(store, "DB_HEALTH", {}) or {})
+            db.setdefault("ok", True)
+            db["exists"] = bool(config.DB_FILE.exists())
+            if db["exists"]:
+                db["bytes"] = config.DB_FILE.stat().st_size
+            out["db"] = db
+            if db.get("ok") is False:
+                out["ok"] = False
+                out["note"] = db.get("note") or "成绩历史库异常"
+        except Exception as e:
+            out["db"] = {"ok": False, "note": f"读不到数据库状态：{e}"}
+            out["ok"] = False
+            out["note"] = out["db"]["note"]
+
+        try:
+            cred = dict(getattr(config, "CRED_HEALTH", {}) or {})
+            out["cred"] = cred
+            if cred.get("ok") is False:
+                out["ok"] = False
+                out["note"] = ((out["note"] + "；") if out["note"] else "") + (
+                    cred.get("note") or "凭据文件异常")
+        except Exception as e:
+            out["cred"] = {"ok": False, "note": str(e)}
+        return out
+
+    def teams_download(self, url: str, name: str = ""):
+        """下载一个 Teams 附件到「桌面/ManageBac 资料/Teams 附件」。
+
+        ★ 为什么不复用 ManageBac 的下载接口：
+          那几条是按 class_id / task_id 走的，只认站点内部的条目；
+          Teams 附件是 SharePoint 直链，只需要「浏览器里那份登录态」。
+
+          所以这里用 download.download_one：先带着会话 Cookie 直连，
+          失败了再退回浏览器内 fetch（两种都试过，SharePoint 常常只认后者）。
+
+        ★ 同一个文件重复点不会重复下：download_one 内部有 in-flight 去重。
+        """
+        try:
+            from app import download as dl
+
+            if not url:
+                return {"ok": False, "error": "没有可下载的链接"}
+            if not (url.startswith("https://") or url.startswith("http://")):
+                return {"ok": False, "error": "只支持 http/https 链接"}
+
+            root = dl.download_root() / "Teams 附件"
+            root.mkdir(parents=True, exist_ok=True)
+            fname = dl.safe_name(name or dl.guess_name(url, name or ""), "附件")
+            dest = root / fname
+
+            cookies = {}
+            try:
+                cookies = dl.browser_cookies() or {}
+            except Exception as e:
+                log.debug("取 Cookie 失败，改为匿名下载：%s", e)
+
+            r = dl.download_one(url, dest, cookies)
+            if r.get("ok"):
+                log.info("Teams 附件已下载：%s", fname)
+                return {"ok": True, "name": fname,
+                        "path": str(r.get("path") or dest),
+                        "size": r.get("size", 0)}
+            return {"ok": False, "error": r.get("error") or "下载失败"}
+        except Exception as e:
+            log.warning("下载 Teams 附件失败：%s", e)
+            return {"ok": False, "error": str(e)}
+
+
 WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+
+def _notify_previous_crash(info: dict) -> None:
+    """上次异常退出 → 用原生对话框告诉用户，并可直接打开报告。
+
+    ★ 为什么用 MessageBox 而不是界面内提示 ★
+      崩溃可能是界面本身起不来导致的 —— 那时候界面里放什么提示都没用。
+      MessageBox 是系统自带的，一定弹得出来。
+    """
+    try:
+        import ctypes
+        #  ★ 只认「上次启动之后」生成的报告 ★
+        #    否则可能指着一份几个月前的旧报告，让用户以为那就是这次的。
+        rep = _crash.report_since_marker(info)
+        made = None
+        #  ★ 被强制结束时不会有崩溃报告 —— 这时候补一份，
+        #    而不是嘴上说「已保存」而目录里空空如也 ★
+        if rep is None:
+            made = _crash.report_previous_run(info)
+            rep = made
+        log.warning("上次运行异常退出；报告：%s",
+                    rep.name if rep else "(生成失败)")
+        if rep is not None:
+            name = rep.name
+            msg = (
+                "上次运行时程序没有正常关闭（可能被强制结束或崩溃）。\n\n"
+                f"诊断报告：{name}\n\n"
+                "想反馈问题的话，把那份报告的内容贴到 issue 里就行，"
+                "里面有系统环境和当时的最后记录，已去掉账号密码等敏感信息。\n\n"
+                "要现在打开报告所在的文件夹吗？"
+            )
+        else:
+            #  连补一份都写不出来（通常是没写权限）—— 如实说，不要装作有
+            msg = (
+                "上次运行时程序没有正常关闭。\n\n"
+                "这次没能生成诊断报告（可能没有写入权限）。\n"
+                "如果反复出现，可以到设置里「生成一份诊断报告」再反馈。\n\n"
+                "要打开日志文件夹吗？"
+            )
+        r = ctypes.windll.user32.MessageBoxW(
+            None, msg, "ManageBac-packer - 上次异常退出", 0x44)   # YESNO|ICONWARN
+        if r == 6:      # IDYES
+            _open_crash_dir()
+    except Exception:
+        pass
+
+
+def _open_crash_dir() -> None:
+    try:
+        import os
+        d = _crash.crash_dir()
+        os.startfile(str(d))
+    except Exception:
+        pass
+
+
+def _log_env_info() -> None:
+    """把「这台电脑的环境」记进日志。
+
+    ★ 为什么要记 ★
+      这个程序要发给各种 Win10/Win11 电脑，出问题的人往往没法描述环境。
+      日志里带一行系统版本、架构、WebView2 版本、浏览器、目录是否可写，
+      就能直接判断是「系统太老 / 没装组件 / 权限不够 / 没有浏览器」中的哪一种。
+    """
+    try:
+        import platform
+        import os
+        log.info("── 环境自检 ──")
+        log.info("  系统：%s %s (build %s)  Python %s %s",
+                 platform.system(), platform.release(), platform.version(),
+                 platform.python_version(),
+                 "64-bit" if platform.machine().endswith("64") else platform.machine())
+
+        #  WebView2 版本（界面渲染依赖）
+        wv = ""
+        try:
+            import winreg
+            for hive, key in (
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients"
+                 r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                (winreg.HKEY_LOCAL_MACHINE,
+                 r"SOFTWARE\Microsoft\EdgeUpdate\Clients"
+                 r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                (winreg.HKEY_CURRENT_USER,
+                 r"SOFTWARE\Microsoft\EdgeUpdate\Clients"
+                 r"\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+            ):
+                try:
+                    with winreg.OpenKey(hive, key) as h:
+                        v, _ = winreg.QueryValueEx(h, "pv")
+                        if v and v != "0.0.0.0":
+                            wv = str(v)
+                            break
+                except OSError:
+                    continue
+        except Exception:
+            pass
+        log.info("  WebView2：%s", wv or "未检测到（界面会打不开）")
+
+        #  浏览器（跳转 / Teams / 附件下载依赖）
+        try:
+            import app.browser as _b
+            p = _b.find()
+            log.info("  浏览器：%s（%s）", _b.display_name(p), p)
+            inst = [n for _k, n, _p in _b.installed()]
+            log.info("  已安装：%s", "、".join(inst) or "一个都没有")
+        except Exception as e:
+            log.info("  浏览器：检测失败（%s）", e)
+
+        #  目录可写性（受限机器上 data 目录可能写不进去）
+        for label, d in (("数据目录", config.DATA_DIR),
+                         ("日志目录", config.LOG_DIR),
+                         ("临时目录", os.environ.get("TEMP") or "")):
+            if not d:
+                continue
+            ok = False
+            try:
+                p = Path(d)          #  widget 里只导入了 Path，没有 pathlib
+                p.mkdir(parents=True, exist_ok=True)
+                probe = p / ".write_probe"
+                probe.write_text("x", encoding="utf-8")
+                probe.unlink()
+                ok = True
+            except Exception as e:
+                log.warning("  %s不可写：%s（%s）", label, d, e)
+                continue
+            log.info("  %s可写：%s", label, d)
+    except Exception as e:
+        log.debug("环境自检失败：%s", e)
 
 
 def _webview2_installed() -> bool:
@@ -1746,8 +2451,12 @@ def _host_command() -> tuple[str, str]:
 
 
 def _make_lnk(lnk: Path, target: str, args: str, workdir: str) -> bool:
-    """用 PowerShell 的 WScript.Shell 建快捷方式。"""
-    import subprocess as _sp
+    """用 PowerShell 的 WScript.Shell 建快捷方式。
+
+    ★ 必须走 app.proc 的 run —— 直接 subprocess 会弹一个 PowerShell
+      黑框（用户看到的是「狂跳的 cmd 窗口」）。
+    """
+    from app import proc as _proc
     ps = (
         "$W = New-Object -ComObject WScript.Shell; "
         f"$s = $W.CreateShortcut('{lnk}'); "
@@ -1759,9 +2468,9 @@ def _make_lnk(lnk: Path, target: str, args: str, workdir: str) -> bool:
         "$s.Save(); Write-Output 'ok'"
     )
     try:
-        r = _sp.run(["powershell", "-NoProfile", "-NonInteractive",
-                     "-Command", ps],
-                    capture_output=True, text=True, timeout=30)
+        _proc.run(["powershell", "-NoProfile", "-NonInteractive",
+                   "-Command", ps],
+                  capture_output=True, text=True, timeout=30)
         return lnk.exists()
     except Exception as e:
         log.warning("创建开机启动快捷方式失败：%s", e)
@@ -1905,8 +2614,11 @@ def _load_window_cfg() -> dict:
             return default
         out = dict(default)
         out.update({k: v for k, v in d.items() if k in default})
-        if out.get("shape") not in _WINDOW_PRESETS:
+        if out.get("shape") != "full":
             out["shape"] = "full"
+        #  小浮窗尺寸随形态一起废弃
+        for _k in ("compact_size", "compact_pos"):
+            out.pop(_k, None)
         #  前端标题栏没做好之前，一律不给无边框 ——
         #  否则窗口会变成一个动不了的方块。
         if not FRONTEND_HAS_TITLEBAR:
@@ -1921,8 +2633,8 @@ def _load_window_cfg() -> dict:
 def _save_window_cfg(d: dict) -> None:
     try:
         config.ensure_dirs()
-        WINDOW_CFG_FILE.write_text(
-            json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+        from app import store as _store
+        _store.write_json_atomic(WINDOW_CFG_FILE, d)
     except Exception as e:
         log.warning("存窗口偏好失败：%s", e)
 
@@ -2040,6 +2752,460 @@ def _glass_status() -> bool:
     return _GLASS_OK
 
 
+# ══════════════════════════════════════════════════════════════════
+#  单实例守卫（0.5.2）
+#
+#  【它解决的是什么】
+#  pywebview 给本地 HTTP 服务用**固定端口**（DEFAULT_HTTP_PORT=42001，
+#  见 webview/__init__.py：private_mode=False 且没传 http_port 就走这条）。
+#  第二个实例启动时端口已被占，它自己的服务起不来（bottle 跑在后台
+#  线程里，异常没人接），于是新窗口跑去旧实例的服务器取前端 ——
+#  拿到的是**上一版的 app.css / app.js**。
+#
+#  这会造成一种很迷惑的现象：代码明明改了、重新装了，界面却没变。
+#  用户报的「找不到关闭置顶的开关」正是它：
+#  新版 index.html 里那行是好的，旧版 app.js 一跑就把它藏掉了。
+#
+#  【为什么不改 http_port 了事】
+#  换随机端口确实能躲开冲突，但会让 WebView2 的缓存键每次都变 ——
+#  磁盘缓存彻底失效，每次启动都要重新解析 190KB 的 CSS，
+#  冷启动变慢。固定端口 + 单实例守卫是更干净的做法。
+#
+#  【为什么用文件锁而不是 CreateMutexW】
+#  文件锁不依赖 Windows API，源码版 / 打包版 / 未来可能的
+#  其他平台都能用；而且进程崩了之后锁会自动释放（内核回收句柄）。
+# ══════════════════════════════════════════════════════════════════
+
+_LOCK_HANDLE = None          # 全局持有，绝不能被 GC —— 一旦回收锁就没了
+
+
+def _lock_path() -> Path:
+    """锁文件放哪。
+
+    ★ 用「用户级」目录，而不是 config.DATA_DIR。
+
+      被抢的资源是 **127.0.0.1:42001 这个端口** —— 它对「同一个用户」
+      是唯一的。而 DATA_DIR 是**跟着程序走的**（源码版在项目目录、
+      安装版在 %LOCALAPPDATA%），两个不同的副本会各自算出不同的锁文件，
+      照样同时跑、照样抢端口。
+
+      所以锁必须放在用户级位置：无论从哪启动，都指向同一把锁。
+      %LOCALAPPDATA% 拿不到时才退回 DATA_DIR（那时只能尽力而为）。
+    """
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    if local:
+        try:
+            d = Path(local) / "ManageBac-packer"
+            d.mkdir(parents=True, exist_ok=True)
+            return d / "app.lock"
+        except Exception:
+            pass
+    try:
+        config.ensure_dirs()
+    except Exception:
+        pass
+    return Path(config.DATA_DIR) / "app.lock"
+
+
+def _pid_path() -> Path:
+    """记录「当前持有锁的进程 pid」的文件。
+
+    ★ 为什么不能把 pid 写进锁文件本身：
+      `msvcrt.locking` 锁住的那段字节，**别的进程连读都读不了**
+      （实测 PermissionError: [Errno 13]）。想「加着锁又能被读出 pid」
+      是做不到的。所以拆成两个文件：
+        app.lock —— 只负责互斥，内容无所谓
+        app.pid  —— 只负责记录 pid，随时可读
+    """
+    return _lock_path().with_name("app.pid")
+
+
+def _claim_single_instance() -> bool:
+    """抢单实例锁。抢到返回 True，已有实例返回 False。
+
+    ★ 这个句柄必须一直活着。落在函数局部变量里被回收掉的话，
+      锁当场失效，守卫就形同虚设。
+    """
+    global _LOCK_HANDLE
+    try:
+        import msvcrt  # noqa: PLC0415
+    except ImportError:
+        return True          # 非 Windows：放行，不影响功能
+
+    try:
+        fh = open(_lock_path(), "a+b")  # noqa: SIM115
+    except Exception as e:
+        log.warning("单实例锁打不开，放行（可能多个实例同时跑）：%s", e)
+        return True
+
+    try:
+        #  锁文件开头 1 字节。别的实例锁着就会抛 OSError
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError as e:
+        #  ★ 用 info 而不是 debug：这条日志是排查「为什么新版没生效」的
+        #    第一现场。用户遇到「装了新版却还是旧界面」时，
+        #    有没有这行、里面的 pid 是谁，一眼就能定性。
+        log.info("单实例锁被占用（pid 文件里是 %s），本进程不做主",
+                 _read_lock_pid() or "?")
+        fh.close()
+        return False
+    except Exception as e:
+        log.warning("加锁异常，放行：%s", e)
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return True
+
+    #  抢到了 —— 把 pid 记到**另一个文件**里（见 _pid_path 的说明）
+    try:
+        _pid_path().write_text(f"{os.getpid()}\n", encoding="ascii")
+        log.info("单实例锁已持有（pid=%d）", os.getpid())
+    except Exception as e:
+        log.warning("写 pid 文件失败：%s", e)
+
+    _LOCK_HANDLE = fh
+    return True
+
+
+def _read_lock_pid() -> int:
+    """读出「持有锁的那个进程」的 pid。读不到返回 0。
+
+    只有抢锁失败时才会用到 —— 目的是把对方的窗口叫到前面。
+    """
+    try:
+        txt = _pid_path().read_text(encoding="ascii", errors="ignore")
+    except Exception:
+        return 0
+    try:
+        return int(txt.strip())
+    except Exception:
+        return 0
+
+
+def _image_path_of(pid) -> str:
+    """取某进程的可执行文件完整路径，用于确认「它确实是本程序」。
+
+    结束别的进程之前一定要核对这个 —— 否则 pid 被系统复用之后，
+    可能误杀一个毫不相干的程序。
+    """
+    if pid <= 0:
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return ""
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 4096
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value or ""
+        return ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            k32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _same_program(a, b) -> bool:
+    """两个路径是否指向同一个程序。
+
+    ★ 为什么不直接比完整路径：
+      venv 里的 `python.exe` 只是个重定向器，`sys.executable` 与实际进程映像
+      可能不同；开发态（python widget.py）下拿到的路径也就跟打包态不一样。
+      只比完整路径会把「确实是本程序」误判成「别的程序」，于是永不接管。
+
+      折中：完整路径相同，或**文件名**相同，都算同一个程序。
+      文件名相同已经是很强的约束，再叠加「它正持有本程序的锁文件」，
+      误杀风险可以接受。反过来，路径不同且文件名也不同（例如
+      ManageBac-packer.exe 与 explorer.exe）一律拒绝。
+    """
+    if not (a and b):
+        return False
+    pa = os.path.normcase(os.path.abspath(a))
+    pb = os.path.normcase(os.path.abspath(b))
+    return pa == pb or os.path.basename(pa) == os.path.basename(pb)
+
+
+def _visible_windows_of(pid) -> list:
+    """列出某个进程的「可见、且有标题」的顶层窗口句柄。
+
+    ★ 不用 FindWindowW(None, TITLE)：
+      界面起来后会把标题改成带课程名的（比如「ManageBac-packer · 数学」），
+      按标题找会落空。这里按 **pid** 找 —— pid 从锁文件里读，
+      一定就是持有锁的那个进程。
+    """
+    if pid <= 0:
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+
+    u32 = ctypes.windll.user32
+    found: list = []
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HWND,
+        wintypes.LPARAM,
+    )
+
+    def _cb(hwnd, _lparam):
+        try:
+            if not u32.IsWindowVisible(hwnd):
+                return 1
+            wpid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and u32.GetWindowTextLengthW(hwnd) > 0:
+                found.append(int(hwnd))
+        except Exception:
+            pass
+        return 1
+
+    try:
+        u32.EnumWindows(WNDENUMPROC(_cb), 0)
+    except Exception as e:
+        log.debug("枚举窗口失败：%s", e)
+    return found
+
+
+def _holder_age() -> float:
+    """持有锁的进程已经占用多久（秒）。读不到返回一个很大的数。
+
+    pid 文件是在抢到锁的那一刻写下的，所以它的修改时间约等于持锁起点。
+    用这个时间区分「刚启动、窗口还没建出来」和「空转了很久」。
+    """
+    try:
+        return max(0.0, time.time() - _pid_path().stat().st_mtime)
+    except Exception:
+        return 1000000000.0
+
+
+def _reclaim_from_windowless_holder(grace: float = 8.0,
+                                    warm_seconds: float = 25.0) -> bool:
+    """持有锁的进程**没有窗口**时，接管单实例锁。成功返回 True。
+
+    【为什么需要这段】
+      实测出现过一次：窗口已经消失、但 pywebview 的 GUI 循环没有返回，
+      进程继续活着并占着单实例锁。此后每次点图标，
+      新进程都判定「已有实例在运行」，去叫一个不存在的窗口，
+      然后自己退出 —— 表现出来就是**点图标一点反应都没有**，
+      而且这个状态会一直持续下去。
+
+    【怎么判断】
+      · 先给 grace 秒的宽限：窗口可能只是还没建出来（正常预热）；
+      · 宽限过了仍然没有窗口，再看持锁时长：
+        年龄小于 warm_seconds 的，按「还在启动」处理，本次照常退出；
+      · 年龄更大的，判定为空转进程 —— 核对可执行文件路径与自身一致后结束它，
+        再重新抢锁，由本进程正常启动界面。
+    """
+    pid = _read_lock_pid()
+
+    deadline = time.time() + max(0.0, grace)
+    while time.time() < deadline:
+        if _focus_running_instance():
+            return False
+        time.sleep(0.4)
+
+    if pid <= 0:
+        log.warning("单实例锁被占用，但读不到持锁 pid，本次不接管")
+        return False
+
+    age = _holder_age()
+    if age < warm_seconds:
+        log.info("持锁进程（pid=%s）启动仅 %.0f 秒，可能仍在建窗，本次退出",
+                 pid, age)
+        return False
+
+    mine = os.path.abspath(sys.executable)
+    theirs = _image_path_of(pid)
+    if not theirs:
+        log.warning("持锁进程（pid=%s）已不存在或无权限查询，尝试直接抢锁", pid)
+    elif not _same_program(theirs, mine):
+        log.warning("持锁 pid=%s 指向另一个程序（%s），本次不接管", pid, theirs)
+        return False
+
+    log.warning(
+        "持锁进程（pid=%s）已运行 %.0f 秒但没有任何可见窗口，"
+        "判定为空转，结束它并接管（否则之后每次启动都只会静默退出）",
+        pid, age)
+    try:
+        import subprocess
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        log.warning("结束空转进程失败：%s", e)
+
+    for _ in range(25):
+        time.sleep(0.2)
+        if _claim_single_instance():
+            log.info("已接管单实例锁（原 pid=%s 已结束）", pid)
+            return True
+    log.warning("接管单实例锁失败：旧进程仍占用")
+    return False
+
+
+def _focus_running_instance() -> bool:
+    """把已经在跑的那个窗口叫到最前面。**成功聚焦返回 True**。
+
+    用户连点两下图标时，期望的是「窗口弹出来」，而不是「什么都没发生」。
+
+    返回值很关键：调用方要靠它区分两种情况 ——
+      · True ：确实把窗口叫出来了，本次可以退出；
+      · False：对方**没有可见窗口**，可能还在预热，也可能是空转进程。
+    """
+    pid = _read_lock_pid()
+    if pid <= 0:
+        log.debug("锁文件里没有可用 pid，跳过聚焦")
+        return False
+
+    found = _visible_windows_of(pid)
+    if not found:
+        log.debug("持有锁的进程（pid=%s）没有可见窗口", pid)
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+        SW_RESTORE = 9
+        u32 = ctypes.windll.user32
+        hwnd = found[0]
+        u32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+        u32.BringWindowToTop(wintypes.HWND(hwnd))
+        u32.SetForegroundWindow(wintypes.HWND(hwnd))
+        log.info("已把运行中的窗口叫到前面（pid=%s）", pid)
+        return True
+    except Exception as e:
+        log.debug("聚焦已有窗口失败：%s", e)
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ★★ 升级后清掉 WebView2 的 HTTP 缓存（0.5.2）★★
+#
+#  【为什么必须做】
+#  pywebview 发的静态文件**带 no-cache 头**，理论上浏览器每次都会
+#  回服务器取。但实测不保险：升级之后窗口里量到的 app.css 仍是
+#  **上一版的**（.ops 的 display 还是 flex，而磁盘上早就写成 grid 了）。
+#  手动删掉 data/webview2 后立刻恢复正常 —— 就是磁盘缓存作祟。
+#
+#  为什么会这样：本地端口是**固定的 42001**（见单实例守卫那段说明），
+#  于是缓存键 http://127.0.0.1:42001/app.css 跨版本完全不变。
+#  再叠加一个更早的版本可能没发对头，旧响应就一直留在缓存里。
+#
+#  结果和「旧实例占端口」是同一个症状：**新版装了却看不出变化**。
+#  用户报的「找不到关闭置顶的开关」两条路都指向它。
+#
+#  【做法】
+#  在存储目录里记一个「前端签名」。签名变了才清缓存，
+#  平时不动 —— 不然每次启动都重新下载 190KB 的 CSS，冷启动变慢。
+#
+#  ★ 只清**缓存**目录，绝不碰 Local Storage / Cookies：
+#    那些存着用户的界面偏好和登录态，删了就白折腾了。
+# ══════════════════════════════════════════════════════════════════
+
+#  纯缓存目录名（出现在 EBWebView 树里任意一层都算）
+_WV_CACHE_DIRS = {
+    "cache", "code cache", "gpucache", "gpushadercache",
+    "dawn_graphite_cache", "dawngraphitecache",
+    "dawnwebgpucache", "gpupersistentcache",
+    "grshadercache", "shadercache", "component_crx_cache",
+    "optimization_guide_hint_cache_store", "autofillaimodelcache",
+    "service worker", "scriptcache",
+}
+
+
+def _frontend_signature() -> str:
+    """给当前前端取一个「内容指纹」。
+
+    改过前端就一定会变，没改就不会变 —— 用它决定要不要清缓存。
+
+    ★ 为什么用**文件内容哈希**，而不是版本号或 mtime：
+
+      版本号 —— 界面可能没动，版本号却会变（改了后端也要发新版），
+                那样会白清一遍缓存。
+                **反过来更危险**：版本号没动、界面却动了（同一个号里改
+                了前端），签名就不变 → 缓存不清 → 用户看到的是旧界面。
+                这正是 0.5.1 踩过的「装了新版界面却没变」。
+
+      mtime  —— 打包版每次启动都重新解压到新的 _MEI 目录，
+                文件时间戳每次都不同。算 mtime 就每次都清缓存，
+                白清一遍，冷启动还变慢。
+
+      内容哈希 —— 三个前端文件不变，签名就不变（缓存照用，冷启动快）；
+                只要其中一个字节变了，签名就变（缓存必清）。
+                与版本号、解压目录、时间戳都无关。
+    """
+    h = hashlib.sha1()
+    for name in ("index.html", "app.css", "app.js"):
+        h.update(name.encode("utf-8"))
+        try:
+            h.update((config.WEB_DIR / name).read_bytes())
+        except Exception:
+            #  读不到就记个标记，别让签名退化成「永远相同」
+            h.update(b"?")
+    return h.hexdigest()[:16]
+
+
+def _purge_webview_cache_on_upgrade(storage: Path) -> int:
+    """前端变了就清掉 WebView2 的缓存目录。返回清掉几个。
+
+    清不掉不是错误 —— 大不了沿用旧的缓存行为，不能因此挡住启动。
+    """
+    marker = storage / "front.sig"
+    sig = _frontend_signature()
+
+    try:
+        old = marker.read_text(encoding="utf-8").strip()
+    except Exception:
+        old = ""
+
+    if old == sig:
+        return 0                       # 前端没变，缓存照用
+
+    removed = 0
+    try:
+        for p in storage.rglob("*"):
+            if not p.is_dir():
+                continue
+            if p.name.lower() in _WV_CACHE_DIRS:
+                try:
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.debug("遍历 WebView2 缓存目录失败：%s", e)
+
+    try:
+        marker.write_text(sig, encoding="utf-8")
+    except Exception as e:
+        log.debug("写前端签名失败（下次会再清一遍）：%s", e)
+
+    if removed:
+        log.info("前端有更新（%s → %s），已清 %d 个 WebView2 缓存目录",
+                 old or "(首次)", sig, removed)
+    return removed
+
+
 def main() -> int:
     #  ══════════ 静默预热模式（开机自启走这里）══════════
     #   exe 被开机启动项调用时带 --warmup：
@@ -2076,10 +3242,51 @@ def main() -> int:
 
     config.ensure_dirs()
     log.info("=" * 52)
-    log.info("启动 ManageBac-packer（解释器 %s）", sys.executable)
+    #  ★ 一定要带上 pid：
+    #    组件会短时间起多个进程（开机自启 + 用户双击 + 预热），
+    #    排查「谁抢了锁」「谁建了窗」时，光看时间戳分不清是谁写的。
+    #    这个坑排查单实例守卫时实实在在踩过。
+    log.info("启动 ManageBac-packer（解释器 %s，pid=%d）",
+             sys.executable, os.getpid())
+
+    # ══════════════════════════════════════════════════════════════
+    #  ★★ 单实例守卫（0.5.2）—— 必须放在建窗之前 ★★
+    #
+    #  【为什么非要有它】
+    #  pywebview 把本地端口**钉死**在 42001：
+    #      webview/__init__.py
+    #        if not private_mode and not http_port:
+    #            http_port = settings['DEFAULT_HTTP_PORT']   # 42001
+    #  而组件开的是持久缓存（private_mode=False），正落在这条分支上。
+    #
+    #  于是「上一个实例还在跑」时启动新版会是这个样子：
+    #     · 新实例自己的 HTTP 服务 bind 失败（端口被占）→ 静默退出
+    #       （bottle 在后台线程里起，异常没人接，界面照常打开）
+    #     · 新窗口去 127.0.0.1:42001 取 index.html / app.js，
+    #       拿到的却是**旧实例发出来的旧文件**
+    #     · 表现 = 「新功能明明写了却没有」
+    #
+    #  用户报的「找不到关闭置顶的开关」就是这么来的：
+    #  新 HTML 里那行是好的，可旧 app.js 一跑就把它藏了。
+    #
+    #  在这里拦住，第二个实例直接把已有窗口叫到前面来，
+    #  既不会串到旧前端，也符合用户「点两下图标只是想看看」的直觉。
+    # ══════════════════════════════════════════════════════════════
+    if not _claim_single_instance():
+        if _focus_running_instance():
+            log.info("已有实例在运行，已把它的窗口叫到前面，本次退出")
+            #  这不是崩溃，只是转发 —— 别把「未正常结束」标记留下
+            _crash.mark_clean()
+            return 0
+        if not _reclaim_from_windowless_holder():
+            log.info("已有实例在运行（未取得窗口），本次退出")
+            _crash.mark_clean()
+            return 0
+        log.info("已接管启动（旧实例无窗口）")
 
     # ★ 启动前先确认 WebView2 在。不在就给提示 + 打开下载页，
     #   而不是让它抛一个用户看不懂的异常然后静默退出。
+    _crash.set_stage("检查 WebView2")
     if not _webview2_installed():
         log.error("未检测到 WebView2 Runtime，无法启动界面")
         _show_missing_webview2()
@@ -2092,6 +3299,40 @@ def main() -> int:
     #  启动自检：确保 js_api 没有「公开的非函数属性」，
     #   否则 pywebview 会递归遍历 → 窗口「未响应」。
     _check_js_api_safe(api)
+
+    #  先把这台电脑的环境记下来（发给别人后排查问题时全靠它）
+    _crash.set_stage("环境自检")
+    _log_env_info()
+    #  上次是异常退出的话，这里告诉用户（并给一键打开报告）
+    if _PREV_CRASH is not None:
+        #  ★ 必须放后台线程 ★
+        #    MessageBox 是模态的：万一没人点（比如开机自启、
+        #    或者用户根本没在看屏幕），主线程会一直卡在对话框上，
+        #    整个界面起不来 —— 那才是最糟的结果。
+        try:
+            import threading as _thr
+            _thr.Thread(target=_notify_previous_crash,
+                        args=(_PREV_CRASH,), daemon=True,
+                        name="crash-notify").start()
+        except Exception:
+            pass
+
+    #  ★ 浏览器依赖体检（WebView2 与 Chromium 浏览器是两个独立组件）★
+    #    企业机器上「有 WebView2 没有 Edge」很常见：界面照常打开、
+    #    什么都不报错，但跳转、Teams、EC 名单、附件下载会一起静默失灵。
+    try:
+        from app import edge as _edge
+        _bh = _edge.browser_health()
+        if _bh.get("ok"):
+            log.info("浏览器依赖正常：%s=%s",
+                     _bh.get("browser_name") or "浏览器",
+                     _bh.get("browser_path", "")[:80])
+        else:
+            log.warning("浏览器依赖缺失（%s）：%s",
+                        ",".join(_bh.get("missing") or []),
+                        _bh.get("message", ""))
+    except Exception as e:
+        log.warning("浏览器依赖体检异常：%s", e)
 
     #  ══════════ 窗口形态（v0.5.0）══════════
     #  两种形态：
@@ -2146,7 +3387,7 @@ def main() -> int:
         #    （我一开始按直觉写了 max_size，会直接 TypeError）。
         min_size=sizes["min"],
         x=sizes.get("x"), y=sizes.get("y"),
-        resizable=True,
+        resizable=False,
         frameless=cfg_frameless,
         #  固定 False：拖动由前端 selfDrag 实现（见上面说明）。
         easy_drag=False,
@@ -2278,6 +3519,9 @@ def main() -> int:
     try:
         _wv_storage = config.DATA_DIR / "webview2"
         _wv_storage.mkdir(parents=True, exist_ok=True)
+        #  ★ 前端改过就先把上一版的 HTTP 缓存清掉。
+        #    放在这里（建窗之前）做 —— 缓存还在被 WebView2 占用时删不干净。
+        _purge_webview_cache_on_upgrade(_wv_storage)
     except Exception as e:
         #  目录建不出来就算了 —— 退回原来的行为（本次启动能用，
         #  只是设置不保留），总比起不来好。

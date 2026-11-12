@@ -17,7 +17,7 @@
 ; ════════════════════════════════════════════════════════════════════
 
 #define MyAppName "ManageBac-packer"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.5.2"
 #define MyAppPublisher "zhyunran"
 #define MyAppURL "https://github.com/zhyunran/ManageBac-packer"
 #define MyAppExeName "ManageBac-packer.exe"
@@ -37,6 +37,15 @@ DisableProgramGroupPage=yes
 ;  免安装到 Program Files —— 不需要管理员权限
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
+
+;  ★ 环境普适性 ★
+;  最低 Windows 10：Win7/8 上 WebView2 根本跑不起来，
+;  与其装完打不开，不如在向导第一步就说清楚。
+MinVersion=10.0
+;  x64compatible = 64 位 x86 与 ARM64（模拟 x64）都放行；
+;  32 位 Windows 装不了 x64 程序，由 Inno 直接拦住并给出系统提示。
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 
 ;  单文件安装包
 OutputDir=release
@@ -82,10 +91,13 @@ Source: "dist\ManageBac-packer.exe"; DestDir: "{app}"; \
     Flags: ignoreversion
 ;  说明文档（能帮用户看懂这是干什么的）
 ;   更新报告在「源码」的上一级目录，文件名带版本号 —— 发新版时记得同步改这里
-Source: "..\更新报告-0.5.1.md"; DestDir: "{app}"; \
+Source: "..\更新报告-0.5.2.md"; DestDir: "{app}"; \
     DestName: "更新报告.md"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+;  WebView2 离线安装器：不装进程序目录，只在需要时释放到临时目录执行。
+;  纯净 Win10 上没有 WebView2 → 界面打不开，这是最容易劝退人的一步。
+Source: "_tools\MicrosoftEdgeWebView2Setup.exe"; Flags: dontcopy
 
 [Icons]
 ;  开始菜单
@@ -146,6 +158,23 @@ begin
     Result := True;
 end;
 
+//  内置的离线安装器：装包自带，不依赖网络也能装
+function TryInstallWebView2(): Boolean;
+var
+  rc: Integer;
+begin
+  Result := False;
+  try
+    ExtractTemporaryFile('MicrosoftEdgeWebView2Setup.exe');
+  except
+    exit;                                  //  没带上安装器就走下载页
+  end;
+  //  /silent /install：静默安装；非管理员时安装器会自己装到当前用户
+  if Exec(ExpandConstant('{tmp}\MicrosoftEdgeWebView2Setup.exe'),
+          '/silent /install', '', SW_SHOW, ewWaitUntilTerminated, rc) then
+    Result := WebView2Installed();
+end;
+
 function InitializeSetup(): Boolean;
 var
   err: Integer;
@@ -154,14 +183,30 @@ begin
   if not WebView2Installed() then
   begin
     if MsgBox('这台电脑缺少一个微软的运行组件（WebView2），' + #13#10 +
-              '不装的话软件打不开。' + #13#10 + #13#10 +
-              '现在打开下载页吗？（装完那个组件再运行本安装包）',
+              '不装的话软件界面打不开。' + #13#10 + #13#10 +
+              '安装包里已经自带了这个组件，现在自动安装吗？' + #13#10 +
+              '（约 1～2 分钟，装到当前用户，不需要管理员权限）',
               mbConfirmation, MB_YESNO) = IDYES then
     begin
-      ShellExec('open',
-        'https://go.microsoft.com/fwlink/p/?LinkId=2124703',
-        '', '', SW_SHOWNORMAL, ewNoWait, err);
+      if TryInstallWebView2() then
+        MsgBox('运行组件已装好，继续安装。', mbInformation, MB_OK)
+      else
+      begin
+        if MsgBox('自动安装没成功（可能被安全软件拦了）。' + #13#10 +
+                  '要打开微软的下载页手动装吗？' + #13#10 + #13#10 +
+                  '装好后重新运行本安装包即可。',
+                  mbConfirmation, MB_YESNO) = IDYES then
+          ShellExec('open',
+            'https://go.microsoft.com/fwlink/p/?LinkId=2124703',
+            '', '', SW_SHOWNORMAL, ewNoWait, err);
+      end;
+    end
+    else
+    begin
+      //  用户不想现在装 —— 说清后果，但允许继续
+      if MsgBox('不装的话程序打开时会提示缺少组件。确定继续安装吗？',
+                mbConfirmation, MB_YESNO) = IDNO then
+        Result := False;
     end;
-    //  还是让他继续 —— 有些人其实已经装了，只是我们没查出来
   end;
 end;
