@@ -5018,3 +5018,126 @@ body.compact .histcv{height:170px}
 .histchart, .histchart canvas, .histcv{
   touch-action: pan-y;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   Teams 三栏结构（0.6.0）
+
+   模仿 Teams 自己的信息组织：
+     左栏图标导航 → 团队列 → 频道列 → 主内容（帖子 / 文件）
+   配色沿用 Teams 的主色 #5b5fc7，密度比卡片略紧，接近原生观感。
+   ══════════════════════════════════════════════════════════════ */
+.tmx{
+  display:flex; align-items:stretch; gap:0;
+  min-height:520px; height:calc(100vh - 210px);
+  border:1px solid var(--line); border-radius:14px; overflow:hidden;
+  background:var(--card);
+}
+/* ── 左栏图标 ── */
+.tmx-rail{
+  flex:0 0 64px; display:flex; flex-direction:column; align-items:center;
+  gap:4px; padding:10px 0; background:var(--bg2); border-right:1px solid var(--line);
+}
+.tmx-ico{
+  width:52px; padding:7px 2px 5px; border:0; background:transparent; cursor:pointer;
+  display:flex; flex-direction:column; align-items:center; gap:2px;
+  color:var(--muted); font-size:10px; border-radius:9px; transition:.14s;
+}
+.tmx-ico span{line-height:1.1}
+.tmx-ico:hover{background:rgba(91,95,199,.10); color:#5b5fc7}
+.tmx-ico.on{color:#5b5fc7; background:rgba(91,95,199,.12); font-weight:600}
+.tmx-ico.dim{opacity:.38; cursor:not-allowed}
+.tmx-ico.dim:hover{background:transparent; color:var(--muted)}
+.tmx-railsp{flex:1}
+
+/* ── 团队 / 频道列 ── */
+.tmx-col{
+  flex:0 0 196px; display:flex; flex-direction:column;
+  border-right:1px solid var(--line); overflow:auto; background:var(--card);
+}
+.tmx-colhead{
+  position:sticky; top:0; z-index:2; padding:9px 12px 7px;
+  font-size:11px; letter-spacing:.06em; color:var(--muted);
+  background:var(--card); border-bottom:1px solid var(--line);
+  display:flex; align-items:center; justify-content:space-between;
+}
+.tmx-colhead i{
+  font-style:normal; font-size:10px; padding:1px 6px; border-radius:8px;
+  background:var(--bg2); color:var(--muted);
+}
+.tmx-row{
+  display:flex; align-items:center; gap:8px; width:100%;
+  padding:8px 10px; border:0; background:transparent; cursor:pointer;
+  text-align:left; color:var(--text); font-size:12.5px; line-height:1.3;
+  border-left:3px solid transparent;
+}
+.tmx-row:hover{background:rgba(91,95,199,.07)}
+.tmx-row.on{background:rgba(91,95,199,.12); border-left-color:#5b5fc7; font-weight:600}
+.tmx-row i{
+  margin-left:auto; font-style:normal; font-size:10.5px; color:var(--muted);
+  background:var(--bg2); padding:1px 6px; border-radius:8px;
+}
+.tmx-av{
+  flex:0 0 24px; width:24px; height:24px; border-radius:6px;
+  background:#5b5fc7; color:#fff; display:inline-flex;
+  align-items:center; justify-content:center; font-size:12px; font-weight:700;
+}
+.tmx-av.sm{flex:0 0 20px; width:20px; height:20px; font-size:11px; border-radius:5px}
+.tmx-nm{
+  flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.tmx-hash{color:#5b5fc7; font-weight:700; width:14px; text-align:center}
+
+/* ── 主内容 ── */
+.tmx-main{flex:1; min-width:0; display:flex; flex-direction:column; overflow:auto; padding:12px 14px 16px}
+.tmx-head{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:8px}
+.tmx-crumb{display:flex; align-items:center; gap:7px; min-width:0; font-size:13px}
+.tmx-tname{font-weight:650; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:210px}
+.tmx-sep{color:var(--muted)}
+.tmx-cname{color:#5b5fc7; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:200px}
+.tmx-cnt{font-size:11px; color:var(--muted); background:var(--bg2); padding:1px 7px; border-radius:9px}
+.tmx-acts{display:flex; gap:7px; margin-left:auto; flex-wrap:wrap}
+
+/* ── 页签 ── */
+.tmx-tabs{display:flex; gap:4px; margin:4px 0 10px; border-bottom:1px solid var(--line)}
+.tmx-tab{
+  display:inline-flex; align-items:center; gap:5px;
+  padding:6px 12px 7px; border:0; background:transparent; cursor:pointer;
+  color:var(--muted); font-size:12.5px; border-bottom:2px solid transparent;
+}
+.tmx-tab:hover{color:#5b5fc7}
+.tmx-tab.on{color:#5b5fc7; font-weight:650; border-bottom-color:#5b5fc7}
+
+/* ── 文件分区 ── */
+.tmx-files{border:1px solid var(--line); border-radius:10px; overflow:hidden}
+.tmx-frow{
+  display:grid; grid-template-columns:1fr 150px 96px 44px;
+  gap:10px; align-items:center; padding:8px 12px; font-size:12.5px;
+  border-bottom:1px solid var(--line);
+}
+.tmx-frow:last-child{border-bottom:0}
+.tmx-fhead{background:var(--bg2); font-size:11px; color:var(--muted)}
+.tmx-frow:hover:not(.tmx-fhead){background:rgba(91,95,199,.06)}
+.tmx-fname{display:flex; align-items:center; gap:7px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tmx-fsrc,.tmx-fdate{color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tmx-fdl{
+  width:28px; height:26px; display:inline-flex; align-items:center; justify-content:center;
+  border:1px solid var(--line); background:var(--card); border-radius:7px; cursor:pointer;
+  color:var(--muted);
+}
+.tmx-fdl:hover{border-color:#5b5fc7; color:#5b5fc7}
+
+/*  帖子卡片头部的作者与时间（三栏后信息更密）  */
+.tm-h{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+.tmx-by{font-size:11.5px; color:var(--muted)}
+.tm-h .tm-d{margin-left:auto}
+
+/*  窄窗口：先收掉团队列，再收频道列，主内容保证可用  */
+@media (max-width:1080px){
+  .tmx-col{flex:0 0 164px}
+  .tmx-frow{grid-template-columns:1fr 110px 80px 40px}
+}
+@media (max-width:880px){
+  .tmx-col.tmx-teams{display:none}
+  .tmx-fsrc{display:none}
+  .tmx-frow{grid-template-columns:1fr 84px 40px}
+}

@@ -2594,6 +2594,9 @@ let TM_TEAM = '';        /* 团队筛选：空 = 全部团队（两级导航的�
 let TMP_STATUS_AT = '';  /* 这批缓存是什么时候抓的（用来提示「太旧了」） */
 let TM_PAGE_KEY = '';    /* 整页的搜索词（与弹窗各自独立） */
 let TM_STATS = {};       /* 全量抓取的概览（团队/频道/条数/时间） */
+/*  Teams 主内容的分区：posts（帖子）/ files（文件） */
+let TM_VIEW = 'posts';
+
 let TM_CRAWL_TIMER = null;
 
 /*  ★ 停止正在进行的 Teams 抓取 ★
@@ -2637,9 +2640,9 @@ function tmChanShort(key){
 }
 
 function tmRenderPage(){
-  /*  容器就是网页里那个 #page-tm（顶级标签的页面容器）。
-      没写成单独的内层 div，是因为 switchTab 按 .page 的索引切页，
-      多包一层反而要改切换逻辑。 */
+  /*  ★ 结构模仿 Teams ★
+        左栏图标 → 团队列 → 频道列 → 主内容（帖子 / 文件）
+      业务逻辑沿用原来的：搜索、卡片、附件下载、回复、归档按钮全保留。 */
   const box = document.getElementById('page-tm');
   if(!box) return;
 
@@ -2648,7 +2651,7 @@ function tmRenderPage(){
 
   let items = (TM_ITEMS || []).slice();
 
-  /* 团队筛选（两级导航的第一级） */
+  /* 团队筛选（第一级） */
   if(TM_TEAM){
     items = items.filter(it => ((it.team || '').trim() || '未标注团队') === TM_TEAM);
   }
@@ -2662,10 +2665,8 @@ function tmRenderPage(){
     });
   }
 
-  /* 搜索：覆盖标题 / 正文 / PDF 文字 / 频道 / 人名 / 附件名 / **回复正文** / 日期
-     ★ 多词按「同时命中」处理（空格、逗号、顿号、分号都算分隔）——
-       这和 Teams 自己的搜索一致：搜 "林里 鸭子" 期望两个词都在同一条消息里，
-       而不是消息里真的连着写下这四个字符。 */
+  /* 搜索：标题 / 正文 / PDF 文字 / 频道 / 人名 / 附件名 / 回复正文 / 日期
+     ★ 多词按「同时命中」处理（空格、逗号、顿号、分号都算分隔） */
   const terms = kw ? kw.toLowerCase().split(/[\s,，、;；]+/).filter(Boolean) : [];
   if(terms.length){
     items = items.filter(it => {
@@ -2680,15 +2681,10 @@ function tmRenderPage(){
     });
   }
 
-  /*  频道胶囊跟着团队走：选了中国队就只列它的频道，
-      否则十几个团队的频道混在一起，跟 Teams 里看到的结构对不上。 */
   const chans = tmChannels().filter(([key]) =>
     !TM_TEAM || key.indexOf(TM_TEAM + ' / ') === 0);
 
-  /* ── 缓存新鲜度：超过 3 天没更新就明确提示 ──
-     ★ 为什么必须有：搜索只能搜到**已经抓下来**的东西。
-       缓存停在 40 天前时，新消息怎么搜都不会出现，
-       但界面不说明的话，用户只会觉得「搜索坏了」。 */
+  /* ── 缓存新鲜度提示 ── */
   let stale = '';
   const at = (TMP_STATUS_AT || '').trim();
   if(at){
@@ -2707,60 +2703,113 @@ function tmRenderPage(){
     }
   }
 
-  /* ── 顶部：动作按钮 + 状态 ── */
-  let h = `<div class="tpg-top">
-    <div class="tpg-acts">
-      <button class="tpg-btn" id="tpgOpen">
-        ${icon('i-external','sm')}<span>打开 Teams</span></button>
+  /* ── 左栏：图标导航（私聊与日历不提供，置灰说明原因） ── */
+  const rail = `<aside class="tmx-rail">
+    <button class="tmx-ico on" title="团队与频道">${icon('i-teams','sm')}<span>团队</span></button>
+    <button class="tmx-ico" data-view="files" title="文件：所有频道的附件">${icon('i-folder','sm')}<span>文件</span></button>
+    <button class="tmx-ico dim" disabled title="私聊不在本程序范围内">${icon('i-list','sm')}<span>聊天</span></button>
+    <button class="tmx-ico dim" disabled title="日历不在本程序范围内">${icon('i-hourglass','sm')}<span>日历</span></button>
+    <div class="tmx-railsp"></div>
+    <button class="tmx-ico" id="tpgOpen" title="在浏览器里打开 Teams">${icon('i-external','sm')}<span>打开</span></button>
+  </aside>`;
+
+  /* ── 团队列 ── */
+  const teams = tmTeams();
+  let sideTeams = '<aside class="tmx-col tmx-teams">';
+  sideTeams += `<div class="tmx-colhead">团队<i>${teams.length}</i></div>`;
+  sideTeams += `<button class="tmx-row tpg-team ${!TM_TEAM?'on':''}" data-tm="">
+      <span class="tmx-av">全</span><span class="tmx-nm">全部团队</span>
+      <i>${(TM_ITEMS||[]).length}</i></button>`;
+  teams.forEach(([name, n])=>{
+    sideTeams += `<button class="tmx-row tpg-team ${TM_TEAM===name?'on':''}"
+        data-tm="${tmEsc(name)}" title="${tmEsc(name)}">
+      <span class="tmx-av">${tmEsc((name||'?').slice(0,1))}</span>
+      <span class="tmx-nm">${tmEsc(name)}</span><i>${n}</i></button>`;
+  });
+  sideTeams += '</aside>';
+
+  /* ── 频道列（选了团队才出现，和 Teams 一致） ── */
+  let sideChans = '';
+  if(chans.length){
+    sideChans = '<aside class="tmx-col tmx-chans">';
+    sideChans += `<div class="tmx-colhead">频道<i>${chans.length}</i></div>`;
+    sideChans += `<button class="tmx-row tpg-ch ${!ch?'on':''}" data-ch="">
+        <span class="tmx-hash">#</span><span class="tmx-nm">全部频道</span>
+        <i>${(TM_ITEMS||[]).length}</i></button>`;
+    chans.forEach(([key, n])=>{
+      sideChans += `<button class="tmx-row tpg-ch ${ch===key?'on':''}"
+          data-ch="${tmEsc(key)}" title="${tmEsc(key)}">
+        <span class="tmx-hash">#</span><span class="tmx-nm">${tmEsc(tmChanShort(key))}</span>
+        <i>${n}</i></button>`;
+    });
+    sideChans += '</aside>';
+  }
+
+  /* ── 主内容 ── */
+  const curTeam = TM_TEAM || '全部团队';
+  const curChan = ch ? tmChanShort(ch) : '全部频道';
+  let h = `<div class="tmx-head">
+    <div class="tmx-crumb">
+      <span class="tmx-tname">${tmEsc(curTeam)}</span>
+      <span class="tmx-sep">/</span>
+      <span class="tmx-cname">#${tmEsc(curChan)}</span>
+      <span class="tmx-cnt">${items.length} 条</span>
+    </div>
+    <div class="tmx-acts">
       <button class="tpg-btn primary" id="tpgFetch" title="遍历所有团队的所有频道，一次收全">
         ${icon('i-download','sm')}<span>全部收一遍</span></button>
       <button class="tpg-btn" id="tpgDeep"
-              title="补全历史：一直滚到每个频道最早的消息。第一次会很慢（可能一小时），之后日常用「全部收一遍」即可">
+              title="补全历史：一直滚到每个频道最早的消息。第一次会很慢（可能一小时）">
         ${icon('i-hourglass','sm')}<span>深度归档</span></button>
       <button class="tpg-btn" id="tpgSync" title="只读当前打开的频道（快）">
         ${icon('i-refresh','sm')}<span>同步</span></button>
       <button class="tpg-btn" id="tpgDL">
         ${icon('i-folder','sm')}<span>取附件</span></button>
     </div>
-    <div class="tpg-status" id="tpgStatus">${TMP_STATUS || '还没同步过'}</div>
-  </div>${stale}`;
+  </div>
+  <div class="tpg-status" id="tpgStatus">${TMP_STATUS || '还没同步过'}</div>${stale}`;
 
-  /* ── 团队（第一级）── */
-  const teams = tmTeams();
-  if(teams.length){
-    h += `<div class="tpg-teams">
-      <button class="tpg-team ${!TM_TEAM?'on':''}" data-tm="">
-        <span>全部团队</span><i>${(TM_ITEMS||[]).length}</i></button>`;
-    teams.forEach(([name, n])=>{
-      h += `<button class="tpg-team ${TM_TEAM===name?'on':''}"
-              data-tm="${tmEsc(name)}" title="${tmEsc(name)}">
-        <span>${tmEsc(name)}</span><i>${n}</i></button>`;
-    });
-    h += `</div>`;
-  }
+  h += `<div class="tmx-tabs">
+    <button class="tmx-tab ${TM_VIEW!=='files'?'on':''}" data-view="posts">
+      ${icon('i-list','sm')}<span>帖子</span></button>
+    <button class="tmx-tab ${TM_VIEW==='files'?'on':''}" data-view="files">
+      ${icon('i-folder','sm')}<span>文件</span></button>
+  </div>`;
 
-  /* ── 频道筛选（第二级）── */
-  if(chans.length){
-    h += `<div class="tpg-chans">
-      <button class="tpg-ch ${!ch?'on':''}" data-ch="">
-        <span>全部</span><i>${(TM_ITEMS||[]).length}</i></button>`;
-    chans.forEach(([key, n])=>{
-      const short = tmChanShort(key);
-      h += `<button class="tpg-ch ${ch===key?'on':''}"
-              data-ch="${tmEsc(key)}" title="${tmEsc(key)}">
-        <span>${tmEsc(short)}</span><i>${n}</i></button>`;
-    });
-    h += `</div>`;
-  }
-
-  /* ── 搜索框 ── */
   h += `<div class="tpg-search">
-    <input id="tpgKw" type="text" placeholder="搜消息内容、人名、频道名"
+    <input id="tpgKw" type="text" placeholder="搜消息内容、人名、频道名、附件名"
            value="${tmEsc(TM_PAGE_KEY)}">
   </div>`;
 
-  /* ── 列表 ── */
-  if(!items.length){
+  /* ── 文件分区：把所有附件拉平成清单（Teams 的「文件」页签）── */
+  if(TM_VIEW === 'files'){
+    const files = [];
+    items.forEach(it=>{
+      (it.attachments||[]).forEach(a=>{
+        files.push({u:a.url||'', n:a.name||'附件', t:it.team||'', c:it.channel||'',
+                    d:it.date||'', by:it.author||''});
+      });
+    });
+    if(!files.length){
+      h += `<div class="tm-empty">这个范围里没有附件</div>`;
+    }else{
+      h += `<div class="tmx-files">
+        <div class="tmx-frow tmx-fhead">
+          <span>文件名</span><span>来自</span><span>日期</span><span></span></div>`;
+      files.forEach(f=>{
+        h += `<div class="tmx-frow">
+          <span class="tmx-fname">${icon('i-file','sm')}${tmEsc(f.n)}</span>
+          <span class="tmx-fsrc" title="${tmEsc((f.t?f.t+' / ':'')+f.c)}">${tmEsc(f.c || f.t || '')}</span>
+          <span class="tmx-fdate">${tmEsc((f.d||'').slice(0,10))}</span>
+          <button class="tmx-fdl tm-att" data-u="${tmEsc(f.u)}" data-n="${tmEsc(f.n)}"
+                  title="下载到「桌面/ManageBac 资料/Teams 附件」">${icon('i-download','sm')}</button>
+        </div>`;
+      });
+      h += `</div>`;
+    }
+  }
+  /* ── 帖子分区（原有卡片，保持不动）── */
+  else if(!items.length){
     h += (kw || ch)
       ? `<div class="tm-empty">没有匹配的内容</div>`
       : `<div class="tm-empty">
@@ -2771,119 +2820,88 @@ function tmRenderPage(){
            <span class="tpg-tip">之后消息都在这里看，不用再进 Teams 网页。</span>
          </div>`;
   }else{
-    /*  三级分组：团队 → 频道 → 日期。
-        全部收一遍之后消息横跨 7 个团队，只按频道分会撞名
-        （很多团队都有「常规」），所以先按团队隔开。 */
-    const byTeam = {};
+    /*  按日期分组（团队与频道已经在左右两栏里选过了） */
+    const byDate = {};
     items.forEach(it=>{
-      const t = (it.team||'').trim() || '未标注团队';
-      (byTeam[t] = byTeam[t] || []).push(it);
+      const d = it.date || '未标注日期';
+      (byDate[d] = byDate[d] || []).push(it);
     });
+    Object.keys(byDate).sort().reverse().forEach(d=>{
+      h += `<div class="tm-sec">${tmEsc(d)}
+        <span class="tm-n">${byDate[d].length}</span></div>`;
+      byDate[d].forEach((it, i)=>{
+        const isEc = it.kind === 'ec';
+        const isHw = it.kind === 'homework';
+        const txt = (it.text || '').slice(0, 1200);
+        const atts = it.attachments || [];
+        const hasFile = !!(it.file_text || '').trim();
+        const reps = it.replies || [];
+        const ini = tmEsc(((it.author||'').trim().slice(0,1)) || '·');
 
-    const teamOrder = Object.keys(byTeam)
-      .sort((a,b)=> byTeam[b].length - byTeam[a].length);
-
-    teamOrder.forEach(t=>{
-      const teamList = byTeam[t];
-      /*  单团队视图下不用再写团队名（省一行） */
-      if(teamOrder.length > 1){
-        h += `<div class="tpg-teamhead">
-          ${icon('i-teams','sm')}<span>${tmEsc(t)}</span>
-          <i>${teamList.length}</i></div>`;
-      }
-
-      const byChan = {};
-      teamList.forEach(it=>{
-        const c = (it.channel||'').trim() || '未标注频道';
-        (byChan[c] = byChan[c] || []).push(it);
+        h += `<div class="tm-item" data-tp="${tmEsc(it.team||'')}|${tmEsc(it.channel||'')}|${tmEsc(d)}|${i}">
+          <div class="tm-h">
+            <span class="tmx-av sm">${ini}</span>
+            <span class="tm-t">${tmHilite(it.title || '消息', kw)}</span>
+            <span class="tmx-by">${tmHilite(it.author||'', kw)}</span>
+            <span class="tm-d">${tmEsc((it.timeLabel||'').slice(0,18))}</span>
+          </div>
+          ${txt ? `<div class="tm-p">${tmHilite(txt, kw)}</div>` : ''}
+          ${tmReactions(it.reactions)}
+          ${reps.length ? `<div class="tm-reps">
+            ${reps.slice(0, 3).map(r=>`
+              <div class="tm-rep">
+                <b>${tmHilite(r.author||'', kw)}</b>
+                <span class="tm-rt">${tmEsc((r.time||'').slice(0,14))}</span>
+                <div>${tmHilite((r.text||'').slice(0, 500), kw)}</div>
+                ${tmReactions(r.reactions, true)}
+              </div>`).join('')}
+            ${reps.length > 3 ? `<div class="tm-rmore">展开全部 ${reps.length} 条回复</div>` : ''}
+          </div>` : ''}
+          <div class="tm-m">
+            ${isEc ? '<span class="tm-tag ec">EC</span>' : ''}
+            ${isHw ? '<span class="tm-tag hw">作业</span>' : ''}
+            ${reps.length ? `<span class="tm-tag">${reps.length} 回复</span>` : ''}
+            ${atts.length ? `<span class="tm-tag att">附件 ${atts.length}</span>` : ''}
+            ${hasFile ? '<span class="tm-tag pdf">已读 PDF</span>' : ''}
+          </div>
+          ${atts.length ? `<div class="tm-atts">${atts.map(a=>
+            `<button class="tm-att" data-u="${tmEsc(a.url||'')}" data-n="${tmEsc(a.name||'')}"
+               title="点击下载到「桌面/ManageBac 资料/Teams 附件」">
+               ${icon('i-download','sm')}<span>${tmEsc((a.name||'附件').slice(0,72))}</span>
+             </button>`).join('')}</div>` : ''}
+          ${hasFile ? `<div class="tm-file">
+            ${it.file_note ? `<span class="tm-note">${tmEsc(it.file_note)}</span>` : ''}
+            ${tmHilite(it.file_text.slice(0, 8000), kw)}
+          </div>` : ''}
+        </div>`;
       });
-
-      Object.keys(byChan)
-        .sort((a,b)=> byChan[b].length - byChan[a].length)
-        .forEach(c=>{
-          const list = byChan[c];
-          h += `<div class="tpg-chhead">
-            ${icon('i-list','sm')}<span>${tmEsc(c)}</span>
-            <i>${list.length}</i></div>`;
-
-          const byDate = {};
-          list.forEach(it=>{
-            const d = it.date || '未标注日期';
-            (byDate[d] = byDate[d] || []).push(it);
-          });
-          Object.keys(byDate).sort().reverse().forEach(d=>{
-            h += `<div class="tm-sec">${tmEsc(d)}
-              <span class="tm-n">${byDate[d].length}</span></div>`;
-            byDate[d].forEach((it, i)=>{
-              const isEc = it.kind === 'ec';
-              const isHw = it.kind === 'homework';
-              const txt = (it.text || '').slice(0, 1200);
-              const atts = it.attachments || [];
-              const hasFile = !!(it.file_text || '').trim();
-              const reps = it.replies || [];
-
-              h += `<div class="tm-item" data-tp="${tmEsc(t)}|${tmEsc(c)}|${tmEsc(d)}|${i}">
-                <div class="tm-h">
-                  <span class="tm-t">${tmHilite(it.title || '消息', kw)}</span>
-                  <span class="tm-d">${tmEsc((it.timeLabel||'').slice(0,18))}</span>
-                </div>
-                ${txt ? `<div class="tm-p">${tmHilite(txt, kw)}</div>` : ''}
-                ${tmReactions(it.reactions)}
-                ${reps.length ? `<div class="tm-reps">
-                  ${reps.slice(0, 6).map(r=>`
-                    <div class="tm-rep">
-                      <b>${tmHilite(r.author||'', kw)}</b>
-                      <span class="tm-rt">${tmEsc((r.time||'').slice(0,14))}</span>
-                      <div>${tmHilite((r.text||'').slice(0, 500), kw)}</div>
-                      ${tmReactions(r.reactions, true)}
-                    </div>`).join('')}
-                  ${reps.length > 6 ? `<div class="tm-rmore">还有 ${reps.length - 6} 条回复</div>` : ''}
-                </div>` : ''}
-                <div class="tm-m">
-                  ${isEc ? '<span class="tm-tag ec">EC</span>' : ''}
-                  ${isHw ? '<span class="tm-tag hw">作业</span>' : ''}
-                  ${it.author ? `<span class="tm-tag">${tmHilite(it.author, kw)}</span>` : ''}
-                  ${reps.length ? `<span class="tm-tag">${reps.length} 回复</span>` : ''}
-                  ${atts.length ? `<span class="tm-tag att">附件 ${atts.length}</span>` : ''}
-                  ${hasFile ? '<span class="tm-tag pdf">已读 PDF</span>' : ''}
-                </div>
-                ${atts.length ? `<div class="tm-atts">${atts.map(a=>
-                  `<button class="tm-att" data-u="${tmEsc(a.url||'')}" data-n="${tmEsc(a.name||'')}"
-                     title="点击下载到「桌面/ManageBac 资料/Teams 附件」">
-                     ${icon('i-download','sm')}<span>${tmEsc((a.name||'附件').slice(0,72))}</span>
-                   </button>`).join('')}</div>` : ''}
-                ${hasFile ? `<div class="tm-file">
-                  ${it.file_note ? `<span class="tm-note">${tmEsc(it.file_note)}</span>` : ''}
-                  ${tmHilite(it.file_text.slice(0, 8000), kw)}
-                </div>` : ''}
-              </div>`;
-            });
-          });
-        });
     });
   }
 
-  box.innerHTML = h;
+  box.innerHTML = `<div class="tmx">${rail}${sideTeams}${sideChans}
+    <div class="tmx-main">${h}</div></div>`;
 
-  /* ── 绑定 ── */
+  /* ── 绑定（与原实现保持一致） ── */
   box.querySelectorAll('.tm-item').forEach(el=>{
     el.addEventListener('click', e=>{
       const att = e.target.closest && e.target.closest('.tm-att');
-      if(att){
-        /*  点附件是「下载」，不是「展开这条消息」 */
-        e.stopPropagation();
-        tmDownloadAtt(att);
-        return;
-      }
+      if(att){ e.stopPropagation(); tmDownloadAtt(att); return; }
       if(e.target.tagName === 'MARK') return;
       el.classList.toggle('open');
+    });
+  });
+
+  /*  文件分区里的下载按钮：不走 .tm-item 那条路径 */
+  box.querySelectorAll('.tmx-fdl').forEach(el=>{
+    el.addEventListener('click', e=>{
+      e.stopPropagation();
+      tmDownloadAtt(el);
     });
   });
 
   box.querySelectorAll('.tpg-team').forEach(el=>{
     el.addEventListener('click', ()=>{
       TM_TEAM = el.dataset.tm || '';
-      /*  换了团队，原来的频道筛选一定失效（键里带团队名），清掉 */
       TM_CH = '';
       tmRenderPage();
     });
@@ -2896,13 +2914,17 @@ function tmRenderPage(){
     });
   });
 
+  box.querySelectorAll('[data-view]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      TM_VIEW = el.dataset.view === 'files' ? 'files' : 'posts';
+      tmRenderPage();
+    });
+  });
+
   const kwi = $('#tpgKw');
   if(kwi){
     kwi.addEventListener('input', ()=>{
       TM_PAGE_KEY = kwi.value;
-      /*  打字时不要每次重建 DOM（会让光标跳），抖一下再刷。
-          但重刷会重建输入框 → 光标丢失，所以这里只重绘列表部分。
-          简单办法：记下光标位置，重绘后还原。 */
       const pos = kwi.selectionStart;
       clearTimeout(tmRenderPage._t);
       tmRenderPage._t = setTimeout(()=>{
